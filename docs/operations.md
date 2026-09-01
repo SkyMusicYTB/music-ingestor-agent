@@ -57,7 +57,7 @@ Only `MUSIC_AGENT_*` keys are accepted by administrative commands. Never add an 
 - **Database busy:** confirm only one web service and the configured worker count exist. Long network/media operations must not hold DB transactions. Do not enable WAL. Run the validation script and inspect leases.
 - **Library permission failure:** run `getfacl /srv/music`, confirm the mount supports POSIX ACLs, then re-run `configure-library-acl.sh` with the exact Navidrome identity. Do not `chown -R` the library.
 - **Disk pressure:** inspect `df -h /srv/music /srv/music-downloads /var/lib/music-agent`; preserve the configured free-space floor. Clean only known abandoned staging jobs after the worker is stopped.
-- **Failed deploy:** inspect `/var/lib/music-agent/deployments/<release>.json` and the paired `predeploy-*.db` manifest. A failed release is retained for diagnosis but never selected by rollback.
+- **Failed deploy:** never-validated builds are removed, while interrupted builds retain a `.build-incomplete` marker. For a failure after preflight, inspect `/var/lib/music-agent/deployments/<release>.json` and the paired `predeploy-*.db` manifest. The failed release is retained for diagnosis but never selected by rollback.
 - **Tailscale URL rejected:** add the exact MagicDNS hostname to trusted hosts, set the public HTTPS URL, and confirm `tailscale serve status`. Do not broadly trust forwarded headers.
 
 ## Cost tracking

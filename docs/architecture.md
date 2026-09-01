@@ -22,7 +22,7 @@ SQLite is sufficient for one web process and a small bounded worker pool. Every 
 
 WAL is intentionally not used. Ubuntu 26.04 currently packages SQLite 3.46.1, a version in the affected range for SQLite's documented WAL-reset corruption bug; upstream's fixed versions are 3.51.3, 3.50.7, and 3.44.6. Rollback journal avoids that code path and removes a custom SQLite runtime from the deployment. Sources: [SQLite WAL advisory](https://www.sqlite.org/wal.html#the_wal_reset_bug), [Ubuntu 26.04 sqlite3 package](https://packages.ubuntu.com/resolute/sqlite3), and [Ubuntu package changelog](https://lists.ubuntu.com/archives/resolute-changes/2026-July/028772.html).
 
-Alembic owns schema changes. Deployment stops both writers, makes and verifies a consistent backup with Python's SQLite backup API, runs `music-agent migrate` from the staged release, then switches code. Each release manifest records its expected schema and paired pre-deployment backup. A rollback with a schema mismatch refuses to proceed without an explicitly selected matching backup.
+Alembic owns schema changes. Deployment builds the virtualenv directly at the inactive release's final absolute path, verifies it as the runtime account, stops both writers, makes and verifies a consistent backup with Python's SQLite backup API, runs `music-agent migrate` from the candidate release, then switches code. Each release manifest records its expected schema and paired pre-deployment backup. A rollback with a schema mismatch refuses to proceed without an explicitly selected matching backup.
 
 ## Persistent and reproducible data
 

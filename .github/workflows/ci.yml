@@ -50,7 +50,8 @@ jobs:
           python -m pip install --disable-pip-version-check --no-build-isolation --no-deps -e .
       - name: Python checks
         run: |
-          ruff check app tests scripts/sqlite-maintenance.py
+          ruff check app migrations tests scripts/*.py scripts/lib/*.py
+          ruff format --check app migrations tests scripts/*.py scripts/lib/*.py
           mypy app
           python -m pip_audit --require-hashes -r requirements/production.lock
       - name: Shell checks

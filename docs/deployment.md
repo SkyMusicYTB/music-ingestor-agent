@@ -4,7 +4,7 @@
 
 Production is guarded to Ubuntu Server 26.04.x (`VERSION_ID=26.04`), amd64, and the distribution Python 3.14. The first-install script checks those values and installs only the required native packages: Python/venv, ffmpeg, Git, curl, CA certificates, rsync, ACL tools, unzip, and OpenSSL. It performs no distribution upgrade and never installs Python packages globally.
 
-Keep the Git checkout under an administrator's home directory. Root never needs Git credentials. Each deployment copies the committed tree to a new `/opt/music-agent/releases/<commit>-<UTC timestamp>` directory, builds its Linux venv there, installs a fully pinned dependency closure, validates imports, and later removes all write bits. `/opt/music-agent/current` is the sole atomic activation pointer.
+Keep the Git checkout under an administrator's home directory. Root never needs Git credentials. Each deployment first creates its unique final `/opt/music-agent/releases/<commit>-<UTC timestamp>` directory, copies the committed tree there, and creates the Linux virtualenv directly at that permanent absolute path. The release is never renamed after virtualenv creation, so pip-generated absolute console-script shebangs remain valid. It installs a fully pinned dependency closure, normalizes the tree to root-owned and runtime-readable but not runtime-writable, and validates the interpreter, imports, web CLI, worker CLI, and shebangs as `music-agent` before activation. `/opt/music-agent/current` is the sole atomic activation pointer; all write bits are removed after successful activation.
 
 ## First installation
 
@@ -53,7 +53,7 @@ git pull --ff-only
 sudo bash scripts/deploy.sh
 ```
 
-Before interruption, deployment builds a complete release, allows only wheels, runs `pip check`, compiles the app, validates credentials/config/tools, and installs parseable units. During the activation transaction it records which services were running, stops worker then web, backs up/integrity-checks SQLite, migrates and validates with the service identity, switches the symlink, starts both services, and revalidates. Any failed migration or activation restores the old symlink and the paired database backup before attempting to restart the old units.
+Before interruption, deployment builds a complete inactive release, allows only wheels, runs `pip check`, compiles the app, validates credentials/config/tools and service-account execution, and installs parseable units. A build that fails before validation is removed; an unexpected interruption leaves a `.build-incomplete` marker, while a validated candidate has a `prepared` manifest and remains inactive. During the activation transaction it records which services were running, stops worker then web, backs up/integrity-checks SQLite, migrates and validates with the service identity, switches the symlink, starts both services, makes the release immutable, and revalidates. Any failed migration or activation restores the old symlink and the paired database backup before attempting to restart the old units. Rollback performs the same service-account virtualenv preflight before stopping either service.
 
 Do not edit an installed release or its venv. Commit a fix and deploy a new one.
 

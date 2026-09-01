@@ -86,6 +86,20 @@ def test_tool_pin_parser_does_not_source_shell(tmp_path: Path) -> None:
     assert result.stdout.strip() == "2026.08.19 2.9.5"
 
 
+def test_atomic_symlink_cleans_temporary_link_when_activation_fails(tmp_path: Path) -> None:
+    link = tmp_path / "current"
+    result = run_bash(
+        f'source "{COMMON}"; '
+        "mv() { return 1; }; "
+        f'music_agent_atomic_symlink "/target/release" "{link}"',
+        tmp_path / "root",
+    )
+
+    assert result.returncode != 0
+    assert not link.is_symlink()
+    assert list(tmp_path.glob(".current.new.*")) == []
+
+
 def test_runtime_environment_rejects_placeholder_musicbrainz_contact() -> None:
     invalid = subprocess.run(  # noqa: S603 - repository script is the test fixture
         [str(RUNTIME_VALIDATOR)],

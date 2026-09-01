@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 # shellcheck source=scripts/lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+readonly ACL_ACCESS_PROBE="$SCRIPT_DIR/lib/library_access_probe.py"
 
 usage() {
     cat <<'EOF'
@@ -35,6 +36,7 @@ music_agent_acquire_lock operations
 music_agent_require_command getfacl
 music_agent_require_command setfacl
 music_agent_require_command runuser
+[[ -r "$ACL_ACCESS_PROBE" ]] || music_agent_die "ACL access probe is missing: $ACL_ACCESS_PROBE"
 [[ -d "$MUSIC_AGENT_MUSIC_DIR" ]] || music_agent_die "music directory does not exist: $MUSIC_AGENT_MUSIC_DIR"
 id "$MUSIC_AGENT_SERVICE_USER" >/dev/null 2>&1 || music_agent_die "service account does not exist"
 
@@ -76,9 +78,19 @@ fi
 
 [[ "$(stat -c '%u:%g' "$MUSIC_AGENT_MUSIC_DIR")" == "$original_owner" ]] ||
     music_agent_die "library ownership changed unexpectedly"
-runuser -u "$MUSIC_AGENT_SERVICE_USER" -- test -r "$MUSIC_AGENT_MUSIC_DIR"
-runuser -u "$MUSIC_AGENT_SERVICE_USER" -- test -w "$MUSIC_AGENT_MUSIC_DIR"
-if [[ -n "$navidrome_user" && "$navidrome_user" != "root" ]]; then
-    runuser -u "$navidrome_user" -- test -r "$MUSIC_AGENT_MUSIC_DIR"
+
+verify_account_access() {
+    local account="${1:?account required}" operation="${2:?operation required}"
+    # The root shell opens the verifier before runuser. This keeps verification
+    # working when the trusted deployment checkout is inside a non-traversable home.
+    if ! runuser -u "$account" -- "$MUSIC_AGENT_PYTHON" - \
+            "$operation" "$MUSIC_AGENT_MUSIC_DIR" < "$ACL_ACCESS_PROBE"; then
+        music_agent_die "$operation access verification failed for account: $account"
+    fi
+}
+
+verify_account_access "$MUSIC_AGENT_SERVICE_USER" write
+if [[ -n "$navidrome_user" ]]; then
+    verify_account_access "$navidrome_user" read
 fi
 music_agent_log "library ACL configured without chown or service restart; backup: $acl_backup"

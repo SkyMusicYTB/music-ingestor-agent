@@ -139,8 +139,11 @@ music_agent_atomic_symlink() {
     parent="$(dirname "$link")"
     install -d -m 0755 "$parent"
     temp="$parent/.${link##*/}.new.$$"
-    ln -s "$target" "$temp"
-    mv -Tf "$temp" "$link"
+    ln -s "$target" "$temp" || return 1
+    if ! mv -Tf "$temp" "$link"; then
+        unlink "$temp" || true
+        return 1
+    fi
 }
 
 music_agent_current_release() {

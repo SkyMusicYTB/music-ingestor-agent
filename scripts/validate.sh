@@ -6,12 +6,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 # shellcheck source=scripts/lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+readonly RELEASE_ACCESS_PROBE="$SCRIPT_DIR/lib/release_access_probe.py"
 
 usage() {
     cat <<'EOF'
 Usage: sudo scripts/validate.sh [--release PATH] [--pre-activate] [--services]
 
---pre-activate validates a staged release without querying the production DB.
+--pre-activate validates an inactive candidate release without querying the production DB.
 --services additionally requires the enabled web and worker units to be active.
 EOF
 }
@@ -30,6 +31,9 @@ done
 music_agent_require_root
 music_agent_assert_supported_host
 music_agent_require_command flock
+music_agent_require_command runuser
+[[ -r "$RELEASE_ACCESS_PROBE" ]] ||
+    music_agent_die "release access probe is missing: $RELEASE_ACCESS_PROBE"
 
 if [[ -z "$release" ]]; then
     release="$(music_agent_current_release)"
@@ -39,7 +43,45 @@ release="$(cd -- "$release" && pwd -P)"
 music_agent_assert_within "$release" "$MUSIC_AGENT_RELEASES_DIR"
 [[ -x "$release/venv/bin/python" ]] || music_agent_die "release virtualenv is missing"
 [[ -x "$release/venv/bin/music-agent" ]] || music_agent_die "music-agent entry point is missing"
-"$release/venv/bin/python" -c 'import app, sqlalchemy, fastapi' >/dev/null
+[[ -x "$release/venv/bin/music-agent-worker" ]] || music_agent_die "worker entry point is missing"
+[[ -z "$(find "$release" -xdev \( ! -user root -o ! -group root \) -print -quit)" ]] ||
+    music_agent_die "release tree must be owned by root:root"
+[[ -z "$(find "$release" -xdev -type d ! -perm -0005 -print -quit)" ]] ||
+    music_agent_die "release directories must be readable and traversable by the service account"
+[[ -z "$(find "$release" -xdev -type f ! -perm -0004 -print -quit)" ]] ||
+    music_agent_die "release files must be readable by the service account"
+[[ -z "$(find "$release" -xdev ! -type l -perm /022 -print -quit)" ]] ||
+    music_agent_die "release must not be writable by the service account"
+release_status=""
+if [[ -f "$release/RELEASE.json" ]]; then
+    release_status="$("$MUSIC_AGENT_PYTHON" -c \
+        'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
+        "$release/RELEASE.json")"
+fi
+if [[ "$release_status" == "active" ]]; then
+    # Symlink mode bits are not access controls on Linux; non-writable parent
+    # directories protect their names, and the linked targets stay root-owned.
+    [[ -z "$(find "$release" -xdev ! -type l -perm /222 -print -quit)" ]] ||
+        music_agent_die "active release is not immutable"
+fi
+
+# This is deliberately an actual execution as the runtime account. Root's
+# access checks cannot prove that systemd's non-root User= can traverse a venv.
+runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+    "PATH=$MUSIC_AGENT_PATH" \
+    "HOME=$MUSIC_AGENT_STATE_DIR" \
+    "PYTHONDONTWRITEBYTECODE=1" \
+    "$release/venv/bin/python" "$RELEASE_ACCESS_PROBE" "$release"
+runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+    "PATH=$MUSIC_AGENT_PATH" \
+    "HOME=$MUSIC_AGENT_STATE_DIR" \
+    "PYTHONDONTWRITEBYTECODE=1" \
+    "$release/venv/bin/music-agent" --help >/dev/null
+runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+    "PATH=$MUSIC_AGENT_PATH" \
+    "HOME=$MUSIC_AGENT_STATE_DIR" \
+    "PYTHONDONTWRITEBYTECODE=1" \
+    "$release/venv/bin/music-agent-worker" --help >/dev/null
 "$release/venv/bin/python" -m pip check >/dev/null
 
 [[ -r "$MUSIC_AGENT_ENV_FILE" ]] || music_agent_die "configuration is missing: $MUSIC_AGENT_ENV_FILE"
@@ -97,13 +139,6 @@ done
 
 if [[ "$pre_activate" -eq 0 ]]; then
     [[ "$(music_agent_current_release)" == "$release" ]] || music_agent_die "release is not the active symlink target"
-    if [[ -f "$release/RELEASE.json" ]] && \
-            [[ "$("$MUSIC_AGENT_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$release/RELEASE.json")" == "active" ]]; then
-        [[ "$(stat -c '%U:%G' "$release")" == "root:root" ]] ||
-            music_agent_die "active release must be root-owned"
-        [[ -z "$(find "$release" -xdev -perm /022 -print -quit)" ]] ||
-            music_agent_die "active release contains writable content"
-    fi
     if [[ -f "$MUSIC_AGENT_DB" ]]; then
         "$MUSIC_AGENT_PYTHON" "$release/scripts/sqlite-maintenance.py" verify "$MUSIC_AGENT_DB" >/dev/null
         [[ "$(stat -c '%U:%G:%a' "$MUSIC_AGENT_DB")" == \
