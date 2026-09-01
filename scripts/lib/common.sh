@@ -222,13 +222,7 @@ music_agent_with_credentials() (
     music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
     [[ -d "$(music_agent_path /run)" ]] || install -d -m 0755 "$(music_agent_path /run)"
     credential_tmp="$(mktemp -d "$(music_agent_path /run)/music-agent-credentials.XXXXXX")"
-    # shellcheck disable=SC2329 # invoked indirectly by the EXIT trap
-    cleanup_credentials() {
-        if [[ -n "${credential_tmp:-}" && -d "$credential_tmp" ]]; then
-            find "$credential_tmp" -depth -delete
-        fi
-    }
-    trap cleanup_credentials EXIT
+    trap 'if [[ -n "${credential_tmp:-}" && -d "$credential_tmp" ]]; then find "$credential_tmp" -depth -delete; fi' EXIT
     chown "$MUSIC_AGENT_SERVICE_USER:$MUSIC_AGENT_SERVICE_GROUP" "$credential_tmp"
     chmod 0700 "$credential_tmp"
     for credential in auth_hmac_key openai_api_key listenbrainz_token; do

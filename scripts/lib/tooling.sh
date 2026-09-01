@@ -45,13 +45,7 @@ music_agent_install_yt_dlp() (
     local target="$target_dir/yt-dlp" digest_file="$version_dir/artifact.sha256"
     local binary_digest_file="$version_dir/binary.sha256"
     local temp_dir="" downloaded actual_version
-    # shellcheck disable=SC2329 # invoked indirectly by the EXIT trap
-    cleanup_yt_dlp_download() {
-        if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then
-            find "$temp_dir" -depth -delete
-        fi
-    }
-    trap cleanup_yt_dlp_download EXIT
+    trap 'if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then find "$temp_dir" -depth -delete; fi' EXIT
     music_agent_assert_within "$target" "$MUSIC_AGENT_TOOLS_DIR/yt-dlp"
     if [[ -f "$target" ]]; then
         music_agent_verify_sha256 "$target" "$digest"
@@ -84,13 +78,7 @@ music_agent_install_deno() (
     local target="$version_dir/bin/deno" digest_file="$version_dir/artifact.sha256"
     local binary_digest_file="$version_dir/binary.sha256"
     local temp_dir="" archive actual_version
-    # shellcheck disable=SC2329 # invoked indirectly by the EXIT trap
-    cleanup_deno_download() {
-        if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then
-            find "$temp_dir" -depth -delete
-        fi
-    }
-    trap cleanup_deno_download EXIT
+    trap 'if [[ -n "$temp_dir" && -d "$temp_dir" ]]; then find "$temp_dir" -depth -delete; fi' EXIT
     music_agent_assert_within "$target" "$MUSIC_AGENT_TOOLS_DIR/deno"
     if [[ -x "$target" && -r "$digest_file" && -r "$binary_digest_file" ]] &&
             [[ "$(<"$digest_file")" == "$digest" ]]; then

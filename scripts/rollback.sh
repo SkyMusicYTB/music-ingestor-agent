@@ -100,8 +100,12 @@ elif [[ "$database_schema" != "$target_schema" ]]; then
 fi
 
 web_was_active=0 worker_was_active=0
-music_agent_systemctl is-active --quiet music-agent-web.service && web_was_active=1 || true
-music_agent_systemctl is-active --quiet music-agent-worker.service && worker_was_active=1 || true
+if music_agent_systemctl is-active --quiet music-agent-web.service; then
+    web_was_active=1
+fi
+if music_agent_systemctl is-active --quiet music-agent-worker.service; then
+    worker_was_active=1
+fi
 if ! music_agent_stop_services; then
     [[ "$web_was_active" -eq 0 ]] || music_agent_systemctl start music-agent-web.service || true
     [[ "$worker_was_active" -eq 0 ]] || music_agent_systemctl start music-agent-worker.service || true
