@@ -4,9 +4,11 @@ import subprocess
 import sys
 import textwrap
 import zipfile
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 
 from hatchling import build as hatchling_build
+from packaging.markers import default_environment
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -42,6 +44,42 @@ def test_editable_backend_requirements_are_explicitly_locked() -> None:
         assert name in lock
         assert inputs[name] == lock[name]
         assert inputs[name] in requirement.specifier
+
+
+def test_development_lock_covers_supported_linux_dependency_markers() -> None:
+    lock = _pinned_requirements(REPO_ROOT / "requirements" / "development.lock")
+
+    for python_version in ("3.12", "3.13", "3.14"):
+        environment = default_environment()
+        environment.update(
+            {
+                "extra": "",
+                "os_name": "posix",
+                "platform_machine": "x86_64",
+                "platform_system": "Linux",
+                "python_full_version": f"{python_version}.0",
+                "python_version": python_version,
+                "sys_platform": "linux",
+            }
+        )
+        for package_name in lock:
+            try:
+                installed = distribution(package_name)
+            except PackageNotFoundError:
+                continue
+            for raw_requirement in installed.requires or ():
+                requirement = Requirement(raw_requirement)
+                if requirement.marker and not requirement.marker.evaluate(environment):
+                    continue
+                dependency_name = canonicalize_name(requirement.name)
+                assert dependency_name in lock, (
+                    f"{package_name} requires {raw_requirement!r} on Linux/Python "
+                    f"{python_version}, but it is absent from the development lock"
+                )
+                assert lock[dependency_name] in requirement.specifier, (
+                    f"{package_name} requires {raw_requirement!r} on Linux/Python "
+                    f"{python_version}, but the lock pins {lock[dependency_name]}"
+                )
 
 
 def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -> None:
