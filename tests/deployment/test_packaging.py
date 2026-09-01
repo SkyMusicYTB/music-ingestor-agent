@@ -6,7 +6,42 @@ import textwrap
 import zipfile
 from pathlib import Path
 
+from hatchling import build as hatchling_build
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _pinned_requirements(path: Path) -> dict[str, Version]:
+    pins: dict[str, Version] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "-r", "--", "\\")):
+            continue
+        requirement = Requirement(line.removesuffix(" \\"))
+        exact_versions = [
+            Version(specifier.version)
+            for specifier in requirement.specifier
+            if specifier.operator == "=="
+        ]
+        if len(exact_versions) == 1:
+            pins[canonicalize_name(requirement.name)] = exact_versions[0]
+    return pins
+
+
+def test_editable_backend_requirements_are_explicitly_locked() -> None:
+    inputs = _pinned_requirements(REPO_ROOT / "requirements" / "development.in")
+    lock = _pinned_requirements(REPO_ROOT / "requirements" / "development.lock")
+
+    for raw_requirement in hatchling_build.get_requires_for_build_editable({}):
+        requirement = Requirement(raw_requirement)
+        name = canonicalize_name(requirement.name)
+        assert name in inputs
+        assert name in lock
+        assert inputs[name] == lock[name]
+        assert inputs[name] in requirement.specifier
 
 
 def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -> None:

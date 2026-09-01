@@ -38,6 +38,8 @@ defusedxml==0.7.1
     # via py-serializable
 distro==1.9.0
     # via openai
+editables==0.6
+    # via -r requirements/development.in
 fastapi==0.141.1
     # via -r requirements/production.in
 filelock==3.32.5
