@@ -1,0 +1,113 @@
+alembic==1.16.5
+    # via -r requirements/production.in
+annotated-doc==0.0.5
+    # via fastapi
+annotated-types==0.8.0
+    # via pydantic
+anyio==4.14.2
+    # via
+    #   httpx
+    #   openai
+    #   starlette
+argon2-cffi==25.1.0
+    # via -r requirements/production.in
+argon2-cffi-bindings==26.1.0
+    # via argon2-cffi
+certifi==2026.7.22
+    # via
+    #   httpcore
+    #   httpx
+cffi==2.1.1
+    # via argon2-cffi-bindings
+click==8.5.0
+    # via uvicorn
+distro==1.9.0
+    # via openai
+fastapi==0.141.1
+    # via -r requirements/production.in
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+hatchling==1.27.0
+    # via -r requirements/production.in
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via
+    #   -r requirements/production.in
+    #   openai
+idna==3.19
+    # via
+    #   anyio
+    #   httpx
+jinja2==3.1.6
+    # via -r requirements/production.in
+jiter==0.16.0
+    # via openai
+mako==1.4.1
+    # via alembic
+markupsafe==3.0.3
+    # via
+    #   jinja2
+    #   mako
+mutagen==1.47.0
+    # via -r requirements/production.in
+openai==1.109.1
+    # via -r requirements/production.in
+packaging==26.3
+    # via hatchling
+pathspec==1.1.1
+    # via hatchling
+pillow==12.3.0
+    # via -r requirements/production.in
+pluggy==1.6.0
+    # via hatchling
+pycparser==3.0
+    # via cffi
+pydantic==2.13.5
+    # via
+    #   -r requirements/production.in
+    #   fastapi
+    #   openai
+    #   pydantic-settings
+pydantic-core==2.46.5
+    # via pydantic
+pydantic-settings==2.15.0
+    # via -r requirements/production.in
+python-dotenv==1.2.3
+    # via pydantic-settings
+python-multipart==0.0.32
+    # via -r requirements/production.in
+rapidfuzz==3.14.1
+    # via -r requirements/production.in
+sniffio==1.3.1
+    # via openai
+sqlalchemy==2.0.43
+    # via
+    #   -r requirements/production.in
+    #   alembic
+starlette==1.6.0
+    # via fastapi
+tqdm==4.70.0
+    # via openai
+trove-classifiers==2026.6.1.19
+    # via hatchling
+typing-extensions==4.16.0
+    # via
+    #   alembic
+    #   anyio
+    #   fastapi
+    #   openai
+    #   pydantic
+    #   pydantic-core
+    #   sqlalchemy
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   fastapi
+    #   pydantic
+    #   pydantic-settings
+uvicorn==0.35.0
+    # via -r requirements/production.in

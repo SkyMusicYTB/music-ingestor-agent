@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Music Agent SQLite backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30m
+Persistent=yes
+Unit=music-agent-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Downloads · Music Agent{% endblock %}
+{% block live_page %}downloads{% endblock %}
+{% block content %}
+<section>
+  <p class="eyebrow">Persistent queue</p>
+  <h1>Downloads</h1>
+  {% if jobs %}
+  <div class="job-list">
+    {% for job in jobs %}
+    <article class="job-row" data-job-id="{{ job.id }}">
+      <div class="section-heading"><strong>{{ job.stage|replace('_', ' ')|title }}</strong><span class="status status-{{ job.status }}">{{ job.status|replace('_', ' ') }}</span></div>
+      {% set snapshot = snapshots.get(job.id, {}) %}
+      {% if snapshot.get('title') %}<p><strong>{{ snapshot.get('title') }}</strong>{% if snapshot.get('artist') %} · {{ snapshot.get('artist') }}{% endif %}{% if snapshot.get('album') %} · {{ snapshot.get('album') }}{% endif %}</p>{% endif %}
+      <progress max="1" value="{{ job.progress }}">{{ (job.progress * 100)|round }}%</progress>
+      {% if job.final_relative_path %}<p><code>{{ job.final_relative_path }}</code></p>{% endif %}
+      {% if job.error_message %}<div class="alert error">{{ job.error_message }}</div>{% endif %}
+      {% for warning in warnings.get(job.id, []) %}<div class="alert warning">{{ warning.message }}</div>{% endfor %}
+      <div class="action-row">
+        {% if job.status not in ['completed', 'cancelled', 'failed'] %}<button class="small secondary job-action" data-action="cancel">Cancel</button>{% endif %}
+        {% if job.status in ['failed', 'waiting_for_space'] %}<button class="small job-action" data-action="retry">Retry</button>{% endif %}
+      </div>
+      {% if job.status == 'needs_review' %}
+      <form class="review-form stack" data-job-id="{{ job.id }}">
+        {% if reviews.get(job.id) %}
+        <fieldset>
+          <legend>Choose a reviewed candidate</legend>
+          {% for option in reviews.get(job.id, []) %}
+          <label class="check"><input type="radio" name="option_id" value="{{ option.id }}"> <span><strong>{{ option.kind|title }} {{ option.rank }}</strong> · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}</span></label>
+          {% endfor %}
+        </fieldset>
+        {% endif %}
+        <details>
+          <summary>Correct metadata manually</summary>
+          <label>Artist <input name="artist" maxlength="300" value="{{ snapshot.get('artist') or '' }}"></label>
+          <label>Title <input name="title" maxlength="300" value="{{ snapshot.get('title') or '' }}"></label>
+          <label>Album <input name="album" maxlength="300" value="{{ snapshot.get('album') or '' }}"></label>
+        </details>
+        <button type="submit" class="small">Apply review and retry</button>
+        <p class="form-error" role="alert"></p>
+      </form>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}<p class="empty">The download queue is empty.</p>{% endif %}
+</section>
+{% endblock %}

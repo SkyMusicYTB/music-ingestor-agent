@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Library · Music Agent{% endblock %}
+{% block live_page %}library{% endblock %}
+{% block content %}
+<section>
+  <div class="section-heading"><div><p class="eyebrow">{{ result.total }} present tracks</p><h1>Library</h1></div><button id="rescan-button" class="secondary small">Full rescan</button></div>
+  <form method="get" action="/library" class="inline-form">
+    <input type="search" name="q" value="{{ query }}" maxlength="300" placeholder="Search artist or title">
+    <button type="submit">Search</button>
+  </form>
+  <div class="library-table" role="table">
+    {% for item in result.items %}
+    <div class="library-row" role="row"><span><strong>{{ item.title }}</strong><small>{{ item.artist }}{% if item.album %} · {{ item.album }}{% endif %}</small></span><span>{{ item.codec or 'audio' }}</span></div>
+    {% else %}<p class="empty">No matching tracks.</p>{% endfor %}
+  </div>
+  <div class="pagination">
+    {% if result.page > 1 %}<a href="?q={{ query|urlencode }}&page={{ result.page - 1 }}">Previous</a>{% endif %}
+    <span>Page {{ result.page }} of {{ ((result.total + result.page_size - 1) // result.page_size) or 1 }}</span>
+    {% if result.page * result.page_size < result.total %}<a href="?q={{ query|urlencode }}&page={{ result.page + 1 }}">Next</a>{% endif %}
+  </div>
+</section>
+{% endblock %}

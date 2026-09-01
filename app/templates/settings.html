@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Settings · Music Agent{% endblock %}
+{% block content %}
+<section>
+  <p class="eyebrow">Read-only operator view</p><h1>Settings</h1>
+  <dl class="settings-list">
+    {% for label, value in settings_visible.items() %}<div><dt>{{ label }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+  </dl>
+  <p>Secrets are loaded by systemd credentials and are never displayed here. Change production secrets with <code>scripts/set-secret.sh</code>.</p>
+  <a href="/health">Detailed health</a>
+</section>
+{% endblock %}

@@ -1,0 +1,59 @@
+[Unit]
+Description=Music Agent web application
+Documentation=file:/opt/music-agent/current/docs/operations.md
+Wants=network-online.target
+After=network-online.target local-fs.target
+RequiresMountsFor=/var/lib/music-agent
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=music-agent
+Group=music-agent
+WorkingDirectory=/var/lib/music-agent
+EnvironmentFile=/etc/music-agent/music-agent.env
+Environment=PATH=/opt/music-agent/tools/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/var/lib/music-agent
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MUSIC_AGENT_SERVICE_ROLE=web
+LoadCredential=auth_hmac_key:/etc/music-agent/credentials/auth_hmac_key
+LoadCredential=openai_api_key:/etc/music-agent/credentials/openai_api_key
+LoadCredential=listenbrainz_token:/etc/music-agent/credentials/listenbrainz_token
+ExecStartPre=/opt/music-agent/current/scripts/validate-runtime-environment.sh
+ExecStartPre=/opt/music-agent/current/venv/bin/music-agent validate
+ExecStart=/opt/music-agent/current/venv/bin/music-agent web
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillMode=mixed
+UMask=0027
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/music-agent /var/lib/music-agent/artwork
+ReadOnlyPaths=/etc/music-agent /var/lib/music-agent/backups /var/lib/music-agent/deployments /var/lib/music-agent/acl-backups
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

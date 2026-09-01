@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Initial setup · Music Agent{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <p class="eyebrow">First-run setup</p>
+  <h1>Create the initial administrator</h1>
+  <p>This one-time page closes permanently when the first account is created. Complete it only on a trusted LAN or Tailscale connection.</p>
+  {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+  <form action="/setup" method="post" class="stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Username <input name="username" autocomplete="username" maxlength="80" required autofocus></label>
+    <label>Password <input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+    <label class="check"><input type="checkbox" name="acknowledge_rights" value="yes" required> I will acquire only music I have permission or a legal right to download. This service does not bypass DRM, logins, paywalls, or access controls.</label>
+    <button type="submit">Create administrator</button>
+  </form>
+</section>
+{% endblock %}

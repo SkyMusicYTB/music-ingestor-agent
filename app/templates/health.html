@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Health · Music Agent{% endblock %}
+{% block content %}
+<section>
+  <p class="eyebrow">Authenticated diagnostics</p><h1>Service health</h1>
+  <div class="alert {% if healthy %}success{% else %}error{% endif %}">{{ 'Ready' if healthy else 'Not ready' }}</div>
+  <dl class="settings-list">
+  {% for name, detail in checks.items() %}<div><dt>{{ name|replace('_', ' ')|title }}</dt><dd><pre>{{ detail|tojson(indent=2) }}</pre></dd></div>{% endfor %}
+  </dl>
+</section>
+{% endblock %}

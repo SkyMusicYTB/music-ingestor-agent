@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Usage · Music Agent{% endblock %}
+{% block content %}
+<section>
+  <p class="eyebrow">Responses API accounting</p>
+  <h1>OpenAI usage</h1>
+  <p>Reasoning tokens are shown as an output breakdown and are not charged twice. A dash means pricing is not configured.</p>
+  {% for heading, rows in [('Daily', aggregates.daily), ('Monthly', aggregates.monthly)] %}
+  <h2>{{ heading }}</h2>
+  <div class="library-table">
+    {% for row in rows %}
+    <div class="usage-row"><span><strong>{{ row.period }}</strong><small>{{ row.calls }} calls · {{ row.web_searches }} web searches · {{ row.reasoning_tokens }} reasoning tokens</small></span><span>{{ row.total_tokens }} tokens<br>{% if row.estimated_cost_microusd is not none %}${{ '%.6f'|format(row.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span></div>
+    {% else %}<p class="empty">No usage for this period.</p>{% endfor %}
+  </div>
+  {% endfor %}
+  <h2>Recent calls</h2>
+  <div class="library-table">
+    {% for call in calls %}
+    <div class="usage-row"><span><strong>{{ call.model }}</strong><small>{{ call.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ call.status }}</small></span><span>{{ call.total_tokens }} tokens<br>{% if call.estimated_cost_microusd is not none %}${{ '%.6f'|format(call.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span></div>
+    {% else %}<p class="empty">No OpenAI calls have been recorded.</p>{% endfor %}
+  </div>
+</section>
+{% endblock %}

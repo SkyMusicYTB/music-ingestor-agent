@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Request · Music Agent{% endblock %}
+{% block live_page %}request{% endblock %}
+{% block content %}
+<section data-request-id="{{ item.id }}">
+  <p class="eyebrow">{{ item.action|title }} request</p>
+  <div class="section-heading"><h1>{{ item.raw_text }}</h1><span class="status status-{{ item.status }}">{{ item.status|replace('_', ' ') }}</span></div>
+  {% if item.error_message %}<div class="alert error">{{ item.error_message }}</div>{% endif %}
+  {% if item.status in ['pending', 'orchestrating'] %}<div class="progress-card"><span class="spinner"></span> Building a proposal…</div>{% endif %}
+  {% if tracks %}
+  <form id="approval-form" data-request-id="{{ item.id }}" class="stack">
+    <div class="proposal-grid">
+    {% for track in tracks %}
+      <article class="track-card duplicate-{{ track.duplicate_status }}">
+        {% if track.release_mbid or track.release_group_mbid %}
+        <div class="track-art-shell" aria-hidden="true">
+          <img class="track-art" alt="" loading="lazy"
+            {% if track.release_mbid %}src="/artwork/caa-release:{{ track.release_mbid }}"{% else %}src="/artwork/caa-release-group:{{ track.release_group_mbid }}"{% endif %}
+            {% if track.release_mbid and track.release_group_mbid %}data-fallback-src="/artwork/caa-release-group:{{ track.release_group_mbid }}"{% endif %}>
+        </div>
+        {% endif %}
+        <label class="track-select">
+          <input type="checkbox" name="track_ids" value="{{ track.id }}" {% if track.selected and track.duplicate_status != 'owned' %}checked{% endif %} {% if track.duplicate_status == 'owned' %}disabled{% endif %}>
+          <span class="track-number">{{ '%02d'|format(track.ordinal) }}</span>
+          <span><strong>{{ track.title }}</strong><small>{{ track.artist }}{% if track.album %} · {{ track.album }}{% endif %}{% if track.year %} ({{ track.year }}){% endif %}</small></span>
+        </label>
+        <p>{{ track.rationale }}</p>
+        <div class="badges">
+          {% if track.version_signature != 'studio' %}<span>{{ track.version_signature }}</span>{% endif %}
+          {% if track.recording_mbid %}<span>MusicBrainz matched</span>{% endif %}
+          {% if track.duplicate_status == 'owned' %}<span class="owned">Already owned</span>{% endif %}
+          {% if track.duplicate_status == 'possible' %}<span class="possible">Possible duplicate</span>{% endif %}
+        </div>
+      </article>
+    {% endfor %}
+    </div>
+    <label class="check"><input type="checkbox" name="acknowledge_rights" required> I confirm I may lawfully download the selected media.</label>
+    <button type="submit">Queue selected tracks</button>
+    <p class="form-error" id="approval-error" role="alert"></p>
+  </form>
+  {% endif %}
+</section>
+<section>
+  <h2>Refine this request</h2>
+  <form id="refine-form" data-request-id="{{ item.id }}" class="inline-form">
+    <input name="text" maxlength="4000" required placeholder="For example: fewer live versions, more 1990s">
+    <button type="submit" class="secondary">Refine</button>
+  </form>
+</section>
+{% endblock %}

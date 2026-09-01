@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements/development.lock
+      - name: Install exact dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements/development.lock
+          python -m pip install --disable-pip-version-check --no-build-isolation --no-deps -e .
+          python -m pip check
+      - name: Test
+        run: pytest
+
+  static:
+    name: Static and supply-chain checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements/development.lock
+      - name: Install exact dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements/development.lock
+          python -m pip install --disable-pip-version-check --no-build-isolation --no-deps -e .
+      - name: Python checks
+        run: |
+          ruff check app tests scripts/sqlite-maintenance.py
+          mypy app
+          python -m pip_audit --require-hashes -r requirements/production.lock
+      - name: Shell checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+          find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          find scripts -type f -name '*.sh' -print0 | xargs -0 shellcheck
+      - name: Verify CPython 3.14 wheel closure
+        run: |
+          destination="$(mktemp -d)"
+          python -m pip download --disable-pip-version-check --only-binary=:all: \
+            --require-hashes --dest "$destination" -r requirements/production.lock
+          test "$(find "$destination" -type f | wc -l)" -gt 0

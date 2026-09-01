@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Discover · Music Agent{% endblock %}
+{% block live_page %}home{% endblock %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">{{ library_summary.track_count }} indexed tracks</p>
+  <h1>What would you like to hear?</h1>
+  <p>Ask for an exact track, an album, or something more exploratory. Find always previews. Add only auto-queues one exact, high-confidence track.</p>
+  <form id="discover-form" class="discover-form">
+    <label class="sr-only" for="request-text">Music request</label>
+    <textarea id="request-text" name="text" maxlength="4000" required placeholder="Try: atmospheric guitar tracks for a rainy evening"></textarea>
+    <div class="action-row" role="group" aria-label="Request action">
+      <button type="submit" name="action" value="find" class="secondary">Find Music</button>
+      <button type="submit" name="action" value="add">Add Music</button>
+    </div>
+    <p class="form-error" id="discover-error" role="alert"></p>
+  </form>
+</section>
+
+<section>
+  <div class="section-heading"><h2>Recent requests</h2><a href="/downloads">View downloads</a></div>
+  {% if recent_requests %}
+  <div class="request-list">
+    {% for item in recent_requests %}
+    <a class="request-row" href="/requests/{{ item.id }}">
+      <span><strong>{{ item.raw_text }}</strong><small>{{ item.action|title }} · {{ item.created_at.strftime('%Y-%m-%d %H:%M') }}</small></span>
+      <span class="status status-{{ item.status }}">{{ item.status|replace('_', ' ') }}</span>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}<p class="empty">No requests yet.</p>{% endif %}
+</section>
+{% endblock %}
