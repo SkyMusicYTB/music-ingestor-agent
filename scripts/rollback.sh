@@ -29,6 +29,8 @@ done
 music_agent_require_root
 music_agent_assert_supported_host
 music_agent_acquire_lock operations
+music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
+music_agent_assert_managed_production_config
 current_release="$(music_agent_current_release)"
 [[ -n "$current_release" && -f "$current_release/RELEASE.json" ]] || music_agent_die "active release manifest is missing"
 
@@ -85,7 +87,7 @@ fi
 
 if [[ -n "$restore_backup" ]]; then
     restore_backup="$(readlink -f "$restore_backup")"
-    music_agent_assert_within "$restore_backup" "$MUSIC_AGENT_BACKUP_DIR"
+    music_agent_assert_managed_backup_path "$restore_backup"
     "$MUSIC_AGENT_PYTHON" "$target_release/scripts/sqlite-maintenance.py" verify \
         --require-checksum "$restore_backup" >/dev/null
     backup_schema="$("$MUSIC_AGENT_PYTHON" - "$restore_backup.json" <<'PY'
@@ -113,7 +115,8 @@ if ! music_agent_stop_services; then
 fi
 safety_backup=""
 if [[ -f "$MUSIC_AGENT_DB" ]]; then
-    if ! safety_backup="$("$current_release/scripts/backup.sh" --label "prerollback-$target_id" --quiet)"; then
+    if ! safety_backup="$("$current_release/scripts/backup.sh" --protected \
+            --label "prerollback-$target_id" --quiet)"; then
         [[ "$web_was_active" -eq 0 ]] || music_agent_systemctl start music-agent-web.service || true
         [[ "$worker_was_active" -eq 0 ]] || music_agent_systemctl start music-agent-worker.service || true
         music_agent_die "pre-rollback safety backup failed; rollback was not attempted"

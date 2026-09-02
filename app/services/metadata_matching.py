@@ -72,6 +72,7 @@ class MatchResult:
     decision: AssociationDecision
     lead: float | None
     reasons: tuple[str, ...]
+    contradiction_codes: tuple[str, ...] = ()
 
     @property
     def confidence(self) -> str:
@@ -90,12 +91,15 @@ class MetadataMatcher:
         duration_seconds: float | None = None,
         requested_version: str | None = None,
         requested_year: int | None = None,
+        album_is_explicit: bool = False,
+        version_is_explicit: bool = False,
         candidates: Iterable[MetadataCandidate],
         limit: int = 10,
     ) -> list[MatchResult]:
         query_version = version_signature(requested_version, title, album)
         results: list[MatchResult] = []
         for candidate in candidates:
+            contradiction_codes: list[str] = []
             title_score = _similarity(title, candidate.title)
             artist_score = _similarity(artist, candidate.artist)
             duration_score, duration_reason = _duration_score(
@@ -109,6 +113,13 @@ class MetadataMatcher:
                 else 1.0
             )
             version_score = 1.0 if query_version == candidate.version else 0.0
+            if version_is_explicit and query_version != candidate.version:
+                contradiction_codes.append("explicit_version_mismatch")
+            if album_is_explicit:
+                if not candidate.album:
+                    contradiction_codes.append("explicit_album_missing")
+                elif normalize_text(album) != normalize_text(candidate.album):
+                    contradiction_codes.append("explicit_album_mismatch")
             evidence_scores = [version_score]
             if requested_year is not None:
                 evidence_scores.append(_year_score(requested_year, candidate.year))
@@ -142,9 +153,19 @@ class MetadataMatcher:
                     decision="reject",
                     lead=None,
                     reasons=tuple([*reasons, *penalty_reasons]),
+                    contradiction_codes=tuple(contradiction_codes),
                 )
             )
-        results.sort(key=lambda result: (-result.score, _candidate_key(result.candidate)))
+        # An explicit user constraint outranks a numerically stronger but
+        # contradictory candidate. This still keeps contradictory candidates
+        # available for one exceptional review when no compatible result exists.
+        results.sort(
+            key=lambda result: (
+                bool(result.contradiction_codes),
+                -result.score,
+                _candidate_key(result.candidate),
+            )
+        )
         return _classify_recordings(results[: max(0, limit)])
 
 
@@ -314,10 +335,18 @@ def candidates_from_apple(payload: Mapping[str, Any]) -> list[MetadataCandidate]
 def _classify_recordings(results: list[MatchResult]) -> list[MatchResult]:
     if not results:
         return []
-    lead = results[0].score - results[1].score if len(results) > 1 else None
+    next_compatible = next(
+        (item for item in results[1:] if not item.contradiction_codes),
+        None,
+    )
+    lead = results[0].score - next_compatible.score if next_compatible is not None else None
     top_decision: AssociationDecision = (
         "auto"
-        if results[0].score >= 88 and (lead is None or lead >= 8)
+        if (
+            results[0].score >= 88
+            and (lead is None or lead >= 8)
+            and not results[0].contradiction_codes
+        )
         else "review"
         if results[0].score >= 70
         else "reject"

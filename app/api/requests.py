@@ -51,6 +51,7 @@ def _request_payload(item: DbRequest, tracks: list[RequestTrack]) -> dict[str, o
                 "duration_seconds": track.duration_seconds,
                 "recording_mbid": track.recording_mbid,
                 "release_mbid": track.release_mbid,
+                "canonical_identity_verified": track.canonical_identity_verified,
                 "source_extractor": track.source_extractor,
                 "source_id": track.source_id,
                 "version": track.version_signature,

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast
+from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
+from starlette.types import Scope
 
 from app import __version__
 from app.api import auth, events, health, jobs, library, pages, requests, usage
@@ -25,7 +27,13 @@ from app.db.engine import (
     make_session_factory,
 )
 from app.logging import configure_logging
-from app.middleware import AllowedClientMiddleware, BodyLimitMiddleware, SecurityHeadersMiddleware
+from app.middleware import (
+    AllowedClientMiddleware,
+    BodyLimitMiddleware,
+    SecurityHeadersMiddleware,
+    TrustedHostMiddleware,
+    TrustedProxyMiddleware,
+)
 from app.repositories.auth import AuthRepository
 from app.repositories.events import EventRepository
 from app.repositories.jobs import JobRepository
@@ -34,15 +42,42 @@ from app.repositories.requests import RequestRepository
 from app.services.supervisor import WebOrchestration, WebTaskSupervisor
 
 
+class FingerprintedStaticFiles(StaticFiles):
+    def __init__(self, *, directory: Path, fingerprints: dict[str, str]) -> None:
+        super().__init__(directory=directory)
+        self.fingerprints = fingerprints
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        query = parse_qs(bytes(scope.get("query_string", b"")).decode("ascii", errors="ignore"))
+        supplied = query.get("v", [])
+        if supplied == [self.fingerprints.get(path)]:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+def _static_fingerprints(directory: Path) -> dict[str, str]:
+    return {
+        path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
 def _build_orchestration(settings: Settings, factory: sessionmaker[Session]) -> WebOrchestration:
     from app.services.orchestration import OrchestrationService
+    from app.tools.media_sources import build_media_source_tools
     from app.tools.registry import build_default_registry
-    from app.tools.youtube import build_youtube_search_tool
 
     registry = build_default_registry(
         settings,
         factory,
-        youtube_search_tool=build_youtube_search_tool(factory),
+        media_source_tools=build_media_source_tools(
+            factory,
+            enabled_providers=settings.enabled_media_providers,
+        ),
     )
     service = OrchestrationService(
         settings=settings,
@@ -114,13 +149,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.orchestration = _build_orchestration(settings, factory)
     app.state.templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
+    static_path = Path(__file__).parent / "static"
+    fingerprints = _static_fingerprints(static_path)
+
+    def asset_url(name: str) -> str:
+        fingerprint = fingerprints.get(name)
+        if fingerprint is None:
+            raise ValueError(f"unknown static asset: {name}")
+        return f"/static/{quote(name, safe='/')}?v={fingerprint}"
+
+    app.state.asset_fingerprints = fingerprints
+    app.state.templates.env.globals["asset_url"] = asset_url
+
     app.add_middleware(BodyLimitMiddleware, max_bytes=1_048_576)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.effective_trusted_hosts)
     app.add_middleware(AllowedClientMiddleware, settings=settings)
+    app.add_middleware(TrustedProxyMiddleware, settings=settings)
     app.add_middleware(SecurityHeadersMiddleware, settings=settings)
 
-    static_path = Path(__file__).parent / "static"
-    app.mount("/static", StaticFiles(directory=static_path), name="static")
+    app.mount(
+        "/static",
+        FingerprintedStaticFiles(directory=static_path, fingerprints=fingerprints),
+        name="static",
+    )
     for router in (
         auth.router,
         health.router,

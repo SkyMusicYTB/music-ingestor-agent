@@ -7,11 +7,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.enums import JobStage, JobStatus, TaskState, TaskTarget
-from app.db.models import DownloadJob, Event, JobReviewOption, Request, ServiceTask, Track
+from app.db.models import DownloadJob, Event, JobDecision, Request, ServiceTask, Track
+from app.repositories.decisions import candidate_set_fingerprint, create_pending_decision
 from app.services.filesystem import sha256_file, validate_relative_path
 
 
@@ -21,6 +22,20 @@ class LeaseLostError(RuntimeError):
 
 class JobCancellationRequested(RuntimeError):
     pass
+
+
+def _decision_category(kind: str) -> str:
+    normalized = kind.strip().casefold()
+    return {
+        "source": "acquisition_source",
+        "acquisition_source": "acquisition_source",
+        "metadata": "canonical_metadata",
+        "canonical_metadata": "canonical_metadata",
+        "duplicate": "possible_duplicate",
+        "possible_duplicate": "possible_duplicate",
+        "version": "recording_version",
+        "recording_version": "recording_version",
+    }.get(normalized, "acquisition_source")
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,8 +330,10 @@ class DownloadJobQueue:
         *,
         reason: str,
         options: list[dict[str, Any]] | None = None,
+        max_rounds_per_category: int = 3,
+        max_rounds_per_job: int = 8,
         now: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         timestamp = now or utc_now()
         serialized_warnings = json.dumps(
             [{"code": "needs_review", "message": reason[:500]}],
@@ -324,50 +341,92 @@ class DownloadJobQueue:
             separators=(",", ":"),
         )
         with self.session_factory() as session:
-            result = session.execute(
-                update(DownloadJob)
-                .where(
+            job = session.scalar(
+                select(DownloadJob).where(
                     DownloadJob.id == lease.job_id,
                     DownloadJob.lease_token == lease.token,
                     DownloadJob.status == JobStatus.ACTIVE.value,
                 )
-                .values(
-                    status=JobStatus.NEEDS_REVIEW.value,
-                    stage=JobStage.RESOLVING_SOURCE.value,
-                    lease_token=None,
-                    lease_expires_at=None,
-                    warnings_json=serialized_warnings,
-                    error_code="source_needs_review",
-                    error_message=reason[:1000],
-                    updated_at=timestamp,
-                )
             )
-            if result.rowcount != 1:
+            if job is None:
                 session.rollback()
                 raise LeaseLostError("job lease was lost while requesting review")
-            session.query(JobReviewOption).filter(JobReviewOption.job_id == lease.job_id).delete()
-            for ordinal, option in enumerate((options or [])[:10], start=1):
-                rank_value = option.get("rank", ordinal)
-                score_value = option.get("score", 0.0)
-                rank = rank_value if isinstance(rank_value, int) and rank_value > 0 else ordinal
-                score = (
-                    float(score_value)
-                    if isinstance(score_value, (int, float)) and not isinstance(score_value, bool)
-                    else 0.0
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for option in (options or [])[:24]:
+                category = _decision_category(str(option.get("kind") or "source"))
+                grouped.setdefault(category, []).append(option)
+            if not grouped:
+                grouped["acquisition_source"] = []
+            pending_decisions: list[JobDecision] = []
+            for category, category_options in grouped.items():
+                fingerprint = candidate_set_fingerprint(category, category_options)
+                existing = session.scalar(
+                    select(JobDecision)
+                    .where(
+                        JobDecision.job_id == job.id,
+                        JobDecision.category == category,
+                        JobDecision.candidate_set_fingerprint == fingerprint,
+                    )
+                    .order_by(JobDecision.revision.desc())
+                    .limit(1)
                 )
-                kind = str(option.get("kind") or "source")[:32]
-                payload = {key: value for key, value in option.items() if key != "score"}
-                session.add(
-                    JobReviewOption(
-                        job_id=lease.job_id,
-                        kind=kind,
-                        rank=rank,
-                        provider_payload_json=json.dumps(
-                            payload, ensure_ascii=False, separators=(",", ":")
-                        ),
-                        score=max(0.0, min(1.0, score)),
+                if existing is not None:
+                    if existing.state == "pending":
+                        pending_decisions.append(existing)
+                    # A selected fingerprint is authoritative and must be replayed
+                    # by the pipeline instead of being presented a second time.
+                    continue
+                if job.review_round_count >= max_rounds_per_job:
+                    raise RuntimeError("exceptional review budget was exhausted")
+                category_rounds = (
+                    session.scalar(
+                        select(func.count(JobDecision.id)).where(
+                            JobDecision.job_id == job.id,
+                            JobDecision.category == category,
+                        )
+                    )
+                    or 0
+                )
+                if category_rounds >= max_rounds_per_category:
+                    raise RuntimeError(f"{category} review budget was exhausted")
+                pending_decisions.append(
+                    create_pending_decision(
+                        session,
+                        job,
+                        category=category,
+                        reason=reason,
+                        options=category_options,
                     )
                 )
+            if not pending_decisions:
+                job.status = JobStatus.QUEUED.value
+                job.stage = JobStage.QUEUED.value
+                job.available_at = timestamp
+                job.lease_token = None
+                job.lease_expires_at = None
+                job.error_code = None
+                job.error_message = None
+                job.updated_at = timestamp
+                _job_event(
+                    session,
+                    lease.job_id,
+                    "job.decision_replayed",
+                    "A previous review decision was reused",
+                )
+                session.commit()
+                return False
+            job.status = JobStatus.NEEDS_REVIEW.value
+            job.stage = (
+                JobStage.RESOLVING_SOURCE.value
+                if "acquisition_source" in grouped
+                else JobStage.RESOLVING_METADATA.value
+            )
+            job.lease_token = None
+            job.lease_expires_at = None
+            job.warnings_json = serialized_warnings
+            job.error_code = "exceptional_review_required"
+            job.error_message = reason[:1000]
+            job.updated_at = timestamp
             _job_event(
                 session,
                 lease.job_id,
@@ -376,6 +435,7 @@ class DownloadJobQueue:
                 details={"option_count": min(len(options or []), 10)},
             )
             session.commit()
+            return True
 
     def add_warning(self, lease: JobLease, *, code: str, message: str) -> None:
         """Append one bounded visible warning while preserving lease fencing."""

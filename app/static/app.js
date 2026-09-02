@@ -1,5 +1,37 @@
 "use strict";
 
+const SAFE_IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/;
+let fallbackCounter = 0;
+
+export function createIdempotencyKey(cryptoProvider = globalThis.crypto) {
+  try {
+    if (typeof cryptoProvider?.randomUUID === "function") {
+      const generated = cryptoProvider.randomUUID();
+      if (SAFE_IDEMPOTENCY_KEY.test(generated)) return generated;
+    }
+  } catch (_failure) {
+    // Continue to the getRandomValues or non-crypto fallback.
+  }
+
+  try {
+    if (typeof cryptoProvider?.getRandomValues === "function") {
+      const bytes = new Uint8Array(16);
+      cryptoProvider.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+  } catch (_failure) {
+    // A broken/inaccessible Web Crypto implementation must not block a request.
+  }
+
+  fallbackCounter += 1;
+  const entropy = Math.random().toString(36).slice(2) || "0";
+  const fallback = `fallback-${Date.now().toString(36)}-${fallbackCounter.toString(36)}-${entropy}`;
+  return fallback.slice(0, 128);
+}
+
 function csrfToken() {
   const entry = document.cookie.split("; ").find((row) => row.startsWith("music_agent_csrf="));
   return entry ? decodeURIComponent(entry.split("=").slice(1).join("=")) : "";
@@ -25,7 +57,7 @@ if (discover) {
     try {
       const payload = await api("/api/v1/requests", {
         method: "POST",
-        headers: {"Idempotency-Key": crypto.randomUUID()},
+        headers: {"Idempotency-Key": createIdempotencyKey()},
         body: JSON.stringify({text: discover.elements.text.value, action: submitter.value})
       });
       window.location.assign(payload.url);
@@ -57,7 +89,7 @@ if (refine) {
     try {
       const payload = await api(`/api/v1/requests/${refine.dataset.requestId}/refinements`, {
         method: "POST",
-        headers: {"Idempotency-Key": crypto.randomUUID()},
+        headers: {"Idempotency-Key": createIdempotencyKey()},
         body: JSON.stringify({text: refine.elements.text.value})
       });
       window.location.assign(payload.url);
@@ -78,17 +110,32 @@ document.querySelectorAll(".job-action").forEach((button) => {
 document.querySelectorAll(".review-form").forEach((form) => {
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const selected = form.querySelector("input[name=option_id]:checked");
-    const details = form.querySelector("details");
+    const details = form.querySelector("details.review-correction");
     const manual = details && details.open;
+    const correction = manual ? {
+      artist: form.elements.artist.value.trim() || null,
+      title: form.elements.title.value.trim() || null,
+      album: form.elements.album.value.trim() || null
+    } : null;
+    const selections = [...form.querySelectorAll("fieldset[data-decision-id]")].map((fieldset, index) => {
+      const selected = fieldset.querySelector("input[type=radio]:checked");
+      return {
+        decision_id: fieldset.dataset.decisionId,
+        option_id: selected ? selected.value : null,
+        correction: index === 0 ? correction : null
+      };
+    });
     const payload = {
-      option_id: selected ? selected.value : null,
-      artist: manual && form.elements.artist.value.trim() ? form.elements.artist.value.trim() : null,
-      title: manual && form.elements.title.value.trim() ? form.elements.title.value.trim() : null,
-      album: manual ? form.elements.album.value.trim() || null : null
+      bundle_fingerprint: form.dataset.bundleFingerprint,
+      revision: Number.parseInt(form.dataset.revision, 10),
+      selections
     };
     const error = form.querySelector(".form-error");
     error.textContent = "";
+    if (selections.some((selection) => !selection.option_id)) {
+      error.textContent = "Choose one option for each exceptional decision.";
+      return;
+    }
     try {
       await api(`/api/v1/jobs/${form.dataset.jobId}/review`, {
         method: "POST",

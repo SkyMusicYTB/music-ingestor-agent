@@ -13,8 +13,14 @@ from starlette.responses import Response
 from app.api.dependencies import CurrentSession
 from app.api.health import health_snapshot
 from app.api.usage import usage_snapshot
-from app.db.models import ArtworkCache, JobReviewOption, OpenAICall
+from app.db.models import (
+    ArtworkCache,
+    JobDecision,
+    JobReviewOption,
+    SourceCandidate,
+)
 from app.db.models import Request as DbRequest
+from app.repositories.decisions import review_bundle_fingerprint
 
 router = APIRouter()
 _CACHE_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
@@ -58,16 +64,74 @@ def _review_option_view(option: JobReviewOption) -> dict[str, object]:
     payload = raw if isinstance(raw, dict) else {}
     label_parts = [
         str(payload.get(key)).strip()
-        for key in ("artist", "title", "album", "channel", "source_id", "reason")
+        for key in (
+            "label",
+            "artist",
+            "title",
+            "album",
+            "channel",
+            "source_id",
+            "reason",
+        )
         if payload.get(key) is not None and str(payload.get(key)).strip()
     ]
+    duration = payload.get("duration_seconds")
+    duration_seconds = (
+        float(duration)
+        if isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and 0 < float(duration) <= 14_400
+        else None
+    )
     return {
         "id": option.id,
+        "decision_id": option.decision_id,
         "kind": option.kind,
         "rank": option.rank,
         "score": option.score,
         "label": " · ".join(label_parts)[:800] or f"{option.kind.title()} option {option.rank}",
+        "recommended": option.rank == 1,
+        "materially_different": option.materially_different,
+        "provider": _bounded_display(payload.get("provider")),
+        "uploader": _bounded_display(payload.get("uploader") or payload.get("channel")),
+        "uploader_relationship": _bounded_display(payload.get("uploader_relationship")),
+        "duration_seconds": duration_seconds,
+        "version": _bounded_display(payload.get("version") or payload.get("version_signature")),
+        "album": _bounded_display(payload.get("album")),
+        "year": _bounded_display(payload.get("year")),
+        "release_status": _bounded_display(payload.get("release_status") or payload.get("status")),
+        "primary_type": _bounded_display(payload.get("primary_type")),
     }
+
+
+def _bounded_display(value: object, *, limit: int = 300) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).split())
+    return normalized[:limit] or None
+
+
+def _json_object(value: str | None) -> dict[str, object]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _friendly_stage(value: str) -> str:
+    return {
+        "queued": "Waiting to start",
+        "resolving_source": "Finding the best safe source",
+        "waiting_ai": "Confirming the match",
+        "downloading": "Downloading audio",
+        "resolving_metadata": "Confirming canonical metadata",
+        "fetching_artwork": "Finding artwork",
+        "tagging": "Writing music tags",
+        "verifying": "Checking the finished audio",
+        "publishing": "Adding to the library",
+        "completed": "Ready in your library",
+    }.get(value, value.replace("_", " ").title())
 
 
 @router.get("/")
@@ -121,8 +185,10 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
     jobs = request.app.state.jobs.list_for_user(authenticated.user_id)
     job_ids = [job.id for job in jobs]
     reviews: dict[str, list[dict[str, object]]] = {job_id: [] for job_id in job_ids}
+    review_bundles: dict[str, dict[str, object]] = {}
     snapshots: dict[str, dict[str, object]] = {}
     warnings: dict[str, list[dict[str, str]]] = {}
+    match_details: dict[str, list[dict[str, object]]] = {job_id: [] for job_id in job_ids}
     with request.app.state.session_factory() as session:
         options = (
             list(
@@ -135,13 +201,39 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
             if job_ids
             else []
         )
+        decisions = (
+            list(
+                session.scalars(
+                    select(JobDecision)
+                    .where(
+                        JobDecision.job_id.in_(job_ids),
+                        JobDecision.state.in_(["pending", "selected"]),
+                    )
+                    .order_by(JobDecision.job_id, JobDecision.category)
+                )
+            )
+            if job_ids
+            else []
+        )
+        source_candidates = (
+            list(
+                session.scalars(select(SourceCandidate).where(SourceCandidate.job_id.in_(job_ids)))
+            )
+            if job_ids
+            else []
+        )
+    source_by_id = {candidate.id: candidate for candidate in source_candidates}
+    pending_decision_ids = {decision.id for decision in decisions if decision.state == "pending"}
     for job in jobs:
         try:
             raw_snapshot = json.loads(job.approved_snapshot_json)
         except (TypeError, json.JSONDecodeError):
             raw_snapshot = {}
         snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
-        snapshots[job.id] = {key: snapshot.get(key) for key in ("artist", "title", "album")}
+        snapshots[job.id] = {
+            key: snapshot.get(key)
+            for key in ("artist", "title", "album", "year", "recording_mbid", "release_mbid")
+        }
         try:
             raw_warnings = json.loads(job.warnings_json or "[]")
         except (TypeError, json.JSONDecodeError):
@@ -155,7 +247,67 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
             if isinstance(item, dict) and item.get("message")
         ][:20]
     for option in options:
-        reviews.setdefault(option.job_id, []).append(_review_option_view(option))
+        if option.decision_id in pending_decision_ids:
+            view = _review_option_view(option)
+            if view["recommended"] or view["materially_different"]:
+                reviews.setdefault(option.job_id, []).append(view)
+    option_decision_ids = {
+        option.decision_id for option in options if option.decision_id in pending_decision_ids
+    }
+    for job in jobs:
+        job_id = job.id
+        pending = [
+            decision
+            for decision in decisions
+            if decision.job_id == job_id and decision.state == "pending"
+        ]
+        if pending:
+            review_bundles[job_id] = {
+                "fingerprint": review_bundle_fingerprint(pending),
+                "revision": job.decision_revision,
+                "has_options": all(decision.id in option_decision_ids for decision in pending),
+                "decisions": [
+                    {
+                        "id": decision.id,
+                        "category": decision.category,
+                        "reason_codes": json.loads(decision.reason_codes_json or "[]"),
+                    }
+                    for decision in pending
+                ],
+            }
+        selected = [
+            decision
+            for decision in decisions
+            if decision.job_id == job_id and decision.state == "selected"
+        ]
+        for decision in selected:
+            payload = _json_object(decision.selected_payload_json)
+            detail: dict[str, object] = {
+                "category": decision.category,
+                "decided_by": decision.decided_by or "deterministic",
+                "confidence": (
+                    decision.model_confidence
+                    if decision.model_confidence is not None
+                    else decision.local_confidence
+                ),
+            }
+            if decision.category == "acquisition_source":
+                source_id = payload.get("source_candidate_id")
+                source = source_by_id.get(source_id) if isinstance(source_id, str) else None
+                if source is not None:
+                    detail.update(
+                        {
+                            "provider": source.provider,
+                            "uploader": source.uploader,
+                            "uploader_relationship": source.uploader_relationship,
+                            "duration_seconds": source.duration_seconds,
+                        }
+                    )
+            elif decision.category == "canonical_metadata":
+                detail.update(
+                    {key: payload.get(key) for key in ("artist", "title", "album", "year")}
+                )
+            match_details[job_id].append(detail)
     return _render(
         request,
         "downloads.html",
@@ -165,8 +317,11 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
             event_cursor=event_cursor,
             jobs=jobs,
             reviews=reviews,
+            review_bundles=review_bundles,
             snapshots=snapshots,
             warnings=warnings,
+            match_details=match_details,
+            friendly_stage=_friendly_stage,
         ),
     )
 
@@ -196,10 +351,7 @@ def library_page(
 @router.get("/usage")
 def usage_page(request: Request, authenticated: CurrentSession) -> Response:
     event_cursor = _event_cursor(request)
-    with request.app.state.session_factory() as session:
-        calls = list(
-            session.scalars(select(OpenAICall).order_by(OpenAICall.created_at.desc()).limit(200))
-        )
+    aggregates = usage_snapshot(request.app.state.session_factory)
     return _render(
         request,
         "usage.html",
@@ -207,8 +359,8 @@ def usage_page(request: Request, authenticated: CurrentSession) -> Response:
             request,
             authenticated,
             event_cursor=event_cursor,
-            calls=calls,
-            aggregates=usage_snapshot(request.app.state.session_factory),
+            calls=aggregates["recent"],
+            aggregates=aggregates,
         ),
     )
 
@@ -225,7 +377,12 @@ def settings_page(request: Request, authenticated: CurrentSession) -> Response:
         "Downloads": str(settings.downloads_path),
         "Maximum media duration": f"{settings.max_direct_media_seconds // 60} minutes",
         "Automatic exact Add": settings.auto_download_exact_single,
-        "HTTP cookie security": "Secure" if settings.https_enabled else "LAN HTTP (not Secure)",
+        "Browser origin policy": settings.origin_policy,
+        "Public base URL": settings.public_base_url or "Not fixed; derived from each request",
+        "Cookie security": "Secure whenever the effective request scheme is HTTPS",
+        "Media source policy": settings.media_source_policy,
+        "Enabled media providers": ", ".join(settings.enabled_media_providers),
+        "Review policy": settings.review_policy,
         "SQLite journal": "DELETE / synchronous FULL",
     }
     return _render(

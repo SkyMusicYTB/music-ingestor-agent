@@ -3,14 +3,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
-import queue
 import shutil
-import signal
 import socket
 import stat
-import subprocess
-import threading
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +13,21 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from app.logging import redact
+from app.sources import (
+    PinnedEgressProxy,
+    ProviderIdentity,
+    ProviderURLPolicy,
+    provider_capability,
+    provider_for_extractor,
+    provider_for_url,
+)
+from app.workers.process import (
+    ProcessCancelled,
+    ProcessFrameLimitExceeded,
+    ProcessOutputLimitExceeded,
+    ProcessTimedOut,
+    run_bounded_process,
+)
 
 YOUTUBE_HOSTS = frozenset(
     {
@@ -77,6 +87,13 @@ class DownloadResult:
     metadata: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class DownloadOutputRecord:
+    path: str
+    extractor: str
+    source_id: str
+
+
 Resolver = Callable[..., Sequence[tuple[Any, ...]]]
 ProgressCallback = Callable[[DownloadProgress], None]
 
@@ -92,6 +109,7 @@ def _is_global_address(value: str) -> bool:
         and not address.is_unspecified
         and not address.is_reserved
         and not address.is_private
+        and not (isinstance(address, ipaddress.IPv6Address) and address.is_site_local)
     )
 
 
@@ -136,6 +154,25 @@ def validate_youtube_url(
     so this validation must still be paired with network egress controls in production.
     """
 
+    return _validate_youtube_url(value, resolver=resolver, require_collection=False)
+
+
+def validate_youtube_collection_url(
+    value: str,
+    *,
+    resolver: Resolver = socket.getaddrinfo,
+) -> str:
+    """Validate a YouTube collection URL for bounded metadata inspection only."""
+
+    return _validate_youtube_url(value, resolver=resolver, require_collection=True)
+
+
+def _validate_youtube_url(
+    value: str,
+    *,
+    resolver: Resolver,
+    require_collection: bool,
+) -> str:
     if not isinstance(value, str) or not value or len(value) > 2048:
         raise SourceValidationError("source URL must be a non-empty string up to 2048 bytes")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
@@ -153,14 +190,37 @@ def validate_youtube_url(
         raise SourceValidationError("source URL must use the default HTTPS port")
     if parsed.fragment:
         raise SourceValidationError("source URL fragments are not allowed")
-    if parsed.path.rstrip("/").casefold().endswith("/playlist"):
-        raise SourceValidationError("YouTube playlist URLs are not allowed")
     try:
         query_items = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
     except ValueError as exc:
         raise SourceValidationError("source URL query is malformed") from exc
-    if any(key.casefold() in {"list", "index"} for key, _value in query_items):
+    has_collection = parsed.path.rstrip("/").casefold().endswith("/playlist") or any(
+        key.casefold() == "list" and bool(item_value) for key, item_value in query_items
+    )
+    if require_collection and not has_collection:
+        raise SourceValidationError("source URL does not identify a supported collection")
+    if not require_collection and (
+        has_collection or any(key.casefold() == "index" for key, _value in query_items)
+    ):
         raise SourceValidationError("YouTube playlist parameters are not allowed")
+    if not require_collection:
+        normalized_path = parsed.path.rstrip("/").casefold()
+        query = {key.casefold(): item_value for key, item_value in query_items}
+        short_id = (
+            parsed.path.strip("/") if (parsed.hostname or "").casefold() == "youtu.be" else ""
+        )
+        path_id = parsed.path.strip("/").split("/", 1)
+        is_single = bool(
+            short_id
+            or (normalized_path == "/watch" and query.get("v"))
+            or (
+                len(path_id) == 2
+                and path_id[0].casefold() in {"embed", "live", "shorts"}
+                and path_id[1]
+            )
+        )
+        if not is_single:
+            raise SourceValidationError("YouTube URL does not identify one supported item")
     hostname = parsed.hostname
     if hostname is None or hostname.endswith("."):
         raise SourceValidationError("source URL has an invalid host")
@@ -181,6 +241,27 @@ def validate_youtube_url(
     return urlunsplit(("https", parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
 
 
+def is_curated_collection_url(value: str) -> bool:
+    """Recognize only reviewed collection URL shapes; arbitrary pages stay unsupported."""
+
+    try:
+        parsed = urlsplit(value)
+        provider = provider_for_url(value)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+    except ValueError:
+        return False
+    path = parsed.path.casefold().rstrip("/")
+    if provider is ProviderIdentity.YOUTUBE:
+        return path.endswith("/playlist") or any(
+            key.casefold() == "list" and bool(item_value) for key, item_value in query_items
+        )
+    if provider is ProviderIdentity.SOUNDCLOUD:
+        return "/sets/" in f"{path}/"
+    if provider is ProviderIdentity.BANDCAMP:
+        return "/album/" in f"{path}/"
+    return False
+
+
 def validate_search_query(value: str) -> str:
     if not isinstance(value, str):
         raise SourceValidationError("search query must be a string")
@@ -190,6 +271,35 @@ def validate_search_query(value: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
         raise SourceValidationError("search query contains control characters")
     return normalized
+
+
+def validate_public_media_metadata(metadata: Mapping[str, Any]) -> None:
+    """Reject DRM-protected or access-controlled yt-dlp metadata.
+
+    Missing availability is tolerated because reviewed providers do not all emit the
+    field for public media. When the field is present, only yt-dlp's explicit
+    ``public`` value is accepted; private, unlisted, premium, subscriber, and
+    authentication-gated items remain outside policy.
+    """
+
+    for key in ("is_drm", "has_drm"):
+        drm = metadata.get(key)
+        if drm is not None and drm is not False and drm != 0:
+            raise SourceValidationError("DRM-protected media is not permitted")
+    formats = metadata.get("formats")
+    if isinstance(formats, list):
+        for item in formats:
+            if not isinstance(item, Mapping):
+                continue
+            drm = item.get("has_drm")
+            if drm is not None and drm is not False and drm != 0:
+                raise SourceValidationError("DRM-protected media is not permitted")
+
+    availability = metadata.get("availability")
+    if availability is None:
+        return
+    if not isinstance(availability, str) or availability.strip().casefold() != "public":
+        raise SourceValidationError("non-public or login-gated media is not permitted")
 
 
 def resolve_executable(value: str) -> Path:
@@ -221,31 +331,6 @@ def minimal_subprocess_env(
     }
 
 
-def terminate_process_group(process: subprocess.Popen[Any], grace_seconds: float = 2.0) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:  # pragma: no cover - the service target is Ubuntu
-            process.terminate()
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:  # pragma: no cover - the service target is Ubuntu
-            process.kill()
-    except ProcessLookupError:
-        return
-    process.wait(timeout=max(1.0, grace_seconds))
-
-
 class YtDlpClient:
     def __init__(
         self,
@@ -255,6 +340,12 @@ class YtDlpClient:
         environment: Mapping[str, str] | None = None,
         metadata_timeout_seconds: float = 45.0,
         max_capture_bytes: int = _MAX_CAPTURE_BYTES,
+        source_policy: str = "curated",
+        enabled_providers: Sequence[str] = ("youtube",),
+        allowed_hosts: Sequence[str] = (),
+        allowed_extractors: Sequence[str] = (),
+        blocked_extractors: Sequence[str] = ("generic",),
+        allow_generic_extractor: bool = False,
     ) -> None:
         self.executable = resolve_executable(executable)
         self._resolver = resolver
@@ -262,18 +353,59 @@ class YtDlpClient:
         self._environment = minimal_subprocess_env(inherited=inherited)
         self._metadata_timeout_seconds = metadata_timeout_seconds
         self._max_capture_bytes = max_capture_bytes
+        if source_policy not in {"curated", "public_supported"}:
+            raise SourceValidationError("media source policy is unsupported")
+        self._source_policy = source_policy
+        self._allowed_hosts = tuple(
+            dict.fromkeys(value.strip().casefold().rstrip(".") for value in allowed_hosts)
+        )
+        try:
+            self._enabled_providers = tuple(
+                dict.fromkeys(ProviderIdentity(value) for value in enabled_providers)
+            )
+        except ValueError as exc:
+            raise SourceValidationError("an enabled media provider is unsupported") from exc
+        if not self._enabled_providers:
+            raise SourceValidationError("at least one media provider must be enabled")
+        configured_extractors = {
+            value.strip().casefold() for value in allowed_extractors if value.strip()
+        }
+        if source_policy == "curated":
+            for provider in self._enabled_providers:
+                capability = provider_capability(provider)
+                if capability.acquisition:
+                    configured_extractors.update(capability.extractor_aliases)
+        elif not self._allowed_hosts or not configured_extractors:
+            raise SourceValidationError(
+                "public_supported policy requires explicit hosts and extractors"
+            )
+        for extractor in configured_extractors:
+            extractor_provider = provider_for_extractor(extractor)
+            if extractor_provider is None or extractor_provider not in self._enabled_providers:
+                raise SourceValidationError(
+                    "an allowed extractor is not reviewed for an enabled provider"
+                )
+        blocked = {value.strip().casefold() for value in blocked_extractors if value.strip()}
+        if "generic" in configured_extractors and not allow_generic_extractor:
+            raise SourceValidationError("the generic extractor is disabled")
+        if configured_extractors & blocked:
+            raise SourceValidationError("an allowed media extractor is explicitly blocked")
+        self._allowed_extractors = tuple(sorted(configured_extractors))
+        self._url_policy = ProviderURLPolicy()
 
-    def _base_argv(self) -> list[str]:
-        return [
+    def _base_argv(self, *, allow_playlist: bool = False) -> list[str]:
+        argv = [
             str(self.executable),
             "--ignore-config",
             "--no-plugin-dirs",
             "--no-remote-components",
-            "--no-playlist",
             "--use-extractors",
-            "youtube,youtube:search",
+            ",".join(self._allowed_extractors),
             "--no-warnings",
         ]
+        if not allow_playlist:
+            argv.append("--no-playlist")
+        return argv
 
     def search(
         self,
@@ -282,15 +414,41 @@ class YtDlpClient:
         limit: int = 8,
         cancel_signal: CancellationSignal | None = None,
     ) -> dict[str, Any]:
+        return self.search_provider(
+            query,
+            provider=ProviderIdentity.YOUTUBE,
+            limit=limit,
+            cancel_signal=cancel_signal,
+        )
+
+    def search_provider(
+        self,
+        query: str,
+        *,
+        provider: ProviderIdentity | str,
+        limit: int = 8,
+        cancel_signal: CancellationSignal | None = None,
+    ) -> dict[str, Any]:
         normalized = validate_search_query(query)
         if isinstance(limit, bool) or not 1 <= limit <= 10:
             raise SourceValidationError("search result limit must be between 1 and 10")
+        provider_id = ProviderIdentity(provider)
+        if provider_id not in self._enabled_providers:
+            raise SourceValidationError("media provider is disabled")
+        prefix = {
+            ProviderIdentity.YOUTUBE: "ytsearch",
+            ProviderIdentity.SOUNDCLOUD: "scsearch",
+        }.get(provider_id)
+        if prefix is None:
+            raise SourceValidationError("provider does not support bounded text search")
         argv = [
-            *self._base_argv(),
+            *self._base_argv(allow_playlist=True),
             "--flat-playlist",
+            "--playlist-end",
+            str(limit),
             "--dump-single-json",
             "--simulate",
-            f"ytsearch{limit}:{normalized}",
+            f"{prefix}{limit}:{normalized}",
         ]
         return self._run_json(
             argv,
@@ -301,14 +459,123 @@ class YtDlpClient:
     def probe(self, url: str, *, cancel_signal: CancellationSignal | None = None) -> dict[str, Any]:
         validated = self.validate_url(url)
         argv = [*self._base_argv(), "--dump-single-json", "--simulate", validated]
-        return self._run_json(
+        result = self._run_json(
             argv,
             timeout_seconds=self._metadata_timeout_seconds,
             cancel_signal=cancel_signal,
         )
+        self._validate_probe_identity(validated, result)
+        validate_public_media_metadata(result)
+        return result
+
+    def inspect_collection(
+        self,
+        url: str,
+        *,
+        limit: int,
+        cancel_signal: CancellationSignal | None = None,
+    ) -> dict[str, Any]:
+        """Return a flat, bounded collection preview without downloading an item."""
+
+        if isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise SourceValidationError("collection item limit must be between 1 and 100")
+        validated = self.validate_collection_url(url)
+        result = self._run_json(
+            [
+                *self._base_argv(allow_playlist=True),
+                "--yes-playlist",
+                "--flat-playlist",
+                "--playlist-end",
+                str(limit + 1),
+                "--dump-single-json",
+                "--simulate",
+                validated,
+            ],
+            timeout_seconds=self._metadata_timeout_seconds,
+            cancel_signal=cancel_signal,
+        )
+        self._validate_probe_identity(validated, result)
+        entries = result.get("entries")
+        if not isinstance(entries, list):
+            raise SourceValidationError("collection metadata did not contain a bounded item list")
+        if len(entries) > limit:
+            raise SourceValidationError("collection exceeds the configured item limit")
+        for entry in entries:
+            if isinstance(entry, Mapping):
+                validate_public_media_metadata(entry)
+        return result
 
     def validate_url(self, url: str) -> str:
-        return validate_youtube_url(url, resolver=self._resolver)
+        if is_curated_collection_url(url):
+            raise SourceValidationError("collection URLs require bounded item selection")
+        return self._validate_provider_url(url, allow_collection=False)
+
+    def validate_collection_url(self, url: str) -> str:
+        if not is_curated_collection_url(url):
+            raise SourceValidationError("source URL does not identify a supported collection")
+        return self._validate_provider_url(url, allow_collection=True)
+
+    def _validate_provider_url(self, url: str, *, allow_collection: bool) -> str:
+        provider = provider_for_url(url)
+        if provider is None or provider not in self._enabled_providers:
+            raise SourceValidationError("source host is not an enabled curated provider")
+        if provider is ProviderIdentity.YOUTUBE:
+            validated = (
+                validate_youtube_collection_url(url, resolver=self._resolver)
+                if allow_collection
+                else validate_youtube_url(url, resolver=self._resolver)
+            )
+        else:
+            validation = self._url_policy.validate(url, provider=provider)
+            if not validation.allowed:
+                raise SourceValidationError(validation.reason_code)
+            parsed_input = urlsplit(url)
+            assert parsed_input.hostname is not None
+            if not allow_collection and not _is_curated_single_item_path(
+                parsed_input.path,
+                provider,
+            ):
+                raise SourceValidationError("source URL does not identify one supported item")
+            try:
+                normalized_hostname = (
+                    parsed_input.hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+                )
+            except UnicodeError as exc:
+                raise SourceValidationError("source host is not valid IDNA") from exc
+            resolve_global_addresses(normalized_hostname, 443, resolver=self._resolver)
+            validated = urlunsplit(
+                (
+                    "https",
+                    normalized_hostname,
+                    parsed_input.path or "/",
+                    parsed_input.query,
+                    "",
+                )
+            )
+        parsed = urlsplit(validated)
+        assert parsed.hostname is not None
+        if self._source_policy == "public_supported" and not _host_matches_any(
+            parsed.hostname, self._allowed_hosts
+        ):
+            raise SourceValidationError("source host is not explicitly allowed")
+        return validated
+
+    def _validate_probe_identity(self, url: str, metadata: Mapping[str, Any]) -> None:
+        expected = provider_for_url(url)
+        extractor = _optional_string(metadata.get("extractor")) or _optional_string(
+            metadata.get("extractor_key")
+        )
+        if extractor is None:
+            raise SourceValidationError("media probe returned no extractor identity")
+        normalized = extractor.strip().casefold()
+        actual = provider_for_extractor(normalized)
+        if actual is None or actual is not expected or not self._extractor_allowed(normalized):
+            raise SourceValidationError("media extractor did not match the validated provider")
+        if normalized == "generic" or normalized in {"generic", "generic:default"}:
+            raise SourceValidationError("generic media extraction is prohibited")
+
+    def _extractor_allowed(self, extractor: str) -> bool:
+        return extractor in self._allowed_extractors
 
     def download_audio(
         self,
@@ -316,6 +583,7 @@ class YtDlpClient:
         output_directory: Path,
         *,
         max_duration_seconds: int,
+        max_media_bytes: int = 1024 * 1024 * 1024,
         timeout_seconds: float = 1800.0,
         progress_callback: ProgressCallback | None = None,
         cancel_signal: CancellationSignal | None = None,
@@ -327,6 +595,8 @@ class YtDlpClient:
             raise SourceValidationError("download destination must be a real directory")
         if isinstance(max_duration_seconds, bool) or max_duration_seconds <= 0:
             raise ValueError("max_duration_seconds must be positive")
+        if isinstance(max_media_bytes, bool) or max_media_bytes <= 0:
+            raise ValueError("max_media_bytes must be positive")
 
         argv = [
             *self._base_argv(),
@@ -342,8 +612,8 @@ class YtDlpClient:
             "--output",
             "%(extractor)s-%(id)s.%(ext)s",
             "--no-overwrites",
-            "--max-downloads",
-            "1",
+            "--max-filesize",
+            str(max_media_bytes),
             "--match-filter",
             f"duration <= {int(max_duration_seconds)}",
             "--newline",
@@ -351,20 +621,40 @@ class YtDlpClient:
             "--progress-template",
             f"download:{_PROGRESS_PREFIX}%(progress)j",
             "--print",
-            f"after_move:{_RESULT_PREFIX}%(filepath)j",
+            (
+                f'after_move:{_RESULT_PREFIX}{{"filepath":%(filepath)j,'
+                '"extractor":%(extractor)j,"source_id":%(id)j}'
+            ),
             "--no-simulate",
             validated,
         ]
         metadata = self.probe(validated, cancel_signal=cancel_signal)
-        lines, final_path = self._run_download(
+        lines, output_record = self._run_download(
             argv,
             timeout_seconds=timeout_seconds,
             progress_callback=progress_callback,
             cancel_signal=cancel_signal,
         )
-        if final_path is None:
-            raise YtDlpError(f"yt-dlp completed without a final path: {redact(lines[-2000:])}")
-        candidate = Path(final_path)
+        if output_record is None:
+            raise YtDlpError(
+                f"yt-dlp completed without a complete result record: {redact(lines[-2000:])}"
+            )
+        expected_extractor = _optional_string(metadata.get("extractor")) or _optional_string(
+            metadata.get("extractor_key")
+        )
+        expected_source_id = _optional_string(metadata.get("id"))
+        if (
+            expected_extractor is None
+            or expected_source_id is None
+            or output_record.extractor.casefold() != expected_extractor.casefold()
+            or output_record.source_id != expected_source_id
+        ):
+            raise YtDlpError("downloaded source identity did not match the validated probe")
+        self._validate_probe_identity(
+            validated,
+            {"extractor": output_record.extractor, "id": output_record.source_id},
+        )
+        candidate = Path(output_record.path)
         if not candidate.is_absolute():
             candidate = output_directory / candidate
         try:
@@ -377,8 +667,8 @@ class YtDlpClient:
             raise YtDlpError("yt-dlp result was not a regular file")
         return DownloadResult(
             path=resolved,
-            extractor=_optional_string(metadata.get("extractor")),
-            source_id=_optional_string(metadata.get("id")),
+            extractor=output_record.extractor,
+            source_id=output_record.source_id,
             metadata=metadata,
         )
 
@@ -407,41 +697,29 @@ class YtDlpClient:
         timeout_seconds: float,
         cancel_signal: CancellationSignal | None = None,
     ) -> str:
-        process = subprocess.Popen(  # noqa: S603 - argv is fixed and shell is disabled
-            list(argv),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            shell=False,
-            env=self._environment,
-            start_new_session=True,
-        )
-        started = time.monotonic()
-        while True:
-            if cancel_signal is not None and cancel_signal.is_set():
-                terminate_process_group(process)
-                process.communicate()
-                raise DownloadCancelled("yt-dlp metadata request was cancelled")
-            remaining = timeout_seconds - (time.monotonic() - started)
-            if remaining <= 0:
-                terminate_process_group(process)
-                process.communicate()
-                raise DownloadTimedOut("yt-dlp metadata request timed out")
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.25, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        if len(stdout) > self._max_capture_bytes or len(stderr) > self._max_capture_bytes:
-            raise YtDlpError("yt-dlp metadata output exceeded the configured limit")
-        decoded_stdout = stdout.decode("utf-8", errors="replace")
-        decoded_stderr = stderr.decode("utf-8", errors="replace")
-        if process.returncode != 0:
+        try:
+            with PinnedEgressProxy(resolver=self._resolver) as egress:
+                result = run_bounded_process(
+                    _with_proxy(argv, egress.url),
+                    environment=self._environment,
+                    timeout_seconds=timeout_seconds,
+                    cancel_signal=cancel_signal,
+                    stdout_limit=self._max_capture_bytes,
+                    stderr_limit=self._max_capture_bytes,
+                )
+        except ProcessCancelled as exc:
+            raise DownloadCancelled("yt-dlp metadata request was cancelled") from exc
+        except ProcessTimedOut as exc:
+            raise DownloadTimedOut("yt-dlp metadata request timed out") from exc
+        except (ProcessOutputLimitExceeded, ProcessFrameLimitExceeded) as exc:
+            raise YtDlpError("yt-dlp metadata output exceeded the configured limit") from exc
+        decoded_stdout = result.stdout.decode("utf-8", errors="replace")
+        decoded_stderr = result.stderr_tail.decode("utf-8", errors="replace")
+        if result.returncode != 0:
             detail = decoded_stderr[-4000:] or decoded_stdout[-4000:]
             raise YtDlpError(
                 f"yt-dlp metadata request failed: {redact(detail)}",
-                returncode=process.returncode,
+                returncode=result.returncode,
             )
         return decoded_stdout
 
@@ -452,89 +730,78 @@ class YtDlpClient:
         timeout_seconds: float,
         progress_callback: ProgressCallback | None,
         cancel_signal: CancellationSignal | None,
-    ) -> tuple[str, str | None]:
-        process = subprocess.Popen(  # noqa: S603 - argv is fixed and shell is disabled
-            list(argv),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            shell=False,
-            env=self._environment,
-            start_new_session=True,
-        )
-        assert process.stdout is not None
-        assert process.stderr is not None
-        line_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+    ) -> tuple[str, DownloadOutputRecord | None]:
+        output_record: DownloadOutputRecord | None = None
 
-        def read_stream(name: str, stream: Any) -> None:
-            try:
-                for line in iter(stream.readline, ""):
-                    line_queue.put((name, line))
-            finally:
-                line_queue.put((name, None))
+        def frame(_stream_name: str, raw_frame: bytes) -> None:
+            nonlocal output_record
+            stripped = raw_frame.decode("utf-8", errors="replace").strip()
+            if stripped.startswith(_PROGRESS_PREFIX):
+                progress = _parse_progress(stripped.removeprefix(_PROGRESS_PREFIX))
+                if progress is not None and progress_callback is not None:
+                    progress_callback(progress)
+            elif stripped.startswith(_RESULT_PREFIX):
+                output_record = _parse_result_record(stripped.removeprefix(_RESULT_PREFIX))
 
-        readers = [
-            threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
-            threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
-        ]
-        for reader in readers:
-            reader.start()
-
-        started = time.monotonic()
-        closed_streams: set[str] = set()
-        captured: list[str] = []
-        captured_size = 0
-        final_path: str | None = None
         try:
-            while process.poll() is None or len(closed_streams) < 2:
-                if cancel_signal is not None and cancel_signal.is_set():
-                    terminate_process_group(process)
-                    raise DownloadCancelled("download was cancelled")
-                if time.monotonic() - started > timeout_seconds:
-                    terminate_process_group(process)
-                    raise DownloadTimedOut("download exceeded its time limit")
-                try:
-                    stream_name, line = line_queue.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                if line is None:
-                    closed_streams.add(stream_name)
-                    continue
-                encoded_size = len(line.encode("utf-8", errors="replace"))
-                captured_size += encoded_size
-                if captured_size <= self._max_capture_bytes:
-                    captured.append(line)
-                elif captured_size - encoded_size <= self._max_capture_bytes:
-                    captured.append("[yt-dlp output truncated]\n")
-                stripped = line.strip()
-                if stripped.startswith(_PROGRESS_PREFIX):
-                    progress = _parse_progress(stripped.removeprefix(_PROGRESS_PREFIX))
-                    if progress is not None and progress_callback is not None:
-                        progress_callback(progress)
-                elif stripped.startswith(_RESULT_PREFIX):
-                    final_path = _parse_result_path(stripped.removeprefix(_RESULT_PREFIX))
-        finally:
-            if process.poll() is None:
-                terminate_process_group(process)
-            for reader in readers:
-                reader.join(timeout=1.0)
-            process.stdout.close()
-            process.stderr.close()
-        combined = "".join(captured)
-        if process.returncode != 0:
+            with PinnedEgressProxy(resolver=self._resolver) as egress:
+                result = run_bounded_process(
+                    _with_proxy(argv, egress.url),
+                    environment=self._environment,
+                    timeout_seconds=timeout_seconds,
+                    cancel_signal=cancel_signal,
+                    stdout_limit=self._max_capture_bytes,
+                    stderr_limit=self._max_capture_bytes,
+                    on_frame=frame,
+                )
+        except ProcessCancelled as exc:
+            raise DownloadCancelled("download was cancelled") from exc
+        except ProcessTimedOut as exc:
+            raise DownloadTimedOut("download exceeded its time limit") from exc
+        except (ProcessOutputLimitExceeded, ProcessFrameLimitExceeded) as exc:
+            raise YtDlpError("yt-dlp download output exceeded the configured limit") from exc
+        combined = (result.stdout + b"\n" + result.stderr_tail).decode("utf-8", errors="replace")
+        if result.returncode != 0 and not (result.returncode == 101 and output_record is not None):
             raise YtDlpError(
                 f"yt-dlp download failed: {redact(combined[-4000:])}",
-                returncode=process.returncode,
+                returncode=result.returncode,
             )
-        return combined, final_path
+        return combined, output_record
 
 
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _host_matches_any(hostname: str, patterns: Sequence[str]) -> bool:
+    normalized = hostname.rstrip(".").casefold()
+    return any(
+        normalized == pattern or (pattern.startswith("*.") and normalized.endswith(pattern[1:]))
+        for pattern in patterns
+    )
+
+
+def _is_curated_single_item_path(path: str, provider: ProviderIdentity) -> bool:
+    parts = [part for part in path.casefold().split("/") if part]
+    if provider is ProviderIdentity.BANDCAMP:
+        return len(parts) == 2 and parts[0] == "track" and bool(parts[1])
+    if provider is ProviderIdentity.SOUNDCLOUD:
+        reserved_collections = {
+            "albums",
+            "likes",
+            "popular-tracks",
+            "reposts",
+            "sets",
+            "tracks",
+        }
+        return len(parts) == 2 and parts[1] not in reserved_collections
+    return False
+
+
+def _with_proxy(argv: Sequence[str], proxy_url: str) -> list[str]:
+    if not argv:
+        raise ValueError("yt-dlp argument vector cannot be empty")
+    return [str(argv[0]), "--proxy", proxy_url, *(str(item) for item in argv[1:])]
 
 
 def _optional_int(value: object) -> int | None:
@@ -577,9 +844,16 @@ def _parse_progress(payload: str) -> DownloadProgress | None:
     )
 
 
-def _parse_result_path(payload: str) -> str | None:
+def _parse_result_record(payload: str) -> DownloadOutputRecord | None:
     try:
         value = json.loads(payload)
     except json.JSONDecodeError:
         return None
-    return value if isinstance(value, str) and value else None
+    if not isinstance(value, dict):
+        return None
+    path = _optional_string(value.get("filepath"))
+    extractor = _optional_string(value.get("extractor"))
+    source_id = _optional_string(value.get("source_id"))
+    if path is None or extractor is None or source_id is None:
+        return None
+    return DownloadOutputRecord(path=path, extractor=extractor, source_id=source_id)

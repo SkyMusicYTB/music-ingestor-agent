@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import stat
-import subprocess
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,9 +12,15 @@ from app.clients.ytdlp import (
     ToolUnavailableError,
     minimal_subprocess_env,
     resolve_executable,
-    terminate_process_group,
 )
 from app.logging import redact
+from app.workers.process import (
+    ProcessCancelled,
+    ProcessFrameLimitExceeded,
+    ProcessOutputLimitExceeded,
+    ProcessTimedOut,
+    run_bounded_process,
+)
 
 
 class MediaValidationError(RuntimeError):
@@ -155,37 +159,24 @@ class MediaProcessor:
         *,
         cancel_signal: CancellationSignal | None = None,
     ) -> str:
-        process = subprocess.Popen(  # noqa: S603 - fixed argv, resolved binary, no shell
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            env=self.environment,
-            start_new_session=True,
-        )
-        started = time.monotonic()
-        while True:
-            if cancel_signal is not None and cancel_signal.is_set():
-                terminate_process_group(process)
-                process.communicate()
-                raise DownloadCancelled("media processing was cancelled")
-            remaining = self.timeout_seconds - (time.monotonic() - started)
-            if remaining <= 0:
-                terminate_process_group(process)
-                process.communicate()
-                raise MediaValidationError("media subprocess timed out")
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.25, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        if len(stdout) > 1024 * 1024 or len(stderr) > 1024 * 1024:
-            raise MediaValidationError("media subprocess output exceeded its bound")
-        if process.returncode != 0:
+        try:
+            result = run_bounded_process(
+                argv,
+                environment=self.environment,
+                timeout_seconds=self.timeout_seconds,
+                cancel_signal=cancel_signal,
+                stdout_limit=1024 * 1024,
+                stderr_limit=1024 * 1024,
+            )
+        except ProcessCancelled as exc:
+            raise DownloadCancelled("media processing was cancelled") from exc
+        except ProcessTimedOut as exc:
+            raise MediaValidationError("media subprocess timed out") from exc
+        except (ProcessOutputLimitExceeded, ProcessFrameLimitExceeded) as exc:
+            raise MediaValidationError("media subprocess output exceeded its bound") from exc
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr_tail.decode("utf-8", errors="replace")
+        if result.returncode != 0:
             raise MediaValidationError(f"media subprocess failed: {redact(stderr[-2000:])}")
         return stdout
 

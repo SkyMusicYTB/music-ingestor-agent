@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
 from app.config import Settings
 from app.db.models import Track, User
 from app.repositories.auth import AuthRepository, SetupAlreadyCompleted
-from app.repositories.requests import parse_requested_count
+from app.repositories.requests import classify_input, parse_requested_count
 from app.services.confirmation import confirmation_decision
 from app.services.duplicates import (
     DuplicateCandidate,
@@ -33,6 +35,9 @@ def test_requested_count_is_extracted_without_model_authority() -> None:
     assert parse_requested_count("recommend twelve songs", input_kind="natural_language") == 12
     assert parse_requested_count("Numb by Linkin Park", input_kind="natural_language") is None
     assert parse_requested_count("https://youtu.be/abcdefghijk", input_kind="youtube_url") == 1
+    collection_url = "https://artist.bandcamp.com/album/a-reviewed-album"
+    assert classify_input(collection_url) == "media_collection_url"
+    assert parse_requested_count(collection_url, input_kind="media_collection_url") is None
 
 
 def test_first_admin_insert_is_atomic(engine, session_factory, settings) -> None:
@@ -133,6 +138,209 @@ def test_confirmation_accepts_only_an_explicit_exact_direct_add(settings) -> Non
     assert result.auto_queue is True
 
 
+def test_fuzzy_single_result_cannot_become_an_exact_add_from_model_output(settings) -> None:
+    class Candidate:
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.99
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": recording_mbid,
+                "score": 99,
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = 1
+
+        def __init__(self, raw_text: str) -> None:
+            self.raw_text = raw_text
+
+    for raw_text in (
+        "add a dreamy track",
+        "add something similar to Yellow by Coldplay",
+        "add some popular music",
+        "add a song by Coldplay",
+        "add a sad song",
+        "add a 90s hit",
+        "add the newest Coldplay single",
+    ):
+        result = confirmation_decision(Request(raw_text), [Candidate()], settings)
+        assert result.auto_queue is False
+        assert "original request" in result.reason
+
+
+def test_explicit_title_and_artist_remain_exact_even_for_a_generic_real_title(settings) -> None:
+    class Candidate:
+        artist = "The Beatles"
+        title = "Something"
+        album = "Abbey Road"
+        version_signature = "studio"
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.96
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": "11111111-1111-1111-1111-111111111111",
+                "score": 96,
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = 1
+        raw_text = "add Something by The Beatles"
+
+    result = confirmation_decision(Request(), [Candidate()], settings)
+    assert result.auto_queue is True
+
+
+@pytest.mark.parametrize(
+    "source_constraint",
+    [
+        "from SoundCloud or via Bandcamp",
+        "from SoundCloud, not from YouTube",
+        "without YouTube",
+        "Bandcamp only",
+    ],
+)
+def test_exact_autoqueue_ignores_only_explicit_source_qualifiers(
+    settings, source_constraint: str
+) -> None:
+    class Candidate:
+        artist = "Coldplay"
+        title = "Yellow"
+        album = "Parachutes"
+        version_signature = "studio"
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.96
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": recording_mbid,
+                "score": 96,
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = 1
+        raw_text = f"add Yellow by Coldplay {source_constraint}"
+
+    assert confirmation_decision(Request(), [Candidate()], settings).auto_queue is True
+
+
+def test_exact_autoqueue_is_bound_to_the_authoritative_requested_identity(settings) -> None:
+    class Candidate:
+        artist = "Radiohead"
+        title = "Creep"
+        album = "Pablo Honey"
+        version_signature = "studio"
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.99
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": recording_mbid,
+                "score": 99,
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = 1
+        raw_text = "add Yellow by Coldplay"
+
+    result = confirmation_decision(Request(), [Candidate()], settings)
+    assert result.auto_queue is False
+    assert "authoritative exact-track identity" in result.reason
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        "add Yellow and Clocks by Coldplay",
+        "add Yellow, Clocks by Coldplay",
+    ],
+)
+def test_partial_bulk_result_cannot_autoqueue_as_an_exact_add(settings, raw_text: str) -> None:
+    class Candidate:
+        artist = "Coldplay"
+        title = "Yellow"
+        album = "Parachutes"
+        version_signature = "studio"
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.99
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": recording_mbid,
+                "score": 99,
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = None
+
+        def __init__(self, text: str) -> None:
+            self.raw_text = text
+
+    assert confirmation_decision(Request(raw_text), [Candidate()], settings).auto_queue is False
+
+
+def test_collection_origin_never_autoqueues_a_single_surviving_entry(settings) -> None:
+    class Candidate:
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 1.0
+        recording_mbid = None
+        source_extractor = "bandcamp"
+        source_id = "yellow"
+        metadata_provenance_json = json.dumps({"source": "validated_direct_collection_metadata"})
+
+    class Request:
+        action = "add"
+        input_kind = "media_collection_url"
+        requested_count = None
+        raw_text = "https://coldplay.bandcamp.com/album/parachutes"
+
+    result = confirmation_decision(Request(), [Candidate()], settings)
+    assert result.auto_queue is False
+    assert "collection entries" in result.reason
+
+
 def test_production_secrets_come_only_from_credential_files(tmp_path: Path) -> None:
     credentials = tmp_path / "credentials"
     credentials.mkdir()
@@ -140,14 +348,10 @@ def test_production_secrets_come_only_from_credential_files(tmp_path: Path) -> N
     (credentials / "openai_api_key").write_text("credential-openai", encoding="utf-8")
     settings = Settings(
         environment="production",
-        database_path=tmp_path / "db.sqlite",
-        artwork_path=tmp_path / "art",
-        downloads_path=tmp_path / "downloads",
-        music_path=tmp_path / "music",
-        backup_path=tmp_path / "backups",
         credential_directory=credentials,
         auth_hmac_key="untrusted-environment-hmac",
         openai_api_key="untrusted-environment-openai",
+        **MANAGED_PRODUCTION_PATHS,
     )
     assert settings.auth_hmac_key.get_secret_value() == "credential-hmac"
     assert settings.openai_api_key is not None
@@ -158,13 +362,18 @@ def test_production_worker_is_secret_free_and_needs_no_credentials(tmp_path: Pat
     settings = Settings(
         environment="production",
         service_role="worker",
-        database_path=tmp_path / "db.sqlite",
-        artwork_path=tmp_path / "art",
-        downloads_path=tmp_path / "downloads",
-        music_path=tmp_path / "music",
-        backup_path=tmp_path / "backups",
         openai_api_key="must-be-discarded",
         listenbrainz_token="must-also-be-discarded",  # noqa: S106 - proves worker scrubbing
+        **MANAGED_PRODUCTION_PATHS,
     )
     assert settings.openai_api_key is None
     assert settings.listenbrainz_token is None
+
+
+MANAGED_PRODUCTION_PATHS = {
+    "database_path": Path("/var/lib/music-agent/music-agent.db"),
+    "artwork_path": Path("/var/lib/music-agent/artwork"),
+    "downloads_path": Path("/srv/music-downloads"),
+    "music_path": Path("/srv/music"),
+    "backup_path": Path("/var/lib/music-agent/backups"),
+}

@@ -32,7 +32,9 @@ done
 
 music_agent_require_root
 music_agent_assert_supported_host
+music_agent_require_command runuser
 music_agent_acquire_lock operations
+music_agent_normalize_tool_tree
 
 if [[ -z "$requested_version" && -z "$requested_digest" ]]; then
     music_agent_read_tool_pins "$SCRIPT_DIR/../requirements/tool-pins.env"
@@ -51,13 +53,30 @@ if [[ -L "$MUSIC_AGENT_TOOL_BIN/yt-dlp" ]]; then
 fi
 
 music_agent_install_yt_dlp "$requested_version" "$url" "$requested_digest"
+music_agent_normalize_tool_tree
+if ! music_agent_probe_tools_as_service >/dev/null; then
+    if [[ -n "$old_target" ]]; then
+        music_agent_warn "runtime-user tool validation failed; restoring the previous yt-dlp link"
+        music_agent_atomic_symlink "$old_target" "$MUSIC_AGENT_TOOL_BIN/yt-dlp"
+        chown -h root:root "$MUSIC_AGENT_TOOL_BIN/yt-dlp"
+        music_agent_normalize_tool_tree
+    else
+        music_agent_warn "runtime-user tool validation failed; removing the unvalidated yt-dlp link"
+        unlink "$MUSIC_AGENT_TOOL_BIN/yt-dlp"
+    fi
+    music_agent_die "yt-dlp update is not executable by the service account"
+fi
 if music_agent_unit_exists music-agent-worker.service && \
         music_agent_systemctl is-active --quiet music-agent-worker.service; then
     if ! music_agent_systemctl restart music-agent-worker.service; then
         if [[ -n "$old_target" ]]; then
             music_agent_warn "worker restart failed; restoring the previous yt-dlp link"
             music_agent_atomic_symlink "$old_target" "$MUSIC_AGENT_TOOL_BIN/yt-dlp"
+            chown -h root:root "$MUSIC_AGENT_TOOL_BIN/yt-dlp"
+            music_agent_normalize_tool_tree
             music_agent_systemctl restart music-agent-worker.service || true
+        else
+            unlink "$MUSIC_AGENT_TOOL_BIN/yt-dlp"
         fi
         music_agent_die "yt-dlp update could not be activated"
     fi

@@ -6,6 +6,13 @@ readonly MUSIC_AGENT_SERVICE_GROUP="music-agent"
 readonly MUSIC_AGENT_SUPPORTED_UBUNTU="26.04"
 readonly MUSIC_AGENT_SUPPORTED_ARCH="amd64"
 readonly MUSIC_AGENT_PYTHON="/usr/bin/python3"
+readonly MUSIC_AGENT_NATIVE_DATABASE_PATH="/var/lib/music-agent/music-agent.db"
+readonly MUSIC_AGENT_NATIVE_ARTWORK_PATH="/var/lib/music-agent/artwork"
+readonly MUSIC_AGENT_NATIVE_DOWNLOADS_PATH="/srv/music-downloads"
+readonly MUSIC_AGENT_NATIVE_MUSIC_PATH="/srv/music"
+readonly MUSIC_AGENT_NATIVE_BACKUP_PATH="/var/lib/music-agent/backups"
+MUSIC_AGENT_DIRECTORY_WRITE_DENIAL_PROBE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/directory_write_denial_probe.py"
+readonly MUSIC_AGENT_DIRECTORY_WRITE_DENIAL_PROBE
 
 if [[ "${MUSIC_AGENT_TEST_MODE:-0}" == "1" ]]; then
     : "${MUSIC_AGENT_ROOT_PREFIX:?MUSIC_AGENT_ROOT_PREFIX is required in test mode}"
@@ -41,6 +48,8 @@ readonly MUSIC_AGENT_STATE_DIR
 readonly MUSIC_AGENT_DB="$MUSIC_AGENT_STATE_DIR/music-agent.db"
 readonly MUSIC_AGENT_BACKUP_DIR="$MUSIC_AGENT_STATE_DIR/backups"
 readonly MUSIC_AGENT_DEPLOYMENT_DIR="$MUSIC_AGENT_STATE_DIR/deployments"
+MUSIC_AGENT_TRANSACTION_BACKUP_DIR="$(music_agent_path /var/lib/music-agent-safety-backups)"
+readonly MUSIC_AGENT_TRANSACTION_BACKUP_DIR
 MUSIC_AGENT_DOWNLOAD_DIR="$(music_agent_path /srv/music-downloads)"
 readonly MUSIC_AGENT_DOWNLOAD_DIR
 MUSIC_AGENT_MUSIC_DIR="$(music_agent_path /srv/music)"
@@ -125,12 +134,79 @@ music_agent_acquire_lock() {
     export MUSIC_AGENT_OPERATION_LOCK_HELD=1
 }
 
+music_agent_acquire_directory_lock() {
+    local directory="${1:?lock directory required}"
+    local description="${2:-operation}"
+    [[ -d "$directory" && ! -L "$directory" ]] ||
+        music_agent_die "$description lock target must be a physical directory: $directory"
+
+    # Lock the already-open directory inode.  Never create a lock pathname in a
+    # service-writable directory: a privileged invocation would otherwise follow
+    # an attacker-planted symlink while opening it for output.
+    exec 8<"$directory"
+    flock -n 8 || music_agent_die "another $description is running"
+}
+
 music_agent_assert_within() {
     local candidate="${1:?candidate required}" parent="${2:?parent required}"
     case "$candidate" in
         "$parent"/*) ;;
         *) music_agent_die "unsafe path outside $parent: $candidate" ;;
     esac
+}
+
+music_agent_assert_managed_backup_path() {
+    local candidate="${1:?backup path required}"
+    case "$candidate" in
+        "$MUSIC_AGENT_BACKUP_DIR"/*|"$MUSIC_AGENT_TRANSACTION_BACKUP_DIR"/*) ;;
+        *) music_agent_die "unsafe path outside the managed backup directories: $candidate" ;;
+    esac
+}
+
+music_agent_prepare_transaction_backup_dir() {
+    local parent
+    parent="$(dirname "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR")"
+    [[ ! -L "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR" ]] ||
+        music_agent_die "transaction backup directory must not be a symlink"
+    if [[ "${MUSIC_AGENT_TEST_MODE:-0}" == "1" ]]; then
+        install -d -m 0700 "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR"
+        return 0
+    fi
+    [[ -d "$parent" && ! -L "$parent" ]] ||
+        music_agent_die "transaction backup parent must be a physical directory: $parent"
+    [[ "$(stat -c '%U' "$parent")" == "root" ]] ||
+        music_agent_die "transaction backup parent must be root-owned: $parent"
+    [[ -z "$(find "$parent" -maxdepth 0 -perm /022 -print -quit)" ]] ||
+        music_agent_die "transaction backup parent must not be group/world-writable: $parent"
+    music_agent_require_command runuser
+    [[ -r "$MUSIC_AGENT_DIRECTORY_WRITE_DENIAL_PROBE" ]] ||
+        music_agent_die "directory write-denial probe is missing"
+    id "$MUSIC_AGENT_SERVICE_USER" >/dev/null 2>&1 ||
+        music_agent_die "service account does not exist"
+    music_agent_assert_service_cannot_write_directory "$parent"
+    install -d -m 0700 -o root -g root "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR"
+    [[ "$(stat -c '%U:%G:%a' "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR")" == "root:root:700" ]] ||
+        music_agent_die "transaction backup directory must be root:root mode 0700"
+    music_agent_assert_service_cannot_write_directory "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR"
+}
+
+music_agent_assert_service_cannot_write_directory() {
+    local directory="${1:?directory required}" nonce probe_name probe_path status
+    nonce="$("$MUSIC_AGENT_PYTHON" -c 'import secrets; print(secrets.token_hex(16))')"
+    [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || music_agent_die "could not create directory probe nonce"
+    probe_name=".music-agent-deny-write-$nonce"
+    probe_path="$directory/$probe_name"
+    set +e
+    runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+        "PATH=/usr/bin:/bin" "$MUSIC_AGENT_PYTHON" - "$directory" "$probe_name" \
+        < "$MUSIC_AGENT_DIRECTORY_WRITE_DENIAL_PROBE"
+    status=$?
+    set -e
+    if [[ -e "$probe_path" || -L "$probe_path" ]]; then
+        unlink "$probe_path" || music_agent_die "could not clean directory write-denial probe"
+    fi
+    [[ "$status" -eq 0 ]] ||
+        music_agent_die "service account can mutate protected backup directory entries: $directory"
 }
 
 music_agent_atomic_symlink() {
@@ -216,10 +292,42 @@ music_agent_parse_env_file() {
     done < "$file"
 }
 
+music_agent_assert_managed_production_config() {
+    local required key expected assignment actual matches
+    for required in \
+            "MUSIC_AGENT_ENVIRONMENT=production" \
+            "MUSIC_AGENT_DATABASE_PATH=$MUSIC_AGENT_NATIVE_DATABASE_PATH" \
+            "MUSIC_AGENT_ARTWORK_PATH=$MUSIC_AGENT_NATIVE_ARTWORK_PATH" \
+            "MUSIC_AGENT_DOWNLOADS_PATH=$MUSIC_AGENT_NATIVE_DOWNLOADS_PATH" \
+            "MUSIC_AGENT_MUSIC_PATH=$MUSIC_AGENT_NATIVE_MUSIC_PATH" \
+            "MUSIC_AGENT_BACKUP_PATH=$MUSIC_AGENT_NATIVE_BACKUP_PATH"; do
+        key="${required%%=*}"
+        expected="${required#*=}"
+        actual=""
+        matches=0
+        for assignment in "${MUSIC_AGENT_CONFIG_ENV[@]}"; do
+            if [[ "${assignment%%=*}" == "$key" ]]; then
+                actual="${assignment#*=}"
+                matches=$((matches + 1))
+            fi
+        done
+        [[ "$matches" -eq 1 ]] ||
+            music_agent_die "$key must appear exactly once in $MUSIC_AGENT_ENV_FILE"
+        [[ "$actual" == "$expected" ]] ||
+            music_agent_die "$key must use the managed production value: $expected"
+    done
+}
+
 music_agent_with_credentials() (
     local command=("$@") credential_tmp credential
     [[ ${#command[@]} -gt 0 ]] || music_agent_die "internal error: command required"
+    if music_agent_unit_exists music-agent-worker.service &&
+            music_agent_systemctl is-active --quiet music-agent-worker.service; then
+        music_agent_die \
+            "credential-backed administrative commands require music-agent-worker.service to be stopped"
+    fi
     music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
+    music_agent_assert_managed_production_config
     [[ -d "$(music_agent_path /run)" ]] || install -d -m 0755 "$(music_agent_path /run)"
     credential_tmp="$(mktemp -d "$(music_agent_path /run)/music-agent-credentials.XXXXXX")"
     trap 'if [[ -n "${credential_tmp:-}" && -d "$credential_tmp" ]]; then find "$credential_tmp" -depth -delete; fi' EXIT
@@ -243,6 +351,20 @@ music_agent_with_credentials() (
     local status=$?
     set -e
     return "$status"
+)
+
+music_agent_without_credentials() (
+    local command=("$@")
+    [[ ${#command[@]} -gt 0 ]] || music_agent_die "internal error: command required"
+    music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
+    music_agent_assert_managed_production_config
+    runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+        "PATH=$MUSIC_AGENT_PATH" \
+        "HOME=$MUSIC_AGENT_STATE_DIR" \
+        "PYTHONDONTWRITEBYTECODE=1" \
+        "${MUSIC_AGENT_CONFIG_ENV[@]}" \
+        "MUSIC_AGENT_SERVICE_ROLE=worker" \
+        "${command[@]}"
 )
 
 music_agent_sha256() {

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import Field, ValidationError, model_validator
+from rapidfuzz.fuzz import token_set_ratio
 from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -38,15 +39,44 @@ from app.repositories.usage import OpenAIUsageRepository
 from app.schemas import MusicProposal, ProposalTrack, StrictModel
 from app.services.conversations import ConversationService, OrchestrationContext
 from app.services.costs import CostCalculator, PricingSnapshot
-from app.services.duplicates import DuplicateCandidate, DuplicateDetector, version_signature
+from app.services.duplicates import (
+    DuplicateCandidate,
+    DuplicateDetector,
+    version_signature,
+    versions_compatible,
+)
 from app.services.metadata_matching import normalize_text
-from app.services.proposals import ProposalLeaseLost, ProposalService, VerifiedMetadata
+from app.services.proposals import (
+    ProposalLeaseLost,
+    ProposalService,
+    VerifiedMetadata,
+    _verified_match,
+)
+from app.sources import (
+    CanonicalMatchDecision,
+    MatchDecision,
+    ProviderIdentity,
+    SourceMatchDecision,
+    UploaderRelationship,
+    bound_provider_description,
+    canonical_match_decision_schema,
+    source_match_decision_schema,
+    validate_canonical_match_decision,
+    validate_source_match_decision,
+)
+from app.tools.media_sources import media_tool_authorization
 from app.tools.registry import ToolExecution, ToolRegistry
 
 PROMPT_VERSION = "orchestrator_v1"
 SOURCE_PROMPT_VERSION = "source_selector_v1"
+SOURCE_MATCH_PROMPT_VERSION = "source_matcher_v2"
+CANONICAL_MATCH_PROMPT_VERSION = "canonical_matcher_v2"
 _PROMPT_DIRECTORY = Path(__file__).resolve().parent.parent / "prompts"
 _SOURCE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
+_MATCH_CANDIDATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_UNTRUSTED_BEGIN = "[BEGIN_UNTRUSTED_PROVIDER_DESCRIPTION]"
+_UNTRUSTED_END = "[END_UNTRUSTED_PROVIDER_DESCRIPTION]"
 
 
 class OrchestrationError(RuntimeError):
@@ -110,6 +140,8 @@ class OrchestrationService:
         self._duplicates = DuplicateDetector(settings.music_path)
         self._instructions = _load_prompt("orchestrator_v1.txt")
         self._source_instructions = _load_prompt("source_selector_v1.txt")
+        self._source_match_instructions = _load_prompt("source_matcher_v2.txt")
+        self._canonical_match_instructions = _load_prompt("canonical_matcher_v2.txt")
         self._closed = False
 
     async def aclose(self) -> None:
@@ -153,8 +185,9 @@ class OrchestrationService:
                 )
                 return
             context = self._conversations.orchestration_context(request_id)
-            async with asyncio.timeout(self._settings.max_agent_seconds):
-                proposal, degraded_reason, verified_metadata = await self._run_loop(context)
+            with media_tool_authorization(context.user_id, context.request_id):
+                async with asyncio.timeout(self._settings.max_agent_seconds):
+                    proposal, degraded_reason, verified_metadata = await self._run_loop(context)
             self._proposals.store(
                 request_id,
                 proposal,
@@ -213,7 +246,7 @@ class OrchestrationService:
                 lease_token,
                 status="failed",
                 error_code=error.code,
-                error_message="The OpenAI request failed.",
+                error_message=_user_provider_error(error.code),
             )
         except OrchestrationError as error:
             self._mark_terminal(
@@ -237,16 +270,18 @@ class OrchestrationService:
                 await heartbeat
 
     async def select_source(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Choose only one of at most eight supplied IDs; the supervisor persists the result."""
+        """Choose only a supplied finite ID; schema v1 remains wire-compatible."""
 
         if not getattr(self._openai, "configured", True):
             raise OpenAINotConfigured("OpenAI API key is not configured")
+        if payload.get("schema_version") == 2:
+            return await self._select_source_v2(payload)
         sanitized, identifiers = _source_selection_input(payload, self._settings)
         request_id = self._existing_request_id(payload.get("request_id"))
         safety_seed = str(
             payload.get("job_id") or payload.get("request_id") or _stable_json_hash(sanitized)
         )
-        response, _call_id = await self._accounted_response(
+        response, call_id = await self._accounted_response(
             request_id=request_id,
             prompt_version=SOURCE_PROMPT_VERSION,
             instructions=self._source_instructions,
@@ -273,22 +308,161 @@ class OrchestrationService:
             ),
             text_format=source_selection_format(identifiers),
         )
-        _raise_for_response_state(response)
+        self._raise_for_accounted_response_state(response, call_id)
         if response_function_calls(response):
-            raise InvalidProposalError("source selector attempted a tool call")
+            error = InvalidProposalError("source selector attempted a tool call")
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_unexpected_tool_call",
+                failure_phase="structured_output",
+                retryable=False,
+            )
+            raise error
         try:
             selection = SourceSelection.model_validate_json(response_output_text(response))
         except ValidationError as error:
-            raise InvalidProposalError("invalid source selection") from error
+            invalid = InvalidProposalError("invalid source selection")
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_malformed_response",
+                failure_phase="structured_output",
+                retryable=False,
+            )
+            raise invalid from error
         if (
             selection.selected_source_id is not None
             and selection.selected_source_id not in identifiers
         ):
-            raise InvalidProposalError("source selector returned an unknown ID")
+            unknown_id_error = InvalidProposalError("source selector returned an unknown ID")
+            self._fail_completed_call(
+                call_id,
+                error=unknown_id_error,
+                error_code="openai_malformed_response",
+                failure_phase="finite_id_validation",
+                retryable=False,
+            )
+            raise unknown_id_error
         return {
             "selected_source_id": selection.selected_source_id,
             "needs_review": selection.needs_review,
             "rationale": selection.rationale,
+        }
+
+    async def _select_source_v2(self, payload: Mapping[str, object]) -> dict[str, object]:
+        sanitized, identifiers = _source_match_input(payload, self._settings)
+        request_id = self._existing_request_id(payload.get("request_id"))
+        safety_seed = str(
+            payload.get("job_id") or payload.get("request_id") or _stable_json_hash(sanitized)
+        )
+        response, call_id = await self._accounted_response(
+            request_id=request_id,
+            prompt_version=SOURCE_MATCH_PROMPT_VERSION,
+            instructions=self._source_match_instructions,
+            input_items=[_structured_user_input(sanitized)],
+            tools=[],
+            enable_web_search=False,
+            safety_identifier=_safety_identifier("source-match", safety_seed),
+            prompt_cache_key=_prompt_cache_key(
+                self._openai.model,
+                SOURCE_MATCH_PROMPT_VERSION,
+                self._source_match_instructions,
+            ),
+            text_format=source_match_decision_schema(source_candidate_ids=identifiers),
+        )
+        self._raise_for_accounted_response_state(response, call_id)
+        if response_function_calls(response):
+            error = InvalidProposalError("source matcher attempted a tool call")
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_unexpected_tool_call",
+                failure_phase="structured_output",
+                retryable=False,
+            )
+            raise error
+        try:
+            parsed = SourceMatchDecision.model_validate_json(response_output_text(response))
+            decision = validate_source_match_decision(
+                parsed,
+                source_candidate_ids=identifiers,
+            )
+        except (ValidationError, ValueError) as error:
+            invalid = InvalidProposalError("invalid finite source match decision")
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_malformed_response",
+                failure_phase="finite_id_validation",
+                retryable=False,
+            )
+            raise invalid from error
+        return {
+            "decision": decision.model_dump(mode="json"),
+            "openai_call_id": call_id,
+        }
+
+    async def match_canonical(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Resolve recording/release identity using only supplied opaque candidate IDs."""
+
+        if not getattr(self._openai, "configured", True):
+            raise OpenAINotConfigured("OpenAI API key is not configured")
+        sanitized, recording_ids, release_ids = _canonical_match_input(payload, self._settings)
+        request_id = self._existing_request_id(payload.get("request_id"))
+        safety_seed = str(
+            payload.get("job_id") or payload.get("request_id") or _stable_json_hash(sanitized)
+        )
+        response, call_id = await self._accounted_response(
+            request_id=request_id,
+            prompt_version=CANONICAL_MATCH_PROMPT_VERSION,
+            instructions=self._canonical_match_instructions,
+            input_items=[_structured_user_input(sanitized)],
+            tools=[],
+            enable_web_search=False,
+            safety_identifier=_safety_identifier("canonical-match", safety_seed),
+            prompt_cache_key=_prompt_cache_key(
+                self._openai.model,
+                CANONICAL_MATCH_PROMPT_VERSION,
+                self._canonical_match_instructions,
+            ),
+            text_format=canonical_match_decision_schema(
+                recording_candidate_ids=recording_ids,
+                release_candidate_ids=release_ids,
+            ),
+        )
+        self._raise_for_accounted_response_state(response, call_id)
+        if response_function_calls(response):
+            error = InvalidProposalError("canonical matcher attempted a tool call")
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_unexpected_tool_call",
+                failure_phase="structured_output",
+                retryable=False,
+            )
+            raise error
+        try:
+            parsed = CanonicalMatchDecision.model_validate_json(response_output_text(response))
+            decision = validate_canonical_match_decision(
+                parsed,
+                recording_candidate_ids=recording_ids,
+                release_candidate_ids=release_ids,
+            )
+            _validate_canonical_pair(decision, sanitized)
+        except (ValidationError, ValueError) as error:
+            invalid = InvalidProposalError("invalid finite canonical match decision")
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_malformed_response",
+                failure_phase="finite_id_validation",
+                retryable=False,
+            )
+            raise invalid from error
+        return {
+            "decision": decision.model_dump(mode="json"),
+            "openai_call_id": call_id,
         }
 
     async def _run_loop(
@@ -329,6 +503,7 @@ class OrchestrationService:
         replenishment_rounds = 0
         collected: dict[str, ProposalTrack] = {}
         verified_metadata: dict[str, VerifiedMetadata] = {}
+        canonical_candidates: dict[str, VerifiedMetadata] = {}
         safety_identifier = _safety_identifier("request", context.user_id, context.request_id)
         prompt_cache_key = _prompt_cache_key(
             self._openai.model, context.prompt_version, self._instructions
@@ -382,7 +557,7 @@ class OrchestrationService:
                 web_fallback_used = True
 
             try:
-                _raise_for_response_state(response)
+                self._raise_for_accounted_response_state(response, call_id)
             except (ModelRefusalError, ModelIncompleteError):
                 if recovery_without_web and fallback_base is not None:
                     return fallback_base, degraded_reason, verified_metadata
@@ -394,11 +569,25 @@ class OrchestrationService:
                 if recovery_without_web:
                     if fallback_base is not None:
                         return fallback_base, degraded_reason, verified_metadata
-                    raise InvalidProposalError("web recovery attempted a tool call")
+                    unexpected_tool_error = InvalidProposalError(
+                        "web recovery attempted a tool call"
+                    )
+                    self._fail_completed_call(
+                        call_id,
+                        error=unexpected_tool_error,
+                        error_code="openai_unexpected_tool_call",
+                        failure_phase="structured_output",
+                        retryable=False,
+                    )
+                    raise unexpected_tool_error
                 for call in calls:
                     execution = await self._tools.execute(call.name, call.arguments)
                     self._record_tool_call(call_id, call.call_id, execution)
-                    _collect_verified_metadata(execution, verified_metadata)
+                    _collect_verified_metadata(
+                        execution,
+                        verified_metadata,
+                        canonical_candidates,
+                    )
                     input_items.append(
                         {
                             "type": "function_call_output",
@@ -412,6 +601,13 @@ class OrchestrationService:
                 proposal = MusicProposal.model_validate_json(response_output_text(response))
                 _validate_proposal(proposal, self._settings.max_candidates_per_request)
             except (ValidationError, ValueError) as error:
+                self._fail_completed_call(
+                    call_id,
+                    error=error,
+                    error_code="openai_malformed_response",
+                    failure_phase="structured_output",
+                    retryable=not validation_retry_used,
+                )
                 if recovery_without_web and fallback_base is not None:
                     return fallback_base, degraded_reason, verified_metadata
                 if validation_retry_used:
@@ -439,9 +635,17 @@ class OrchestrationService:
             for track in proposal.tracks:
                 if len(collected) >= self._settings.max_candidates_per_request:
                     break
-                collected.setdefault(_proposal_identity(track), track)
+                collected.setdefault(_proposal_identity(track, verified_metadata), track)
             merged = proposal.model_copy(update={"tracks": list(collected.values())})
-            available_count = self._available_candidate_count(tuple(collected.values()))
+            await self._resolve_borderline_exact_match(
+                context,
+                merged,
+                verified_metadata,
+                canonical_candidates,
+            )
+            available_count = self._available_candidate_count(
+                tuple(collected.values()), verified_metadata
+            )
 
             if recovery_without_web:
                 return merged, degraded_reason, verified_metadata
@@ -508,7 +712,143 @@ class OrchestrationService:
             return merged, degraded_reason, verified_metadata
         raise OrchestrationError("Music discovery reached its configured step limit.")
 
-    def _available_candidate_count(self, tracks: Sequence[ProposalTrack]) -> int:
+    async def _resolve_borderline_exact_match(
+        self,
+        context: OrchestrationContext,
+        proposal: MusicProposal,
+        verified: dict[str, VerifiedMetadata],
+        candidates: Mapping[str, VerifiedMetadata],
+    ) -> None:
+        if (
+            context.action != "add"
+            or len(proposal.tracks) != 1
+            or context.requested_count not in {None, 1}
+            or not self._settings.ai_match_resolution_enabled
+            or not candidates
+        ):
+            return
+        track = proposal.tracks[0]
+        signature = version_signature(track.version, track.title, track.album)
+        if _verified_match(track, signature, verified) is not None:
+            return
+        eligible = [
+            value
+            for value in candidates.values()
+            if value.score >= self._settings.ai_match_min_local_score * 100
+            and versions_compatible(signature, value.version_signature)
+        ]
+        eligible.sort(key=lambda value: (-value.score, value.recording_mbid))
+        eligible = eligible[:8]
+        if not eligible:
+            return
+        recording_rows: list[dict[str, object]] = []
+        release_rows: list[dict[str, object]] = []
+        by_id: dict[str, VerifiedMetadata] = {}
+        release_pair: dict[str, str] = {}
+        for candidate in eligible:
+            recording_id = _opaque_candidate_id("rec", candidate.recording_mbid)
+            release_id = (
+                _opaque_candidate_id("rel", candidate.release_mbid)
+                if candidate.release_mbid
+                else None
+            )
+            by_id[recording_id] = candidate
+            recording_rows.append(
+                {
+                    "recording_candidate_id": recording_id,
+                    "release_candidate_id": release_id,
+                    "artist": candidate.artist,
+                    "title": candidate.title,
+                    "album": candidate.album,
+                    "year": None,
+                    "duration_seconds": candidate.duration_seconds,
+                    "local_score": candidate.score / 100.0,
+                    "version": candidate.version_signature,
+                    "reason_codes": ["musicbrainz_borderline_candidate"],
+                }
+            )
+            if release_id is not None:
+                release_pair[release_id] = recording_id
+                release_rows.append(
+                    {
+                        "release_candidate_id": release_id,
+                        "recording_candidate_id": recording_id,
+                        "album": candidate.album,
+                        "year": None,
+                        "status": "unknown",
+                        "primary_type": "unknown",
+                        "local_score": candidate.score / 100.0,
+                    }
+                )
+        try:
+            result = await self.match_canonical(
+                {
+                    "schema_version": 2,
+                    "request_id": context.request_id,
+                    "intent": {
+                        "artist": track.artist,
+                        "title": track.title,
+                        "album": track.album,
+                        "version": signature,
+                        "duration_seconds": track.duration_seconds,
+                    },
+                    "recording_candidates": recording_rows,
+                    "release_candidates": release_rows,
+                }
+            )
+        except (
+            InvalidProposalError,
+            ModelIncompleteError,
+            ModelRefusalError,
+            OpenAINotConfigured,
+            ProviderRequestError,
+            TimeoutError,
+        ):
+            return
+        raw_decision = result.get("decision")
+        if not isinstance(raw_decision, Mapping):
+            return
+        try:
+            decision = CanonicalMatchDecision.model_validate(raw_decision)
+        except ValidationError:
+            return
+        selected_id = decision.selected_recording_candidate_id
+        selected = by_id.get(selected_id or "")
+        if (
+            decision.decision is not MatchDecision.MATCH
+            or selected is None
+            or decision.confidence < self._settings.ai_match_auto_accept_threshold
+            or decision.contradiction_codes
+            or not versions_compatible(signature, decision.recording_version)
+        ):
+            return
+        if (
+            decision.selected_release_candidate_id is not None
+            and release_pair.get(decision.selected_release_candidate_id) != selected_id
+        ):
+            return
+        if not _canonical_evidence_compatible(track, selected):
+            return
+        verified[selected.recording_mbid] = VerifiedMetadata(
+            recording_mbid=selected.recording_mbid,
+            artist=selected.artist,
+            title=selected.title,
+            album=selected.album,
+            duration_seconds=selected.duration_seconds,
+            version_signature=selected.version_signature,
+            release_mbid=selected.release_mbid,
+            release_group_mbid=selected.release_group_mbid,
+            score=selected.score,
+            decided_by="openai",
+            model_confidence=decision.confidence,
+            openai_call_id=_bounded_string(result.get("openai_call_id"), 64),
+        )
+
+    def _available_candidate_count(
+        self,
+        tracks: Sequence[ProposalTrack],
+        verified_metadata: Mapping[str, VerifiedMetadata],
+    ) -> int:
         """Count candidates not already owned, revalidating indexed paths on disk."""
 
         with self._session_factory.begin() as session:
@@ -524,7 +864,7 @@ class OrchestrationService:
                             track.album,
                         ),
                         duration_seconds=track.duration_seconds,
-                        recording_mbid=track.recording_mbid,
+                        recording_mbid=_authoritative_recording_mbid(track, verified_metadata),
                     ),
                 ).status
                 != "owned"
@@ -590,6 +930,8 @@ class OrchestrationService:
                 call_id,
                 latency_ms=_elapsed_ms(started),
                 error_code=error_code,
+                error=error,
+                failure_phase="responses_create",
             )
             if isinstance(error, OpenAINotConfigured):
                 raise
@@ -621,13 +963,82 @@ class OrchestrationService:
             )
             return row.id
 
-    def _fail_call(self, call_id: str, *, latency_ms: int, error_code: str) -> None:
+    def _fail_call(
+        self,
+        call_id: str,
+        *,
+        latency_ms: int,
+        error_code: str,
+        error: Exception,
+        failure_phase: str,
+    ) -> None:
+        details = _provider_failure_details(error)
         with self._session_factory.begin() as session:
             row = session.get(OpenAICall, call_id)
             if row is not None:
                 OpenAIUsageRepository(session).fail_call(
-                    row, latency_ms=latency_ms, error_code=error_code
+                    row,
+                    latency_ms=latency_ms,
+                    error_code=error_code,
+                    provider_request_id=details["provider_request_id"],
+                    exception_class=details["exception_class"],
+                    http_status=details["http_status"],
+                    provider_error_code=details["provider_error_code"],
+                    provider_error_parameter=details["provider_error_parameter"],
+                    failure_phase=failure_phase,
+                    retryable=details["retryable"],
                 )
+
+    def _raise_for_accounted_response_state(self, response: Any, call_id: str) -> None:
+        try:
+            _raise_for_response_state(response)
+        except ModelRefusalError as error:
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_refusal",
+                failure_phase="response_state",
+                retryable=False,
+            )
+            raise
+        except ModelIncompleteError as error:
+            self._fail_completed_call(
+                call_id,
+                error=error,
+                error_code="openai_incomplete",
+                failure_phase="response_state",
+                retryable=True,
+            )
+            raise
+
+    def _fail_completed_call(
+        self,
+        call_id: str,
+        *,
+        error: Exception,
+        error_code: str,
+        failure_phase: str,
+        retryable: bool,
+    ) -> None:
+        """Retain response usage while recording a bounded post-response failure."""
+
+        details = _provider_failure_details(error)
+        with self._session_factory.begin() as session:
+            row = session.get(OpenAICall, call_id)
+            if row is None:
+                return
+            OpenAIUsageRepository(session).fail_call(
+                row,
+                latency_ms=row.latency_ms,
+                error_code=error_code,
+                provider_request_id=details["provider_request_id"],
+                exception_class=details["exception_class"],
+                http_status=details["http_status"],
+                provider_error_code=details["provider_error_code"],
+                provider_error_parameter=details["provider_error_parameter"],
+                failure_phase=failure_phase,
+                retryable=retryable,
+            )
 
     def _record_tool_call(
         self, openai_call_id: str, provider_call_id: str, execution: ToolExecution
@@ -770,6 +1181,7 @@ def _validate_proposal(proposal: MusicProposal, max_candidates: int) -> None:
 def _collect_verified_metadata(
     execution: ToolExecution,
     verified: dict[str, VerifiedMetadata],
+    candidates: dict[str, VerifiedMetadata] | None = None,
 ) -> None:
     """Bind automatic association only to canonical rows returned by our matcher."""
 
@@ -793,12 +1205,11 @@ def _collect_verified_metadata(
         if (
             value.get("source") != "musicbrainz"
             or value.get("association_scope") != "canonical_musicbrainz"
-            or value.get("decision") != "auto"
         ):
             continue
         score = _finite_number(value.get("score"))
         lead = _finite_number(value.get("lead"))
-        if score is None or score < 88 or (lead is not None and lead < 8):
+        if score is None or score < 70:
             continue
         recording_mbid = _canonical_mbid(value.get("recording_mbid"))
         artist = _bounded_string(value.get("artist"), 300)
@@ -821,9 +1232,34 @@ def _collect_verified_metadata(
             release_group_mbid=_canonical_mbid(value.get("release_group_mbid")),
             score=min(100.0, score),
         )
+        if candidates is not None and candidate.score >= 75:
+            current_candidate = candidates.get(recording_mbid)
+            if current_candidate is None or candidate.score > current_candidate.score:
+                candidates[recording_mbid] = candidate
+        if value.get("decision") != "auto" or score < 88 or (lead is not None and lead < 8):
+            continue
         current = verified.get(recording_mbid)
         if current is None or candidate.score > current.score:
             verified[recording_mbid] = candidate
+
+
+def _opaque_candidate_id(prefix: str, canonical_id: str | None) -> str:
+    if canonical_id is None:
+        raise ValueError("canonical candidate is missing its local identifier")
+    return f"{prefix}_{hashlib.sha256(canonical_id.encode()).hexdigest()[:20]}"
+
+
+def _canonical_evidence_compatible(proposed: ProposalTrack, selected: VerifiedMetadata) -> bool:
+    if (
+        token_set_ratio(normalize_text(proposed.artist), normalize_text(selected.artist)) < 80
+        or token_set_ratio(normalize_text(proposed.title), normalize_text(selected.title)) < 80
+    ):
+        return False
+    if proposed.duration_seconds is not None and selected.duration_seconds is not None:
+        tolerance = max(10.0, selected.duration_seconds * 0.05)
+        if abs(proposed.duration_seconds - selected.duration_seconds) > tolerance:
+            return False
+    return True
 
 
 def _canonical_mbid(value: object) -> str | None:
@@ -857,13 +1293,28 @@ def _oversample_target(requested_count: int | None, hard_cap: int) -> int | None
     return min(hard_cap, max(requested_count, (requested_count * 5 + 3) // 4))
 
 
-def _proposal_identity(track: ProposalTrack) -> str:
-    if track.recording_mbid:
-        return f"mbid:{track.recording_mbid}:{normalize_text(track.version)}"
+def _proposal_identity(
+    track: ProposalTrack, verified_metadata: Mapping[str, VerifiedMetadata]
+) -> str:
+    signature = version_signature(track.version, track.title, track.album)
+    verified = _verified_match(track, signature, verified_metadata)
+    if verified is not None:
+        return f"mbid:{verified.recording_mbid}:{normalize_text(track.version)}"
     return (
         f"text:{normalize_text(track.artist)}:{normalize_text(track.title)}:"
         f"{normalize_text(track.version)}"
     )
+
+
+def _authoritative_recording_mbid(
+    track: ProposalTrack, verified_metadata: Mapping[str, VerifiedMetadata]
+) -> str | None:
+    verified = _verified_match(
+        track,
+        version_signature(track.version, track.title, track.album),
+        verified_metadata,
+    )
+    return verified.recording_mbid if verified is not None else None
 
 
 def _source_selection_input(
@@ -938,6 +1389,308 @@ def _source_selection_input(
     return {"intent": intent, "candidates": candidates}, identifiers
 
 
+def _source_match_input(
+    payload: Mapping[str, object], settings: Settings
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    raw_candidates = payload.get("candidates")
+    maximum = min(24, settings.max_source_candidates)
+    if not isinstance(raw_candidates, list) or not 1 <= len(raw_candidates) <= maximum:
+        raise ValueError(f"source matching requires 1-{maximum} candidates")
+    enabled = set(settings.enabled_media_providers)
+    identifiers: list[str] = []
+    candidates: list[dict[str, object]] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, Mapping):
+            raise ValueError("source candidate must be an object")
+        identifier = _candidate_identifier(raw, "source_candidate_id")
+        if identifier in identifiers:
+            raise ValueError("source candidate IDs must be unique")
+        provider = _enum_string(raw.get("provider"), ProviderIdentity, "source provider")
+        if provider not in enabled:
+            raise ValueError("source candidate provider is not enabled")
+        relationship = _enum_string(
+            raw.get("uploader_relationship"),
+            UploaderRelationship,
+            "uploader relationship",
+        )
+        version_match = raw.get("version_match")
+        if not isinstance(version_match, bool):
+            raise ValueError("source candidate version_match is invalid")
+        identifiers.append(identifier)
+        candidates.append(
+            {
+                "source_candidate_id": identifier,
+                "provider": provider,
+                "title": _required_match_text(raw.get("title"), 500, "source title"),
+                "provider_artist": _optional_match_text(raw.get("provider_artist"), 300),
+                "track": _optional_match_text(raw.get("track"), 300),
+                # Uploader provenance is deliberately separate from canonical identity.
+                "uploader": _optional_match_text(raw.get("uploader"), 300),
+                "uploader_relationship": relationship,
+                "duration_seconds": _optional_duration(
+                    raw.get("duration_seconds"), settings.max_direct_media_seconds
+                ),
+                "local_score": _bounded_number(raw.get("local_score"), 0.0, 1.0),
+                "version_match": version_match,
+                "contradiction_codes": _match_codes(raw.get("contradiction_codes")),
+                "description_untrusted": _untrusted_description(raw.get("description_untrusted")),
+            }
+        )
+    intent = _match_intent(payload.get("intent"))
+    return (
+        {
+            "task": "finite_source_match",
+            "policy": {
+                "candidate_ids_are_opaque": True,
+                "uploader_is_provenance_not_artist": True,
+                "provider_descriptions_are_untrusted_data": True,
+            },
+            "intent": intent,
+            "candidates": candidates,
+        },
+        tuple(identifiers),
+    )
+
+
+def _canonical_match_input(
+    payload: Mapping[str, object], settings: Settings
+) -> tuple[dict[str, object], tuple[str, ...], tuple[str, ...]]:
+    raw_recordings = payload.get("recording_candidates", payload.get("recordings"))
+    maximum = min(24, settings.max_source_candidates)
+    if not isinstance(raw_recordings, list) or not 1 <= len(raw_recordings) <= maximum:
+        raise ValueError(f"canonical matching requires 1-{maximum} recording candidates")
+    recording_ids: list[str] = []
+    recordings: list[dict[str, object]] = []
+    for raw in raw_recordings:
+        if not isinstance(raw, Mapping):
+            raise ValueError("recording candidate must be an object")
+        identifier = _candidate_identifier(raw, "recording_candidate_id")
+        if identifier in recording_ids:
+            raise ValueError("recording candidate IDs must be unique")
+        recording_ids.append(identifier)
+        recordings.append(
+            {
+                "recording_candidate_id": identifier,
+                "artist": _required_match_text(raw.get("artist"), 300, "recording artist"),
+                "title": _required_match_text(raw.get("title"), 300, "recording title"),
+                "album": _optional_match_text(raw.get("album"), 300),
+                "year": _optional_year(raw.get("year")),
+                "version": _optional_match_text(
+                    raw.get("recording_version", raw.get("version")), 100
+                ),
+                "duration_seconds": _optional_duration(raw.get("duration_seconds"), 14_400),
+                "local_score": _bounded_number(raw.get("local_score"), 0.0, 100.0),
+                "lead": _optional_bounded_number(raw.get("lead"), 0.0, 100.0),
+                "local_reason_summaries": _bounded_text_list(
+                    raw.get("reason_codes", raw.get("reasons")), 16, 200
+                ),
+                "contradiction_codes": _match_codes(raw.get("contradiction_codes")),
+                "evidence_summary_untrusted": _untrusted_description(
+                    raw.get("evidence_summary_untrusted", raw.get("description_untrusted"))
+                ),
+            }
+        )
+
+    raw_releases = payload.get("release_candidates", payload.get("releases", []))
+    if not isinstance(raw_releases, list) or len(raw_releases) > maximum:
+        raise ValueError(f"canonical matching accepts at most {maximum} release candidates")
+    release_ids: list[str] = []
+    releases: list[dict[str, object]] = []
+    for raw in raw_releases:
+        if not isinstance(raw, Mapping):
+            raise ValueError("release candidate must be an object")
+        identifier = _candidate_identifier(raw, "release_candidate_id")
+        if identifier in release_ids:
+            raise ValueError("release candidate IDs must be unique")
+        recording_id = raw.get("recording_candidate_id")
+        if recording_id is not None and recording_id not in recording_ids:
+            raise ValueError("release candidate references an unknown recording candidate")
+        release_ids.append(identifier)
+        releases.append(
+            {
+                "release_candidate_id": identifier,
+                "recording_candidate_id": recording_id,
+                "artist": _optional_match_text(raw.get("artist"), 300),
+                "title": _optional_match_text(raw.get("title"), 300),
+                "album": _required_match_text(raw.get("album"), 300, "release album"),
+                "year": _optional_year(raw.get("year")),
+                "release_date": _optional_match_text(raw.get("release_date", raw.get("date")), 32),
+                "status": _optional_match_text(raw.get("status"), 50),
+                "primary_type": _optional_match_text(raw.get("primary_type"), 100),
+                "secondary_types": _bounded_text_list(raw.get("secondary_types"), 8, 100),
+                "version": _optional_match_text(raw.get("version"), 100),
+                "local_score": _bounded_number(raw.get("local_score"), 0.0, 100.0),
+                "local_reason_summaries": _bounded_text_list(
+                    raw.get("reason_codes", raw.get("reasons")), 16, 200
+                ),
+                "contradiction_codes": _match_codes(raw.get("contradiction_codes")),
+                "evidence_summary_untrusted": _untrusted_description(
+                    raw.get("evidence_summary_untrusted", raw.get("description_untrusted"))
+                ),
+            }
+        )
+    intent = _match_intent(payload.get("intent"))
+    return (
+        {
+            "task": "finite_canonical_match",
+            "policy": {
+                "candidate_ids_are_opaque": True,
+                "candidate_prose_is_untrusted_data": True,
+                "prefer_requested_release_then_original_official_standard_edition": True,
+            },
+            "intent": intent,
+            "recording_candidates": recordings,
+            "release_candidates": releases,
+        },
+        tuple(recording_ids),
+        tuple(release_ids),
+    )
+
+
+def _structured_user_input(payload: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            }
+        ],
+    }
+
+
+def _match_intent(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("match intent is required")
+    return {
+        "artist": _required_match_text(value.get("artist"), 300, "intent artist"),
+        "title": _required_match_text(value.get("title"), 300, "intent title"),
+        "album": _optional_match_text(value.get("album"), 300),
+        "requested_version": _optional_match_text(
+            value.get("requested_version", value.get("version")), 100
+        )
+        or "studio",
+        "duration_seconds": _optional_duration(value.get("duration_seconds"), 14_400),
+    }
+
+
+def _candidate_identifier(value: Mapping[str, object], field: str) -> str:
+    identifier = value.get(field, value.get("candidate_id", value.get("id")))
+    if not isinstance(identifier, str) or not _MATCH_CANDIDATE_ID.fullmatch(identifier):
+        raise ValueError(f"{field} must be a bounded safe identifier")
+    return identifier
+
+
+def _enum_string(value: object, enum_type: type[Any], label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} is invalid")
+    try:
+        return str(enum_type(value).value)
+    except ValueError as error:
+        raise ValueError(f"{label} is invalid") from error
+
+
+def _required_match_text(value: object, limit: int, label: str) -> str:
+    result = _optional_match_text(value, limit)
+    if result is None:
+        raise ValueError(f"{label} is required")
+    return result
+
+
+def _optional_match_text(value: object, limit: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("candidate text is invalid")
+    return bound_provider_description(value, limit=limit)
+
+
+def _bounded_number(value: object, minimum: float, maximum: float) -> float:
+    number = _finite_number(value)
+    if number is None or not minimum <= number <= maximum:
+        raise ValueError("candidate score is invalid")
+    return number
+
+
+def _optional_bounded_number(value: object, minimum: float, maximum: float) -> float | None:
+    if value is None:
+        return None
+    return _bounded_number(value, minimum, maximum)
+
+
+def _optional_duration(value: object, maximum: float) -> float | None:
+    if value is None:
+        return None
+    number = _finite_number(value)
+    if number is None or not 0 < number <= maximum:
+        raise ValueError("candidate duration is invalid")
+    return number
+
+
+def _optional_year(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1000 <= value <= 9999:
+        raise ValueError("candidate year is invalid")
+    return value
+
+
+def _match_codes(value: object) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 16:
+        raise ValueError("contradiction codes are invalid")
+    codes: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _REASON_CODE.fullmatch(item):
+            raise ValueError("contradiction code is invalid")
+        if item not in codes:
+            codes.append(item)
+    return codes
+
+
+def _bounded_text_list(value: object, maximum_items: int, maximum_length: int) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise ValueError("candidate text list is invalid")
+    return [
+        _required_match_text(item, maximum_length, "candidate text list item") for item in value
+    ]
+
+
+def _untrusted_description(value: object) -> str | None:
+    if value is None:
+        return None
+    description = _optional_match_text(value, 2_000)
+    if description is None:
+        return None
+    escaped = description.replace(_UNTRUSTED_BEGIN, "[FILTERED_BOUNDARY]").replace(
+        _UNTRUSTED_END, "[FILTERED_BOUNDARY]"
+    )
+    return f"{_UNTRUSTED_BEGIN}\n{escaped}\n{_UNTRUSTED_END}"
+
+
+def _validate_canonical_pair(
+    decision: CanonicalMatchDecision, sanitized: Mapping[str, object]
+) -> None:
+    release_id = decision.selected_release_candidate_id
+    recording_id = decision.selected_recording_candidate_id
+    if release_id is None or recording_id is None:
+        return
+    releases = sanitized.get("release_candidates")
+    if not isinstance(releases, list):
+        raise ValueError("canonical release candidates are invalid")
+    for raw in releases:
+        if not isinstance(raw, Mapping) or raw.get("release_candidate_id") != release_id:
+            continue
+        associated = raw.get("recording_candidate_id")
+        if associated is not None and associated != recording_id:
+            raise ValueError("selected release does not contain the selected recording")
+        return
+    raise ValueError("selected release candidate is unknown")
+
+
 def _safety_identifier(*values: str) -> str:
     material = "\x1f".join(("music-agent", *values))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
@@ -960,14 +1713,72 @@ def _elapsed_ms(started: float) -> int:
 def _provider_error_code(error: Exception) -> str:
     if isinstance(error, OpenAINotConfigured):
         return "openai_not_configured"
+    details = _provider_failure_details(error)
+    status = details["http_status"]
     name = type(error).__name__.casefold()
-    if "rate" in name:
+    if status == 429 or "rate" in name:
         return "openai_rate_limit"
-    if "timeout" in name:
+    if status == 408 or "timeout" in name:
         return "openai_timeout"
-    if "auth" in name or "permission" in name:
+    if status in {401, 403} or "auth" in name or "permission" in name:
         return "openai_auth"
+    if status == 404:
+        return "openai_model_unavailable"
+    if status in {400, 422}:
+        return "openai_rejected_request"
+    if (isinstance(status, int) and status >= 500) or any(
+        token in name for token in ("connection", "network", "internalserver")
+    ):
+        return "openai_temporary_failure"
     return "openai_error"
+
+
+def _provider_failure_details(error: Exception) -> dict[str, Any]:
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int) and response is not None:
+        response_status = getattr(response, "status_code", None)
+        status = response_status if isinstance(response_status, int) else None
+    body = getattr(error, "body", None)
+    error_object: Mapping[str, object] = body if isinstance(body, Mapping) else {}
+    nested = error_object.get("error")
+    if isinstance(nested, Mapping):
+        error_object = nested
+    provider_code = error_object.get("code")
+    provider_parameter = error_object.get("param")
+    request_id = getattr(error, "request_id", None)
+    if not isinstance(request_id, str) and response is not None:
+        headers = getattr(response, "headers", None)
+        if isinstance(headers, Mapping):
+            candidate = headers.get("x-request-id") or headers.get("X-Request-Id")
+            request_id = candidate if isinstance(candidate, str) else None
+    name = type(error).__name__
+    retryable = bool(
+        status in {408, 409, 429}
+        or (isinstance(status, int) and status >= 500)
+        or any(token in name.casefold() for token in ("timeout", "connection", "network"))
+    )
+    return {
+        "provider_request_id": request_id if isinstance(request_id, str) else None,
+        "exception_class": name,
+        "http_status": status if isinstance(status, int) else None,
+        "provider_error_code": provider_code if isinstance(provider_code, str) else None,
+        "provider_error_parameter": (
+            provider_parameter if isinstance(provider_parameter, str) else None
+        ),
+        "retryable": retryable,
+    }
+
+
+def _user_provider_error(code: str) -> str:
+    return {
+        "openai_rate_limit": "OpenAI is rate limited. The request can be retried shortly.",
+        "openai_model_unavailable": "The configured OpenAI model is unavailable.",
+        "openai_rejected_request": "OpenAI rejected the structured request.",
+        "openai_timeout": "OpenAI did not respond before the timeout.",
+        "openai_temporary_failure": "OpenAI is temporarily unavailable.",
+        "openai_auth": "OpenAI authentication is unavailable to the service.",
+    }.get(code, "The OpenAI request failed.")
 
 
 def _web_search_unsupported(error: Exception) -> bool:

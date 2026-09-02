@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>{% block title %}Music Agent{% endblock %}</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
-  <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+  <link rel="stylesheet" href="{{ asset_url('app.css') }}">
+  <script type="module" src="{{ asset_url('app.js') }}"></script>
 </head>
 <body data-live-page="{% block live_page %}general{% endblock %}" data-event-cursor="{{ event_cursor if event_cursor is defined else '' }}">
   <header class="site-header">

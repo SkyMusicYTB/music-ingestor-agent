@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.config import Settings
 from app.db.models import Base
 from app.schemas import StrictModel
+from app.tools.media_sources import build_media_source_tools
 from app.tools.registry import ToolDefinition, ToolRegistry, build_default_registry
 
 
@@ -51,6 +52,23 @@ async def test_default_registry_has_only_locked_metadata_tools() -> None:
     assert schemas["search_library"]["properties"]["limit"]["maximum"] == 50
     assert schemas["musicbrainz_search_recordings"]["properties"]["limit"]["maximum"] == 25
     assert schemas["listenbrainz_popular_recordings"]["properties"]["limit"]["maximum"] == 100
+    await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_production_registry_adds_only_finite_media_broker_tools() -> None:
+    factory = database()
+    registry = build_default_registry(
+        Settings(
+            environment="test",
+            musicbrainz_user_agent="MusicAgentTests/1.0 (tests@example.test)",
+        ),
+        factory,
+        media_source_tools=build_media_source_tools(factory),
+    )
+    names = {definition.name for definition in registry.definitions}
+    assert {"search_media_sources", "probe_media_source"} <= names
+    assert "youtube_search_candidates" not in names
     await registry.aclose()
 
 

@@ -52,7 +52,7 @@ RemoveIPC=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/music-agent /var/lib/music-agent/artwork
-ReadOnlyPaths=/etc/music-agent /var/lib/music-agent/backups /var/lib/music-agent/deployments /var/lib/music-agent/acl-backups
+ReadOnlyPaths=/etc/music-agent /var/lib/music-agent/backups /var/lib/music-agent/deployments
 TasksMax=256
 
 [Install]

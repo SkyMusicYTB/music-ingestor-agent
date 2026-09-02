@@ -1,13 +1,6 @@
-"""Persistent media worker."""
+"""Persistent media worker package.
 
-from app.workers.processor import DownloadJobProcessor, ProcessOutcome
-from app.workers.queue import DownloadJobQueue, JobLease, LeaseLostError, ServiceTaskQueue
-
-__all__ = [
-    "DownloadJobProcessor",
-    "DownloadJobQueue",
-    "JobLease",
-    "LeaseLostError",
-    "ProcessOutcome",
-    "ServiceTaskQueue",
-]
+Worker components are intentionally imported from their concrete modules. Keeping
+this package initializer side-effect free prevents client helpers from loading the
+entire worker graph merely to use the shared bounded subprocess runner.
+"""

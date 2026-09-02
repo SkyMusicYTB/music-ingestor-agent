@@ -6,22 +6,27 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 # shellcheck source=scripts/lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=scripts/lib/tooling.sh
+source "$SCRIPT_DIR/lib/tooling.sh"
 readonly RELEASE_ACCESS_PROBE="$SCRIPT_DIR/lib/release_access_probe.py"
 
 usage() {
     cat <<'EOF'
-Usage: sudo scripts/validate.sh [--release PATH] [--pre-activate] [--services]
+Usage: sudo scripts/validate.sh [--release PATH] [--pre-activate]
+                                [--require-config-check] [--services]
 
 --pre-activate validates an inactive candidate release without querying the production DB.
+--require-config-check rejects a candidate whose CLI predates the database-free preflight.
 --services additionally requires the enabled web and worker units to be active.
 EOF
 }
 
-release="" pre_activate=0 require_services=0
+release="" pre_activate=0 require_config_check=0 require_services=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --release) [[ $# -ge 2 ]] || { usage >&2; exit 64; }; release="$2"; shift 2 ;;
         --pre-activate) pre_activate=1; shift ;;
+        --require-config-check) require_config_check=1; shift ;;
         --services) require_services=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
@@ -44,12 +49,14 @@ music_agent_assert_within "$release" "$MUSIC_AGENT_RELEASES_DIR"
 [[ -x "$release/venv/bin/python" ]] || music_agent_die "release virtualenv is missing"
 [[ -x "$release/venv/bin/music-agent" ]] || music_agent_die "music-agent entry point is missing"
 [[ -x "$release/venv/bin/music-agent-worker" ]] || music_agent_die "worker entry point is missing"
-[[ -z "$(find "$release" -xdev \( ! -user root -o ! -group root \) -print -quit)" ]] ||
-    music_agent_die "release tree must be owned by root:root"
-[[ -z "$(find "$release" -xdev -type d ! -perm -0005 -print -quit)" ]] ||
+[[ -z "$(find "$release" -xdev \( ! -user root -o ! -group "$MUSIC_AGENT_SERVICE_GROUP" \) -print -quit)" ]] ||
+    music_agent_die "release tree must be owned by root:$MUSIC_AGENT_SERVICE_GROUP"
+[[ -z "$(find "$release" -xdev -type d ! -perm -0050 -print -quit)" ]] ||
     music_agent_die "release directories must be readable and traversable by the service account"
-[[ -z "$(find "$release" -xdev -type f ! -perm -0004 -print -quit)" ]] ||
+[[ -z "$(find "$release" -xdev -type f ! -perm -0040 -print -quit)" ]] ||
     music_agent_die "release files must be readable by the service account"
+[[ -z "$(find "$release" -xdev ! -type l -perm /007 -print -quit)" ]] ||
+    music_agent_die "release content must not be accessible to unrelated local accounts"
 [[ -z "$(find "$release" -xdev ! -type l -perm /022 -print -quit)" ]] ||
     music_agent_die "release must not be writable by the service account"
 release_status=""
@@ -72,11 +79,11 @@ runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
     "HOME=$MUSIC_AGENT_STATE_DIR" \
     "PYTHONDONTWRITEBYTECODE=1" \
     "$release/venv/bin/python" "$RELEASE_ACCESS_PROBE" "$release"
-runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+cli_help="$(runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
     "PATH=$MUSIC_AGENT_PATH" \
     "HOME=$MUSIC_AGENT_STATE_DIR" \
     "PYTHONDONTWRITEBYTECODE=1" \
-    "$release/venv/bin/music-agent" --help >/dev/null
+    "$release/venv/bin/music-agent" --help)"
 runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
     "PATH=$MUSIC_AGENT_PATH" \
     "HOME=$MUSIC_AGENT_STATE_DIR" \
@@ -86,6 +93,7 @@ runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
 
 [[ -r "$MUSIC_AGENT_ENV_FILE" ]] || music_agent_die "configuration is missing: $MUSIC_AGENT_ENV_FILE"
 music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
+music_agent_assert_managed_production_config
 env -i "PATH=/usr/bin:/bin" "${MUSIC_AGENT_CONFIG_ENV[@]}" \
     "$release/scripts/validate-runtime-environment.sh"
 if grep -Eq '^[[:space:]]*MUSIC_AGENT_(AUTH_HMAC_KEY|OPENAI_API_KEY|LISTENBRAINZ_TOKEN)=' "$MUSIC_AGENT_ENV_FILE"; then
@@ -106,6 +114,21 @@ done
 [[ "$(wc -c < "$MUSIC_AGENT_CREDENTIAL_DIR/auth_hmac_key")" -ge 33 ]] ||
     music_agent_die "auth_hmac_key is too short"
 
+# This check intentionally precedes every database and service-state probe. It
+# exercises both production roles and every strict OpenAI schema without opening
+# SQLite or exposing web credentials to a still-running shared-UID worker. Root's
+# checks above validate the credential files themselves; credential-backed Settings
+# construction still runs after service stop and in the web unit's ExecStartPre.
+if grep -Eq '(^|[[:space:]])config-check([[:space:],]|$)' <<< "$cli_help"; then
+    music_agent_without_credentials \
+        "$release/venv/bin/music-agent" config-check --all-roles \
+        --without-runtime-credentials >/dev/null
+elif [[ "$require_config_check" -eq 1 ]]; then
+    music_agent_die "candidate release does not provide the required config-check preflight"
+else
+    music_agent_warn "release predates config-check; continuing compatibility validation"
+fi
+
 for executable in yt-dlp deno; do
     link="$MUSIC_AGENT_TOOL_BIN/$executable"
     [[ -L "$link" ]] || music_agent_die "tool link is missing: $link"
@@ -120,13 +143,32 @@ for executable in yt-dlp deno; do
     [[ -r "$binary_provenance" && "$(<"$binary_provenance")" =~ ^[0-9a-f]{64}$ ]] ||
         music_agent_die "installed tool digest is missing or invalid: $binary_provenance"
     music_agent_verify_sha256 "$target" "$(<"$binary_provenance")"
+    provider_directory="$(dirname "$version_directory")"
+    for managed_directory in "$MUSIC_AGENT_OPT_DIR" "$MUSIC_AGENT_TOOLS_DIR" \
+            "$MUSIC_AGENT_TOOLS_DIR/current" "$MUSIC_AGENT_TOOL_BIN" \
+            "$provider_directory" "$version_directory" "$(dirname "$target")"; do
+        [[ "$(stat -c '%U:%G:%a' "$managed_directory")" == "root:root:755" ]] ||
+            music_agent_die "managed tool directory must be root:root mode 0755: $managed_directory"
+    done
+    [[ "$(stat -c '%U:%G:%a' "$target")" == "root:root:755" ]] ||
+        music_agent_die "tool executable must be root:root mode 0755: $target"
+    [[ "$(stat -c '%U:%G:%a' "$provenance")" == "root:root:644" ]] ||
+        music_agent_die "tool provenance must be root:root mode 0644: $provenance"
+    [[ "$(stat -c '%U:%G:%a' "$binary_provenance")" == "root:root:644" ]] ||
+        music_agent_die "tool digest must be root:root mode 0644: $binary_provenance"
+    [[ "$(stat -c '%U:%G' "$link")" == "root:root" ]] ||
+        music_agent_die "tool symlink must be root-owned: $link"
     [[ "$(stat -c '%U:%G' "$version_directory")" == "root:root" ]] ||
         music_agent_die "tool directory must be root-owned: $version_directory"
     [[ -z "$(find "$version_directory" -xdev -perm /022 -print -quit)" ]] ||
         music_agent_die "tool directory contains group/world-writable content: $version_directory"
 done
-yt_version="$(PATH=/usr/bin:/bin "$MUSIC_AGENT_TOOL_BIN/yt-dlp" --version)"
-deno_version="$("$MUSIC_AGENT_TOOL_BIN/deno" --version | awk 'NR == 1 {print $2}')"
+runtime_tool_report="$(music_agent_probe_tools_as_service)"
+yt_version="$(awk -F= '$1 == "yt-dlp" {print $2; exit}' <<< "$runtime_tool_report")"
+deno_report="$(awk -F= '$1 == "deno" {print $2; exit}' <<< "$runtime_tool_report")"
+[[ -n "$yt_version" && -n "$deno_report" ]] ||
+    music_agent_die "runtime service-account tool probe returned incomplete versions"
+deno_version="$(awk '{print $2}' <<< "$deno_report")"
 [[ "$(readlink -f "$MUSIC_AGENT_TOOL_BIN/yt-dlp")" == *"/$yt_version/bin/yt-dlp" ]] ||
     music_agent_die "yt-dlp version does not match its immutable directory"
 [[ "$(readlink -f "$MUSIC_AGENT_TOOL_BIN/deno")" == *"/$deno_version/bin/deno" ]] ||
@@ -145,7 +187,9 @@ if [[ "$pre_activate" -eq 0 ]]; then
             "$MUSIC_AGENT_SERVICE_USER:$MUSIC_AGENT_SERVICE_GROUP:640" ]] ||
             music_agent_die "database must be $MUSIC_AGENT_SERVICE_USER:$MUSIC_AGENT_SERVICE_GROUP mode 0640"
     fi
-    music_agent_with_credentials "$release/venv/bin/music-agent" validate
+    # Database/schema/path checks need no web secret. Keep the same credentialless
+    # worker-role boundary even when validation is requested against live services.
+    music_agent_without_credentials "$release/venv/bin/music-agent" validate
 
     if command -v systemd-analyze >/dev/null 2>&1 && [[ "${MUSIC_AGENT_TEST_MODE:-0}" != "1" ]]; then
         systemd-analyze verify \

@@ -8,6 +8,14 @@ The production target is **Ubuntu Server 26.04.1 LTS amd64**, installed natively
 
 The FastAPI web process authenticates the operator, validates requests, orchestrates discovery, and enqueues durable work. A separate worker leases jobs from SQLite, downloads into `/srv/music-downloads`, validates/transcodes/tags media, and atomically publishes it to `/srv/music`. SQLite is also the library index and audit record. Navidrome reads the finished library on its own schedule.
 
+## Automatic acquisition
+
+The default interaction is automatic unless evidence is genuinely exceptional. An exact Add request such as `add Yellow by Coldplay` resolves a finite MusicBrainz recording/release set, searches curated SoundCloud and YouTube candidates, incorporates direct Bandcamp evidence when supplied, groups equivalent uploads, and queues the coherent result without showing source or release-edition forms. The uploader is retained as provenance and is never treated as the canonical recording artist, so a valid third-party upload can still match the requested Coldplay recording.
+
+Deterministic high-confidence matches avoid an extra OpenAI call. Borderline matches use strict structured decisions over opaque candidate IDs already returned by local tools; OpenAI cannot invent a URL or MBID, relax extractor/network rules, or override version, duplicate, filesystem, and publication gates. Failed source-specific attempts advance through at most three persisted safe candidates. Find and fuzzy/bulk requests retain their request-level preview, while per-track source and ordinary release selection stays automatic. Only conflicting versions, unsafe duplicates, exhausted permitted sources, or similarly irreducible cases produce one durable exceptional-review bundle.
+
+Direct single-item URLs support reviewed YouTube, SoundCloud, and Bandcamp paths. A YouTube playlist, SoundCloud set, or Bandcamp album is inspected only as a flat bounded collection (25 items by default), never downloaded as one playlist; the operator selects its entries once and each selected item becomes an independently validated job. Profiles, likes pages, cookies, login-only media, DRM, and generic extraction remain unsupported.
+
 Production uses SQLite rollback-journal mode (`journal_mode=DELETE`, `synchronous=FULL`), short transactions, a 10-second busy timeout, and independent connections. WAL is deliberately disabled; see [the database rationale](docs/architecture.md).
 
 | Concern | Production location |
@@ -55,7 +63,7 @@ sudo /opt/music-agent/current/scripts/validate.sh --services
 
 On a first run, the installer creates the environment file and deliberately stops at its invalid `CHANGE-ME` MusicBrainz contact. Replace that value with a monitored email address or HTTPS contact URL, review the remaining settings, and rerun the same command. The installer also refuses non-Ubuntu-26.04 hosts, non-amd64 machines, dirty Git trees (unless explicitly overridden), and unknown Navidrome identities. It installs apt prerequisites without upgrading the OS, creates a non-login `music-agent` account, preserves existing configuration, takes an ACL snapshot before granting library access, verifies pinned tool checksums, builds the virtualenv at its permanent release path, backs up SQLite, migrates, and activates the immutable release atomically. It never `chown`s `/srv/music` or restarts Navidrome.
 
-Review `/etc/music-agent/music-agent.env`, especially the MusicBrainz contact, host allowlist, client networks, and HTTPS settings. Secrets are set interactively or from stdin and never placed in this file:
+Review `/etc/music-agent/music-agent.env`, especially the MusicBrainz contact, host allowlist, client networks, origin/proxy policy, enabled media providers, and HTTPS settings. Deployment's credentialless all-role preflight rejects malformed lists, prohibited generic extraction, and incoherent matching limits before activation. Secrets are set interactively or from stdin and never placed in this file:
 
 ```bash
 printf '%s\n' "$OPENAI_API_KEY" | sudo /opt/music-agent/current/scripts/set-secret.sh openai_api_key --stdin --restart

@@ -54,12 +54,14 @@ service_shell="$(getent passwd "$MUSIC_AGENT_SERVICE_USER" | cut -d: -f7)"
 [[ "$service_shell" == "/usr/sbin/nologin" || "$service_shell" == "/bin/false" ]] ||
     music_agent_die "existing service account must use a non-login shell"
 
-install -d -m 0755 -o root -g root "$MUSIC_AGENT_OPT_DIR" "$MUSIC_AGENT_RELEASES_DIR" "$MUSIC_AGENT_TOOLS_DIR"
+install -d -m 0755 -o root -g root "$MUSIC_AGENT_OPT_DIR" "$MUSIC_AGENT_TOOLS_DIR"
+install -d -m 0750 -o root -g "$MUSIC_AGENT_SERVICE_GROUP" "$MUSIC_AGENT_RELEASES_DIR"
 install -d -m 0750 -o root -g "$MUSIC_AGENT_SERVICE_GROUP" "$MUSIC_AGENT_ETC_DIR"
 install -d -m 0700 -o root -g root "$MUSIC_AGENT_CREDENTIAL_DIR"
 install -d -m 0750 -o "$MUSIC_AGENT_SERVICE_USER" -g "$MUSIC_AGENT_SERVICE_GROUP" \
     "$MUSIC_AGENT_STATE_DIR" "$MUSIC_AGENT_STATE_DIR/artwork" "$MUSIC_AGENT_BACKUP_DIR"
 install -d -m 0750 -o root -g "$MUSIC_AGENT_SERVICE_GROUP" "$MUSIC_AGENT_DEPLOYMENT_DIR"
+music_agent_prepare_transaction_backup_dir
 install -d -m 0750 -o "$MUSIC_AGENT_SERVICE_USER" -g "$MUSIC_AGENT_SERVICE_GROUP" \
     "$MUSIC_AGENT_DOWNLOAD_DIR" "$MUSIC_AGENT_DOWNLOAD_DIR/.tmp"
 if [[ ! -e "$MUSIC_AGENT_MUSIC_DIR" ]]; then
@@ -78,6 +80,7 @@ else
 fi
 
 music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
+music_agent_assert_managed_production_config
 if ! env -i "PATH=/usr/bin:/bin" "${MUSIC_AGENT_CONFIG_ENV[@]}" \
         "$SCRIPT_DIR/validate-runtime-environment.sh"; then
     music_agent_die "set an operator-controlled MusicBrainz contact in $MUSIC_AGENT_ENV_FILE, then rerun install"

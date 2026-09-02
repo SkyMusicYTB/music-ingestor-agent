@@ -8,7 +8,7 @@ At minimum, keep encrypted off-host copies of:
 - `/var/lib/music-agent/music-agent.db` — jobs, index, auth/session state, audit, and request history;
 - `/etc/music-agent/music-agent.env` and `/etc/music-agent/credentials` — configuration and secrets (use stricter access/retention than media);
 - `/var/lib/music-agent/artwork` when retaining cached artwork is useful;
-- `/var/lib/music-agent/backups` and deployment manifests.
+- `/var/lib/music-agent/backups`, root-only `/var/lib/music-agent-safety-backups`, and deployment manifests.
 
 Git reproduces source code, not production data. `/srv/music-downloads` is normally disposable staging but may be retained temporarily for incident diagnosis.
 
@@ -39,7 +39,7 @@ sudo /opt/music-agent/current/scripts/restore.sh \
   --backup /var/lib/music-agent/backups/<file>.db
 ```
 
-The script verifies the checksum and integrity first, makes a new safety backup, stops worker/web, refuses unexpected journal/WAL sidecars, atomically restores through SQLite's backup API, runs the current migration and validation commands, and starts services. If validation fails it reinstates the safety database.
+The script verifies the checksum and integrity first, makes a new root-only safety backup under `/var/lib/music-agent-safety-backups`, stops worker/web, refuses unexpected journal/WAL sidecars, atomically restores through SQLite's backup API, reapplies the required database ownership and mode, runs the current migration and validation commands, and starts services. Any replacement, permission, migration, or validation failure enters the same recovery path and reinstates the protected safety database. Services remain stopped if that recovery cannot be secured.
 
 Afterward, verify both services, authentication, recent jobs, and a library search. A database restore does not roll back `/srv/music`; reconcile the library with `sudo /opt/music-agent/current/scripts/music-agentctl.sh scan --full`. Restore media and configuration from their off-host backup independently when required.
 

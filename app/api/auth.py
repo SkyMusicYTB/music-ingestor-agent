@@ -29,11 +29,12 @@ def _set_session_cookies(
     response: RedirectResponse, request: Request, token: str, csrf: str
 ) -> None:
     settings = request.app.state.settings
+    secure = request.url.scheme == "https"
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=settings.session_absolute_seconds,
-        secure=settings.https_enabled,
+        secure=secure,
         httponly=True,
         samesite="strict",
         path="/",
@@ -42,7 +43,7 @@ def _set_session_cookies(
         CSRF_COOKIE,
         csrf,
         max_age=settings.session_absolute_seconds,
-        secure=settings.https_enabled,
+        secure=secure,
         httponly=False,
         samesite="strict",
         path="/",
@@ -54,6 +55,7 @@ def _preauth_response(
     request: Request, template: str, purpose: str, error: str | None = None
 ) -> Response:
     settings = request.app.state.settings
+    secure = request.url.scheme == "https"
     token = issue_preauth_token(settings, purpose, client_ip(request))
     response = cast(
         Response,
@@ -68,7 +70,7 @@ def _preauth_response(
         PREAUTH_COOKIE,
         token.raw,
         max_age=1200,
-        secure=settings.https_enabled,
+        secure=secure,
         httponly=True,
         samesite="strict",
         path="/",

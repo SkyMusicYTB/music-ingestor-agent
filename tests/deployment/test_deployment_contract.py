@@ -160,6 +160,69 @@ def test_deployment_uses_backup_migration_and_atomic_link() -> None:
     assert 'chmod -R a-w "$release"' in deploy
 
 
+def test_activation_safety_backups_are_outside_service_owned_state() -> None:
+    common = text("scripts/lib/common.sh")
+    backup = text("scripts/backup.sh")
+    web = text("systemd/music-agent-web.service")
+    worker = text("systemd/music-agent-worker.service")
+
+    assert "music-agent-safety-backups" in common
+    assert 'install -d -m 0700 -o root -g root "$MUSIC_AGENT_TRANSACTION_BACKUP_DIR"' in common
+    assert 'destination_dir="$MUSIC_AGENT_TRANSACTION_BACKUP_DIR"' in backup
+    assert 'chown root:root "$destination" "$destination.sha256" "$destination.json"' in backup
+    assert 'music_agent_acquire_directory_lock "$MUSIC_AGENT_STATE_DIR" "backup"' in backup
+    assert ".backup.lock" not in backup
+    assert "exec 8>" not in backup
+    for unit in (web, worker):
+        assert "music-agent-safety-backups" not in unit
+        assert "/var/lib/music-agent/acl-backups" not in unit
+    for script_name in ("deploy.sh", "rollback.sh", "restore.sh"):
+        assert "--protected" in text(f"scripts/{script_name}")
+
+
+def test_deployment_never_materializes_web_credentials_while_worker_is_live() -> None:
+    deploy = text("scripts/deploy.sh")
+    validator = text("scripts/validate.sh")
+
+    stop = deploy.index("music_agent_stop_services")
+    first_credentials = deploy.index("music_agent_with_credentials")
+    last_credentials = deploy.rindex("music_agent_with_credentials")
+    start = deploy.rindex("music_agent_start_services")
+    assert stop < first_credentials <= last_credentials < start
+    assert "music_agent_with_credentials" not in validator
+    assert "music_agent_without_credentials" in validator
+    assert "--without-runtime-credentials" in validator
+    common = text("scripts/lib/common.sh")
+    guard = (
+        "credential-backed administrative commands require music-agent-worker.service to be stopped"
+    )
+    assert common.index(guard) < common.index('credential_tmp="$(mktemp')
+
+
+def test_native_operations_assert_the_exact_managed_production_layout() -> None:
+    common = text("scripts/lib/common.sh")
+
+    for assignment in (
+        "MUSIC_AGENT_ENVIRONMENT=production",
+        "MUSIC_AGENT_DATABASE_PATH=$MUSIC_AGENT_NATIVE_DATABASE_PATH",
+        "MUSIC_AGENT_ARTWORK_PATH=$MUSIC_AGENT_NATIVE_ARTWORK_PATH",
+        "MUSIC_AGENT_DOWNLOADS_PATH=$MUSIC_AGENT_NATIVE_DOWNLOADS_PATH",
+        "MUSIC_AGENT_MUSIC_PATH=$MUSIC_AGENT_NATIVE_MUSIC_PATH",
+        "MUSIC_AGENT_BACKUP_PATH=$MUSIC_AGENT_NATIVE_BACKUP_PATH",
+    ):
+        assert assignment in common
+    for script_name in (
+        "deploy.sh",
+        "install.sh",
+        "validate.sh",
+        "configure-library-acl.sh",
+        "backup.sh",
+        "rollback.sh",
+        "restore.sh",
+    ):
+        assert "music_agent_assert_managed_production_config" in text(f"scripts/{script_name}")
+
+
 def test_live_database_permission_contract_is_0640() -> None:
     for script_name in ("deploy.sh", "restore.sh", "rollback.sh"):
         script = text(f"scripts/{script_name}")
@@ -171,6 +234,42 @@ def test_live_database_permission_contract_is_0640() -> None:
         "database must be $MUSIC_AGENT_SERVICE_USER:$MUSIC_AGENT_SERVICE_GROUP mode 0640"
         in validator
     )
+
+
+def test_restore_permission_failures_enter_automatic_recovery() -> None:
+    restore = text("scripts/restore.sh")
+
+    assert "apply_database_permissions || restore_failed=1" in restore
+    assert "elif ! apply_database_permissions; then" in restore
+    assert (
+        'chown "$MUSIC_AGENT_SERVICE_USER:$MUSIC_AGENT_SERVICE_GROUP" "$MUSIC_AGENT_DB"' in restore
+    )
+    assert 'chmod 0640 "$MUSIC_AGENT_DB"' in restore
+    assert "automatic recovery was incomplete; services remain stopped" in restore
+
+    helper_match = re.search(r"(?ms)^apply_database_permissions\(\) \{.*?^\}", restore)
+    assert helper_match is not None
+    result = subprocess.run(  # noqa: S603 - repository shell helper under controlled mocks
+        [
+            "/bin/bash",
+            "-c",
+            "set -e\n"
+            "MUSIC_AGENT_SERVICE_USER=music-agent\nMUSIC_AGENT_SERVICE_GROUP=music-agent\n"
+            "MUSIC_AGENT_DB=/tmp/test-music-agent.db\nchmod_called=0\n"
+            "music_agent_warn() { :; }\n"
+            "chown() { return 1; }\n"
+            "chmod() { chmod_called=1; return 0; }\n"
+            f"{helper_match.group(0)}\n"
+            "restore_failed=0\n"
+            "apply_database_permissions || restore_failed=1\n"
+            'printf "%s %s\\n" "$restore_failed" "$chmod_called"\n',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "1 1\n"
 
 
 @pytest.mark.parametrize(

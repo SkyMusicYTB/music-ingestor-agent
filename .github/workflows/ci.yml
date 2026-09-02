@@ -21,6 +21,10 @@ jobs:
         python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v6
+      - name: Install media test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
@@ -60,6 +64,16 @@ jobs:
           sudo apt-get install --yes --no-install-recommends shellcheck
           find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
           find scripts -type f -name '*.sh' -print0 | xargs -0 shellcheck
+      - name: Browser helper tests with pinned Deno
+        run: |
+          set -euo pipefail
+          source requirements/tool-pins.env
+          deno_test_dir="$(mktemp -d)"
+          trap 'find "$deno_test_dir" -depth -delete' EXIT
+          curl --fail --silent --show-error --location "$DENO_URL" --output "$deno_test_dir/deno.zip"
+          printf '%s  %s\n' "$DENO_SHA256" "$deno_test_dir/deno.zip" | sha256sum --check --status
+          unzip -q "$deno_test_dir/deno.zip" -d "$deno_test_dir"
+          "$deno_test_dir/deno" test tests/unit/idempotency_test.js
       - name: Verify CPython 3.14 wheel closure
         run: |
           destination="$(mktemp -d)"

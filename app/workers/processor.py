@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Mapping
@@ -10,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from rapidfuzz.fuzz import token_set_ratio
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -17,14 +19,22 @@ from app.clients.ytdlp import (
     CancellationSignal,
     DownloadCancelled,
     DownloadProgress,
+    DownloadResult,
     SourceValidationError,
     YtDlpClient,
     YtDlpError,
 )
 from app.config import Settings
 from app.db.enums import JobStage
-from app.db.models import JobReviewOption, RequestTrack, ServiceTask, Track
+from app.db.models import DownloadJob, RequestTrack, ServiceTask, Track
 from app.logging import redact
+from app.repositories.decisions import (
+    candidate_set_fingerprint,
+    latest_user_canonical_selection,
+    record_selected_decision,
+    selected_decision,
+    selected_payload,
+)
 from app.services.artwork import (
     Artwork,
     ArtworkCacheService,
@@ -52,10 +62,24 @@ from app.services.filesystem import (
     sha256_file,
 )
 from app.services.library_scan import LibraryScanner
-from app.services.metadata_matching import MetadataCandidate, MetadataMatcher
+from app.services.metadata_matching import (
+    MetadataCandidate,
+    MetadataMatcher,
+)
+from app.services.metadata_matching import (
+    normalize_text as normalize_metadata_text,
+)
 from app.services.source_selection import SelectionDecision, TrackIntent
+from app.sources import (
+    DEFAULT_VERSION_CLASSIFIER,
+    CanonicalMatchDecision,
+    MatchDecision,
+    resolve_provider_recording_metadata,
+    validate_canonical_match_decision,
+)
 from app.tags import TaggingError, UnsupportedMediaFormat, write_tags
 from app.tools.youtube import YouTubeTool
+from app.workers.ai_task_reuse import reuse_or_create_decision_task
 from app.workers.cleanup import cleanup_staging_directory
 from app.workers.lease import LeaseMonitor
 from app.workers.media import MediaProbe, MediaProcessor, MediaValidationError
@@ -65,6 +89,19 @@ from app.workers.queue import (
     JobCancellationRequested,
     JobLease,
     LeaseLostError,
+)
+from app.workers.reservations import (
+    BudgetGuardSignal,
+    MediaBudgetExceeded,
+    MediaReservationManager,
+    Reservation,
+)
+from app.workers.source_failures import (
+    is_transient_source_error as _is_transient_source_error,
+)
+from app.workers.source_resolution import (
+    SourceResolutionNeedsReview,
+    WorkerSourceResolver,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +125,10 @@ class JobNeedsReview(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.options = options or []
+
+
+class SourceCandidateRejected(JobNeedsReview):
+    """A source-specific identity failure that permits bounded automatic fallback."""
 
 
 class DuplicateOwned(RuntimeError):
@@ -134,10 +175,26 @@ class DownloadJobProcessor:
         self.metadata_resolver = metadata_resolver
         self.metadata_matcher = MetadataMatcher()
         self.duplicate_detector = DuplicateDetector(settings.music_path)
+        self.reservations = (
+            MediaReservationManager(
+                session_factory,
+                min_free_bytes=settings.min_free_bytes,
+                max_media_bytes=settings.max_media_bytes,
+            )
+            if session_factory is not None
+            else None
+        )
+        self.source_resolver = (
+            WorkerSourceResolver(settings, session_factory, queue, ytdlp)
+            if session_factory is not None
+            else None
+        )
 
     def process(self, lease: JobLease) -> ProcessOutcome:
         staging: Path | None = None
         publication: PublicationResult | None = None
+        download_reservation: Reservation | None = None
+        publication_reservation: Reservation | None = None
         monitor = LeaseMonitor(self.queue, lease)
         try:
             with monitor:
@@ -148,29 +205,38 @@ class DownloadJobProcessor:
                     reserve_bytes=self.settings.min_free_bytes,
                 )
                 staging = create_staging_directory(self.settings.downloads_path, lease.job_id)
-                cancellation = _CombinedCancellation(monitor.cancel_event, self.shutdown_signal)
-                source_url = self._resolve_source(lease, monitor, cancellation)
-                monitor.raise_if_unusable()
-                self.queue.set_progress(lease, stage=JobStage.DOWNLOADING, progress=0.08)
-                progress_callback = self._progress_callback(lease, monitor)
-                result = self.ytdlp.download_audio(
-                    source_url,
+                base_cancellation = _CombinedCancellation(
+                    monitor.cancel_event, self.shutdown_signal
+                )
+                if self.reservations is not None:
+                    download_reservation = self.reservations.reserve_download(
+                        lease.job_id,
+                        lease.token,
+                        staging,
+                    )
+                    cancellation: CancellationSignal = BudgetGuardSignal(
+                        base_cancellation,
+                        self.reservations,
+                        download_reservation,
+                        staging,
+                    )
+                else:
+                    cancellation = base_cancellation
+                result, _source_url, media_probe, tag_values = self._acquire_valid_source(
+                    lease,
+                    monitor,
+                    cancellation,
                     staging,
-                    max_duration_seconds=self.settings.max_direct_media_seconds,
-                    progress_callback=progress_callback,
-                    cancel_signal=cancellation,
+                    download_reservation,
                 )
-                monitor.raise_if_unusable()
-                media_probe = self._normalize_media(result.path, cancellation)
                 self.queue.set_progress(lease, stage=JobStage.RESOLVING_METADATA, progress=0.62)
-                tag_values = self._tag_values(
-                    lease.approved_snapshot,
-                    result.metadata,
-                    source_url,
-                    job_id=lease.job_id,
+                tag_values = self._resolve_canonical_metadata(
+                    tag_values,
+                    media_probe,
+                    lease=lease,
+                    monitor=monitor,
+                    cancellation=cancellation,
                 )
-                self._validate_canonical_metadata(tag_values, result.metadata, media_probe)
-                tag_values = self._resolve_canonical_metadata(tag_values, media_probe)
                 self._check_duplicate(lease.job_id, tag_values, media_probe)
                 artwork = self._fetch_artwork(lease, monitor, result.metadata, tag_values)
                 self.queue.set_progress(lease, stage=JobStage.TAGGING, progress=0.76)
@@ -195,6 +261,13 @@ class DownloadJobProcessor:
                 monitor.raise_if_unusable()
                 self.queue.heartbeat(lease)
                 self.queue.set_progress(lease, stage=JobStage.PUBLISHING, progress=0.94)
+                if self.reservations is not None:
+                    publication_reservation = self.reservations.reserve_publication(
+                        lease.job_id,
+                        lease.token,
+                        self.settings.music_path,
+                        media_probe.path.stat().st_size,
+                    )
                 publication = self._publish_or_adopt(
                     media_probe.path,
                     relative_path,
@@ -261,13 +334,18 @@ class DownloadJobProcessor:
             else:
                 reason = exc.reason
                 options = exc.options
-            self.queue.require_review(
+            review_created = self.queue.require_review(
                 lease,
                 reason=reason,
                 options=options,
+                max_rounds_per_category=self.settings.max_review_rounds_per_category,
+                max_rounds_per_job=self.settings.max_review_rounds_per_job,
             )
             cleanup_staging_directory(staging)
-            return ProcessOutcome(job_id=lease.job_id, status="needs_review")
+            return ProcessOutcome(
+                job_id=lease.job_id,
+                status="needs_review" if review_created else "queued",
+            )
         except DuplicateOwned as exc:
             monitor.stop()
             self.queue.complete(
@@ -328,18 +406,7 @@ class DownloadJobProcessor:
                     status="published_pending_recovery",
                     relative_path=publication.relative_path,
                 )
-            retryable = isinstance(
-                exc, (YtDlpError, WorkerMetadataError, OSError, ArtworkError)
-            ) and not isinstance(
-                exc,
-                (
-                    SourceValidationError,
-                    TaggingError,
-                    UnsupportedMediaFormat,
-                    PublicationConflict,
-                    MediaValidationError,
-                ),
-            )
+            retryable = _is_retryable_job_error(exc)
             status = self.queue.fail(
                 lease,
                 error_code=_error_code(exc),
@@ -355,6 +422,19 @@ class DownloadJobProcessor:
                 extra={"job_id": lease.job_id},
             )
             return ProcessOutcome(job_id=lease.job_id, status=status)
+        finally:
+            if self.reservations is not None:
+                for reservation in (publication_reservation, download_reservation):
+                    if reservation is None:
+                        continue
+                    try:
+                        self.reservations.release(reservation)
+                    except Exception as exc:
+                        logger.warning(
+                            "media reservation cleanup will be reconciled: %s",
+                            redact(exc),
+                            extra={"job_id": lease.job_id},
+                        )
 
     def _resolve_source(
         self,
@@ -362,6 +442,12 @@ class DownloadJobProcessor:
         monitor: LeaseMonitor,
         cancellation: CancellationSignal,
     ) -> str:
+        source_resolver = self.source_resolver if hasattr(self, "source_resolver") else None
+        if source_resolver is not None:
+            try:
+                return source_resolver.resolve(lease, monitor, cancellation).url
+            except SourceResolutionNeedsReview as exc:
+                raise JobNeedsReview(exc.reason, exc.options) from exc
         snapshot = lease.approved_snapshot
         source_url = _string_or_none(snapshot.get("source_url"))
         if source_url:
@@ -387,6 +473,75 @@ class DownloadJobProcessor:
             raise SourceNeedsReview(decision)
         return decision.selected.url
 
+    def _acquire_valid_source(
+        self,
+        lease: JobLease,
+        monitor: LeaseMonitor,
+        cancellation: CancellationSignal,
+        staging: Path,
+        reservation: Reservation | None,
+    ) -> tuple[DownloadResult, str, MediaProbe, dict[str, Any]]:
+        while True:
+            source_url = self._resolve_source(lease, monitor, cancellation)
+            monitor.raise_if_unusable()
+            self.queue.set_progress(lease, stage=JobStage.DOWNLOADING, progress=0.08)
+            try:
+                result = self.ytdlp.download_audio(
+                    source_url,
+                    staging,
+                    max_duration_seconds=self.settings.max_direct_media_seconds,
+                    max_media_bytes=self.settings.max_media_bytes,
+                    progress_callback=self._progress_callback(lease, monitor),
+                    cancel_signal=cancellation,
+                )
+                if result.path.stat().st_size > self.settings.max_media_bytes:
+                    raise MediaBudgetExceeded("downloaded source exceeded the media byte limit")
+                monitor.raise_if_unusable()
+                media_probe = self._normalize_media(result.path, cancellation)
+                if self.reservations is not None and reservation is not None:
+                    self.reservations.update_download(reservation, staging)
+                tag_values = self._tag_values(
+                    lease.approved_snapshot,
+                    result.metadata,
+                    source_url,
+                    job_id=lease.job_id,
+                )
+                self._validate_canonical_metadata(tag_values, result.metadata, media_probe)
+                return result, source_url, media_probe, tag_values
+            except DownloadCancelled:
+                raise
+            except (
+                YtDlpError,
+                SourceValidationError,
+                SourceCandidateRejected,
+                MediaValidationError,
+                MediaBudgetExceeded,
+            ) as exc:
+                source_resolver = self.source_resolver if hasattr(self, "source_resolver") else None
+                if source_resolver is None:
+                    raise
+                if _is_transient_source_error(exc):
+                    # A provider/network outage belongs to the durable job retry
+                    # budget, not to the finite candidate-attempt budget.
+                    raise
+                attempts = source_resolver.reject_active(lease, _error_code(exc))
+                if attempts >= self.settings.max_automatic_source_attempts:
+                    fallback_review = source_resolver.provider_fallback_review(lease)
+                    if fallback_review is not None:
+                        reason, options = fallback_review
+                        raise JobNeedsReview(reason, options) from exc
+                    raise JobNeedsReview(
+                        "safe source candidates were exhausted after automatic fallback"
+                    ) from exc
+                self.queue.add_warning(
+                    lease,
+                    code="source_candidate_rejected",
+                    message="A source failed validation; another safe candidate is being tried.",
+                )
+                if not cleanup_staging_directory(staging):
+                    raise RuntimeError("failed to clean the rejected source staging area") from exc
+                create_staging_directory(self.settings.downloads_path, lease.job_id)
+
     def _resolve_ambiguous_source(
         self,
         lease: JobLease,
@@ -407,9 +562,20 @@ class DownloadJobProcessor:
                 request_id = session.scalar(
                     select(RequestTrack.request_id).where(RequestTrack.id == request_track_id)
                 )
+        candidate_records = [
+            {
+                "source_id": candidate.source_id,
+                "title": candidate.title,
+                "channel": candidate.channel,
+                "duration_seconds": candidate.duration_seconds,
+            }
+            for candidate in candidates
+        ]
         payload = {
+            "schema_version": 1,
             "request_id": request_id,
             "job_id": lease.job_id,
+            "decision_category": "acquisition_source",
             "intent": {
                 "artist": _required_string(lease.approved_snapshot, "artist"),
                 "title": _required_string(lease.approved_snapshot, "title"),
@@ -419,37 +585,20 @@ class DownloadJobProcessor:
                 ),
                 "duration_seconds": _float_or_none(lease.approved_snapshot.get("duration_seconds")),
             },
-            "candidates": [
-                {
-                    "source_id": candidate.source_id,
-                    "title": candidate.title,
-                    "channel": candidate.channel,
-                    "duration_seconds": candidate.duration_seconds,
-                }
-                for candidate in candidates
-            ],
+            "candidates": candidate_records,
+            "candidate_set_fingerprint": candidate_set_fingerprint(
+                "acquisition_source", candidate_records
+            ),
         }
-        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with self.session_factory.begin() as session:
-            task = session.scalar(
-                select(ServiceTask)
-                .where(
-                    ServiceTask.target == "web",
-                    ServiceTask.kind == "select_source",
-                    ServiceTask.payload_json == serialized,
-                )
-                .order_by(ServiceTask.created_at.desc())
-                .limit(1)
+            _leased_job(session, lease, action="requesting legacy source selection")
+            task = reuse_or_create_decision_task(
+                session,
+                target="web",
+                kind="select_source",
+                payload_version=1,
+                payload=payload,
             )
-            if task is None:
-                task = ServiceTask(
-                    target="web",
-                    kind="select_source",
-                    payload_json=serialized,
-                    available_at=datetime.now(UTC),
-                )
-                session.add(task)
-                session.flush()
             task_id = task.id
         self.queue.set_progress(lease, stage=JobStage.WAITING_AI, progress=0.04)
         deadline = time.monotonic() + float(self.settings.max_agent_seconds + 5)
@@ -521,10 +670,31 @@ class DownloadJobProcessor:
     ) -> None:
         expected_artist = _required_string(expected, "artist")
         expected_title = _required_string(expected, "title")
-        provider_artist = _first_source_string(source, "artist", "creator", "uploader", "channel")
-        provider_title = _first_source_string(source, "track", "alt_title", "title")
-        if provider_artist is None or provider_title is None:
-            raise JobNeedsReview("the downloaded source did not expose enough metadata to match")
+        expected_version = DEFAULT_VERSION_CLASSIFIER.classify(
+            expected_title,
+            _explicit_version_constraint(expected),
+        )
+        source_version = DEFAULT_VERSION_CLASSIFIER.classify(
+            _first_source_string(source, "title"),
+            _first_source_string(source, "track"),
+            _first_source_string(source, "alt_title"),
+            _first_source_string(source, "version"),
+        )
+        if DEFAULT_VERSION_CLASSIFIER.contradictions(expected_version, source_version):
+            raise SourceCandidateRejected(
+                "the downloaded source is a contradictory recording version"
+            )
+        recording = resolve_provider_recording_metadata(source)
+        provider_artist = recording.artist
+        provider_title = recording.title
+        if provider_title is None:
+            raise SourceCandidateRejected(
+                "the downloaded source did not expose enough track metadata to match"
+            )
+        if provider_artist is None:
+            # Uploader identity is deliberately excluded. An exact title plus the
+            # already-probed duration can still corroborate the canonical artist.
+            provider_artist = expected_artist
         if provider_artist.casefold().endswith(" - topic"):
             provider_artist = provider_artist[:-8].strip()
         provider_title = strip_provider_suffixes(provider_title)
@@ -538,20 +708,22 @@ class DownloadJobProcessor:
             title=provider_title,
             album=_first_source_string(source, "album"),
             duration_seconds=probe.duration_seconds,
-            source="youtube",
+            source=_first_source_string(source, "extractor", "extractor_key") or "media",
             raw=source,
         )
         ranked = self.metadata_matcher.rank(
             artist=expected_artist,
             title=expected_title,
-            album=_string_or_none(expected.get("album")),
+            album=_explicit_album_constraint(expected),
             duration_seconds=_float_or_none(expected.get("duration_seconds")),
+            requested_version=_explicit_version_constraint(expected),
+            version_is_explicit=_version_constraint_explicit(expected),
             candidates=[candidate],
             limit=1,
         )
         match = ranked[0]
         if match.decision != "auto":
-            raise JobNeedsReview(
+            raise SourceCandidateRejected(
                 "downloaded source metadata does not confidently match the approved track",
                 [
                     {
@@ -582,25 +754,33 @@ class DownloadJobProcessor:
         with self.session_factory.begin() as session:
             decision = self.duplicate_detector.find(session, candidate)
             track = session.get(Track, decision.track_id) if decision.track_id else None
-            reviewed_duplicate = session.scalar(
-                select(JobReviewOption.id).where(
-                    JobReviewOption.job_id == job_id,
-                    JobReviewOption.kind == "duplicate",
-                    JobReviewOption.selected_at.is_not(None),
-                )
+            options = _possible_duplicate_options(track, decision.reason)
+            fingerprint = candidate_set_fingerprint("possible_duplicate", options)
+            reviewed_duplicate = selected_payload(
+                session,
+                job_id,
+                "possible_duplicate",
+                fingerprint,
             )
         if decision.status == "possible" and reviewed_duplicate is None:
             raise JobNeedsReview(
                 decision.reason or "a possible duplicate requires review",
-                [
-                    {
-                        "kind": "duplicate",
-                        "rank": 1,
-                        "track_id": decision.track_id,
-                        "score": 1.0,
-                        "reason": decision.reason,
-                    }
-                ],
+                options,
+            )
+        if decision.status == "possible" and reviewed_duplicate is not None:
+            action = _string_or_none(reviewed_duplicate.get("duplicate_action"))
+            selected_track_id = _string_or_none(reviewed_duplicate.get("track_id"))
+            if action == "import_separate" and selected_track_id == decision.track_id:
+                return
+            if action == "use_existing" and track is not None and selected_track_id == track.id:
+                existing = self.settings.music_path / track.filepath
+                digest = track.file_sha256 or sha256_file(existing)
+                raise DuplicateOwned(track, digest)
+            # Legacy or mismatched decisions do not authorize suppressing a new
+            # possible-duplicate warning.
+            raise JobNeedsReview(
+                decision.reason or "a possible duplicate requires review",
+                options,
             )
         if decision.status == "owned" and track is not None:
             existing = self.settings.music_path / track.filepath
@@ -611,22 +791,120 @@ class DownloadJobProcessor:
         self,
         values: dict[str, Any],
         probe: MediaProbe,
+        *,
+        lease: JobLease | None = None,
+        monitor: LeaseMonitor | None = None,
+        cancellation: CancellationSignal | None = None,
     ) -> dict[str, Any]:
-        if self.metadata_resolver is None:
-            raise RuntimeError("MusicBrainz canonical metadata resolution is not configured")
-        resolution = self.metadata_resolver.resolve(
-            artist=_required_string(values, "artist"),
-            title=_required_string(values, "title"),
-            album=_string_or_none(values.get("album")),
-            duration_seconds=probe.duration_seconds,
-            version_signature=_string_or_none(values.get("version_signature")) or "studio",
-        )
-        if resolution.decision != "auto" or resolution.candidate is None:
-            raise JobNeedsReview(
-                resolution.reason,
-                list(resolution.options) if resolution.decision == "review" else [],
+        durable_replay = None
+        if lease is not None and self.session_factory is not None:
+            with self.session_factory() as session:
+                durable_replay = latest_user_canonical_selection(session, lease.job_id)
+        if durable_replay is not None:
+            candidate = _metadata_candidate_from_payload(durable_replay.payload)
+            authority = "user"
+            model_confidence = durable_replay.model_confidence
+            openai_call_id = durable_replay.openai_call_id
+            options: list[dict[str, Any]] = []
+        else:
+            if self.metadata_resolver is None:
+                raise RuntimeError("MusicBrainz canonical metadata resolution is not configured")
+            resolution = self.metadata_resolver.resolve(
+                artist=_required_string(values, "artist"),
+                title=_required_string(values, "title"),
+                album=_explicit_album_constraint(values),
+                duration_seconds=probe.duration_seconds,
+                version_signature=_explicit_version_constraint(values),
+                album_is_explicit=_album_constraint_explicit(values),
             )
-        candidate = resolution.candidate
+            options = list(resolution.options)
+            fingerprint = candidate_set_fingerprint("canonical_metadata", options)
+            replayed: dict[str, object] | None = None
+            replayed_authority: str | None = None
+            replayed_model_confidence: float | None = None
+            replayed_openai_call_id: str | None = None
+            if lease is not None and self.session_factory is not None:
+                with self.session_factory() as session:
+                    replayed = selected_payload(
+                        session, lease.job_id, "canonical_metadata", fingerprint
+                    )
+                    prior_decision = selected_decision(
+                        session, lease.job_id, "canonical_metadata", fingerprint
+                    )
+                    if prior_decision is not None:
+                        replayed_authority = prior_decision.decided_by
+                        replayed_model_confidence = prior_decision.model_confidence
+                        replayed_openai_call_id = prior_decision.openai_call_id
+            authority = "deterministic"
+            model_confidence = None
+            openai_call_id = None
+            if replayed is not None:
+                candidate = _metadata_candidate_from_payload(replayed)
+                authority = replayed_authority or "deterministic"
+                model_confidence = replayed_model_confidence
+                openai_call_id = replayed_openai_call_id
+            elif resolution.decision == "auto" and resolution.candidate is not None:
+                candidate = resolution.candidate
+            elif (
+                resolution.decision == "review"
+                and options
+                and lease is not None
+                and monitor is not None
+                and cancellation is not None
+                and self.session_factory is not None
+                and getattr(self.settings, "ai_match_resolution_enabled", False)
+            ):
+                model_result = self._ask_openai_canonical(
+                    lease,
+                    monitor,
+                    cancellation,
+                    values,
+                    options,
+                )
+                selected, decision = self._adjudicate_canonical_model(
+                    values, probe, options, model_result
+                )
+                if selected is None or decision is None:
+                    raise JobNeedsReview(resolution.reason, options)
+                candidate = _metadata_candidate_from_payload(selected)
+                authority = "openai"
+                model_confidence = decision.confidence
+                openai_call_id = _string_or_none(model_result.get("openai_call_id"))
+            else:
+                raise JobNeedsReview(
+                    resolution.reason,
+                    options if resolution.decision == "review" else [],
+                )
+        if durable_replay is None and lease is not None and self.session_factory is not None:
+            selected_option = next(
+                (
+                    option
+                    for option in options
+                    if option.get("recording_mbid") == candidate.recording_mbid
+                    and option.get("release_mbid") == candidate.release_mbid
+                ),
+                _metadata_payload(candidate),
+            )
+            local_confidence = _float_or_none(selected_option.get("local_score"))
+            with self.session_factory.begin() as session:
+                job = _leased_job(session, lease, action="persisting canonical metadata")
+                record_selected_decision(
+                    session,
+                    job,
+                    category="canonical_metadata",
+                    candidates=options,
+                    selected_payload={
+                        **_metadata_payload(candidate),
+                        "recording_candidate_id": selected_option.get("recording_candidate_id"),
+                        "release_candidate_id": selected_option.get("release_candidate_id"),
+                    },
+                    decided_by=authority,
+                    reason_codes=["canonical_match_accepted"],
+                    local_confidence=local_confidence,
+                    model_confidence=model_confidence,
+                    openai_call_id=openai_call_id,
+                    prompt_version=("canonical_matcher_v2" if authority == "openai" else None),
+                )
         enriched = dict(values)
         enriched["artist"] = candidate.artist
         enriched["artists"] = [candidate.artist]
@@ -638,10 +916,206 @@ class DownloadJobProcessor:
         if candidate.year is not None:
             enriched["year"] = candidate.year
         for key in ("recording_mbid", "release_mbid", "release_group_mbid"):
-            value = getattr(candidate, key)
-            if value:
-                enriched[key] = value
+            # Always overwrite these fields so an unverified model suggestion can
+            # never survive a later local MusicBrainz resolution by omission.
+            enriched[key] = getattr(candidate, key)
+        enriched["canonical_identity_verified"] = candidate.recording_mbid is not None
+        raw_provenance = values.get("metadata_provenance")
+        provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
+        raw_resolution = provenance.get("canonical_metadata_resolution")
+        canonical_resolution = dict(raw_resolution) if isinstance(raw_resolution, Mapping) else {}
+        canonical_resolution.update(
+            {
+                "source": (
+                    "user_confirmed_server_candidate"
+                    if authority == "user"
+                    else "musicbrainz_local_candidate"
+                ),
+                "automatic_association": authority != "user",
+                "decided_by": authority,
+            }
+        )
+        provenance["canonical_metadata_resolution"] = canonical_resolution
+        enriched["metadata_provenance"] = provenance
         return enriched
+
+    def _ask_openai_canonical(
+        self,
+        lease: JobLease,
+        monitor: LeaseMonitor,
+        cancellation: CancellationSignal,
+        values: Mapping[str, Any],
+        options: list[dict[str, Any]],
+    ) -> dict[str, object]:
+        request_track_id = _string_or_none(lease.approved_snapshot.get("request_track_id"))
+        request_id: str | None = None
+        if request_track_id is not None and self.session_factory is not None:
+            with self.session_factory() as session:
+                request_id = session.scalar(
+                    select(RequestTrack.request_id).where(RequestTrack.id == request_track_id)
+                )
+        recording_candidates = [
+            {
+                "recording_candidate_id": option.get("recording_candidate_id"),
+                "release_candidate_id": option.get("release_candidate_id"),
+                "artist": option.get("artist"),
+                "title": option.get("title"),
+                "album": option.get("album"),
+                "year": option.get("year"),
+                "duration_seconds": option.get("duration_seconds"),
+                "local_score": option.get("local_score"),
+                "version": option.get("version"),
+                "reason_codes": option.get("reason_codes", []),
+            }
+            for option in options[:8]
+        ]
+        release_candidates = [
+            {
+                "release_candidate_id": option.get("release_candidate_id"),
+                "recording_candidate_id": option.get("recording_candidate_id"),
+                "album": option.get("album"),
+                "year": option.get("year"),
+                "status": option.get("release_status"),
+                "primary_type": option.get("primary_type"),
+                "local_score": option.get("local_score"),
+            }
+            for option in options[:8]
+            if option.get("release_candidate_id") is not None
+        ]
+        payload = {
+            "schema_version": 2,
+            "request_id": request_id,
+            "job_id": lease.job_id,
+            "decision_category": "canonical_metadata",
+            "intent": {
+                "artist": _required_string(dict(values), "artist"),
+                "title": _required_string(dict(values), "title"),
+                "album": _explicit_album_constraint(values),
+                "version": _explicit_version_constraint(values),
+                "duration_seconds": _float_or_none(values.get("duration_seconds")),
+            },
+            "recording_candidates": recording_candidates,
+            "release_candidates": release_candidates,
+        }
+        payload["candidate_set_fingerprint"] = candidate_set_fingerprint(
+            "canonical_metadata", options[:8]
+        )
+        assert self.session_factory is not None
+        with self.session_factory.begin() as session:
+            _leased_job(session, lease, action="requesting canonical metadata selection")
+            task = reuse_or_create_decision_task(
+                session,
+                target="web",
+                kind="match_canonical",
+                payload_version=2,
+                payload=payload,
+            )
+            task_id = task.id
+        self.queue.set_progress(lease, stage=JobStage.WAITING_AI, progress=0.64)
+        deadline = time.monotonic() + float(self.settings.max_agent_seconds + 5)
+        while time.monotonic() < deadline:
+            if cancellation.is_set():
+                raise DownloadCancelled("canonical metadata selection was cancelled")
+            monitor.raise_if_unusable()
+            with self.session_factory() as session:
+                row = session.get(ServiceTask, task_id)
+                if row is None or row.state == "failed":
+                    return {}
+                if row.state == "completed":
+                    try:
+                        result = json.loads(row.result_json or "{}")
+                    except json.JSONDecodeError:
+                        return {}
+                    return result if isinstance(result, dict) else {}
+            time.sleep(0.2)
+        return {}
+
+    def _adjudicate_canonical_model(
+        self,
+        values: Mapping[str, Any],
+        probe: MediaProbe,
+        options: list[dict[str, Any]],
+        model_result: Mapping[str, object],
+    ) -> tuple[dict[str, Any] | None, CanonicalMatchDecision | None]:
+        recording_ids = [
+            identifier
+            for option in options
+            if isinstance((identifier := option.get("recording_candidate_id")), str)
+        ]
+        release_ids = [
+            identifier
+            for option in options
+            if isinstance((identifier := option.get("release_candidate_id")), str)
+        ]
+        raw_decision = model_result.get("decision")
+        if not isinstance(raw_decision, Mapping):
+            return None, None
+        try:
+            decision = validate_canonical_match_decision(
+                raw_decision,
+                recording_candidate_ids=recording_ids,
+                release_candidate_ids=release_ids,
+            )
+        except (TypeError, ValueError):
+            return None, None
+        if (
+            decision.decision is not MatchDecision.MATCH
+            or decision.confidence < self.settings.ai_match_auto_accept_threshold
+            or decision.contradiction_codes
+        ):
+            return None, decision
+        selected = next(
+            (
+                option
+                for option in options
+                if option.get("recording_candidate_id") == decision.selected_recording_candidate_id
+            ),
+            None,
+        )
+        if selected is None:
+            return None, decision
+        selected_release = decision.selected_release_candidate_id
+        if (
+            selected_release is not None
+            and selected.get("release_candidate_id") != selected_release
+        ):
+            return None, decision
+        local_score = _float_or_none(selected.get("local_score")) or 0.0
+        if local_score < self.settings.ai_match_min_local_score:
+            return None, decision
+        option_contradictions = selected.get("contradiction_codes")
+        if isinstance(option_contradictions, list) and option_contradictions:
+            return None, decision
+        expected_version = _explicit_version_constraint(values)
+        if expected_version is None:
+            expected_version = self.settings.default_version_preference
+        candidate_version = _string_or_none(selected.get("version")) or "studio"
+        if not _metadata_versions_compatible(expected_version, candidate_version):
+            return None, decision
+        if not _metadata_versions_compatible(expected_version, decision.recording_version):
+            return None, decision
+        expected_album = _explicit_album_constraint(values)
+        if expected_album is not None:
+            candidate_album = _string_or_none(selected.get("album"))
+            if candidate_album is None or normalize_metadata_text(
+                expected_album
+            ) != normalize_metadata_text(candidate_album):
+                return None, decision
+        expected_artist = _required_string(dict(values), "artist")
+        expected_title = _required_string(dict(values), "title")
+        artist = _string_or_none(selected.get("artist")) or ""
+        title = _string_or_none(selected.get("title")) or ""
+        if (
+            token_set_ratio(expected_artist, artist) < 80
+            or token_set_ratio(expected_title, title) < 80
+        ):
+            return None, decision
+        duration = _float_or_none(selected.get("duration_seconds"))
+        if duration is not None:
+            tolerance = max(10.0, probe.duration_seconds * 0.05)
+            if abs(duration - probe.duration_seconds) > tolerance:
+                return None, decision
+        return selected, decision
 
     def _fetch_artwork(
         self,
@@ -709,7 +1183,11 @@ class DownloadJobProcessor:
         values["artist"] = _required_string(snapshot, "artist")
         values["title"] = _required_string(snapshot, "title")
         values["source_url"] = source_url
-        values["source_extractor"] = _string_or_none(source_metadata.get("extractor")) or "youtube"
+        values["source_extractor"] = (
+            _string_or_none(source_metadata.get("extractor"))
+            or _string_or_none(source_metadata.get("extractor_key"))
+            or _string_or_none(snapshot.get("source_extractor"))
+        )
         values["source_id"] = _string_or_none(source_metadata.get("id"))
         values["job_id"] = job_id
         return values
@@ -722,6 +1200,11 @@ class DownloadJobProcessor:
         def callback(progress: DownloadProgress) -> None:
             nonlocal last_update, last_progress
             monitor.raise_if_unusable()
+            if (
+                progress.downloaded_bytes is not None
+                and progress.downloaded_bytes > self.settings.max_media_bytes
+            ):
+                raise MediaBudgetExceeded("download exceeded the configured media byte limit")
             fraction = (progress.percent or 0.0) / 100.0
             mapped = 0.08 + min(1.0, max(0.0, fraction)) * 0.52
             now = time.monotonic()
@@ -834,6 +1317,69 @@ def _first_source_string(value: Mapping[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _metadata_payload(candidate: MetadataCandidate) -> dict[str, object]:
+    return {
+        "artist": candidate.artist,
+        "title": candidate.title,
+        "album": candidate.album,
+        "year": candidate.year,
+        "duration_seconds": candidate.duration_seconds,
+        "recording_mbid": candidate.recording_mbid,
+        "release_mbid": candidate.release_mbid,
+        "release_group_mbid": candidate.release_group_mbid,
+        "version": candidate.version,
+    }
+
+
+def _metadata_candidate_from_payload(value: Mapping[str, object]) -> MetadataCandidate:
+    artist = _string_or_none(value.get("artist"))
+    title = _string_or_none(value.get("title"))
+    if artist is None or title is None:
+        raise JobNeedsReview("the persisted canonical metadata decision is incomplete")
+    return MetadataCandidate(
+        artist=artist,
+        title=title,
+        album=_string_or_none(value.get("album")),
+        year=_int_or_none(value.get("year")),
+        duration_seconds=_float_or_none(value.get("duration_seconds")),
+        recording_mbid=_string_or_none(value.get("recording_mbid")),
+        release_mbid=_string_or_none(value.get("release_mbid")),
+        release_group_mbid=_string_or_none(value.get("release_group_mbid")),
+        source="persisted_canonical_decision",
+    )
+
+
+def _possible_duplicate_options(track: Track | None, reason: str | None) -> list[dict[str, object]]:
+    if track is None:
+        return []
+    shared = {
+        "kind": "possible_duplicate",
+        "track_id": track.id,
+        "artist": track.artist,
+        "title": track.title,
+        "album": track.album,
+        "duration_seconds": track.duration_seconds,
+        "reason": reason or "similar library track",
+        "materially_different": True,
+    }
+    return [
+        {
+            **shared,
+            "rank": 1,
+            "duplicate_action": "use_existing",
+            "label": "Use the existing library copy",
+            "score": 1.0,
+        },
+        {
+            **shared,
+            "rank": 2,
+            "duplicate_action": "import_separate",
+            "label": "Import this as a separate track",
+            "score": 0.5,
+        },
+    ]
+
+
 def _string_or_none(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
@@ -846,6 +1392,92 @@ def _float_or_none(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _is_retryable_job_error(exc: Exception) -> bool:
+    if isinstance(exc, (YtDlpError, SourceValidationError)):
+        return _is_transient_source_error(exc)
+    return isinstance(exc, (WorkerMetadataError, OSError, ArtworkError)) and not isinstance(
+        exc,
+        (
+            TaggingError,
+            UnsupportedMediaFormat,
+            PublicationConflict,
+            MediaValidationError,
+        ),
+    )
+
+
+def _album_constraint_explicit(values: Mapping[str, object]) -> bool:
+    return _constraint_explicit(values, "album")
+
+
+def _version_constraint_explicit(values: Mapping[str, object]) -> bool:
+    return _constraint_explicit(values, "version")
+
+
+def _constraint_explicit(values: Mapping[str, object], name: str) -> bool:
+    flag = f"{name}_constraint_explicit"
+    provenance = values.get("metadata_provenance")
+    if isinstance(provenance, Mapping):
+        user_constraints = provenance.get("user_constraints")
+        if isinstance(user_constraints, Mapping) and isinstance(user_constraints.get(flag), bool):
+            return user_constraints[flag] is True
+    if values.get(flag) is True:
+        return True
+    if isinstance(provenance, Mapping):
+        if provenance.get(flag) is True:
+            return True
+        request_constraints = provenance.get("request_constraints")
+        return isinstance(request_constraints, Mapping) and request_constraints.get(flag) is True
+    return False
+
+
+def _explicit_album_constraint(values: Mapping[str, object]) -> str | None:
+    if not _album_constraint_explicit(values):
+        return None
+    provenance = values.get("metadata_provenance")
+    if isinstance(provenance, Mapping):
+        user_constraints = provenance.get("user_constraints")
+        if (
+            isinstance(user_constraints, Mapping)
+            and user_constraints.get("album_constraint_explicit") is True
+        ):
+            return _string_or_none(user_constraints.get("requested_album"))
+    return _string_or_none(values.get("requested_album")) or _string_or_none(values.get("album"))
+
+
+def _explicit_version_constraint(values: Mapping[str, object]) -> str | None:
+    if not _version_constraint_explicit(values):
+        return None
+    return _string_or_none(values.get("requested_version")) or _string_or_none(
+        values.get("version_signature")
+    )
+
+
+def _metadata_versions_compatible(left: str | None, right: str | None) -> bool:
+    def parts(value: str | None) -> frozenset[str]:
+        normalized = (value or "studio").casefold().replace("_", " ").replace("-", " ")
+        return frozenset(
+            " ".join(part.split()) for part in re.split(r"[|+]", normalized) if part.strip()
+        ) or frozenset({"studio"})
+
+    return parts(left) == parts(right)
+
+
+def _leased_job(session: Session, lease: JobLease, *, action: str) -> DownloadJob:
+    job = session.scalar(
+        select(DownloadJob).where(
+            DownloadJob.id == lease.job_id,
+            DownloadJob.lease_token == lease.token,
+            DownloadJob.status == "active",
+            DownloadJob.lease_expires_at.is_not(None),
+            DownloadJob.lease_expires_at >= datetime.now(UTC),
+        )
+    )
+    if job is None:
+        raise LeaseLostError(f"job lease was lost while {action}")
+    return job
 
 
 def _error_code(exc: Exception) -> str:

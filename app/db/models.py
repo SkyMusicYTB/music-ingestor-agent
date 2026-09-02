@@ -145,6 +145,10 @@ class RequestTrack(TimestampMixin, Base):
     recording_mbid: Mapped[str | None] = mapped_column(String(36), index=True)
     release_mbid: Mapped[str | None] = mapped_column(String(36), index=True)
     release_group_mbid: Mapped[str | None] = mapped_column(String(36), index=True)
+    suggested_recording_mbid: Mapped[str | None] = mapped_column(String(36))
+    suggested_release_mbid: Mapped[str | None] = mapped_column(String(36))
+    suggested_release_group_mbid: Mapped[str | None] = mapped_column(String(36))
+    canonical_identity_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     source_url: Mapped[str | None] = mapped_column(String(2048))
     source_extractor: Mapped[str | None] = mapped_column(String(40))
     source_id: Mapped[str | None] = mapped_column(String(100))
@@ -219,6 +223,10 @@ class DownloadJob(TimestampMixin, Base):
     priority: Mapped[int] = mapped_column(Integer, default=100)
     source_extractor: Mapped[str | None] = mapped_column(String(40))
     source_id: Mapped[str | None] = mapped_column(String(100))
+    active_source_candidate_id: Mapped[str | None] = mapped_column(String(36))
+    source_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    decision_revision: Mapped[int] = mapped_column(Integer, default=0)
+    review_round_count: Mapped[int] = mapped_column(Integer, default=0)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     lease_token: Mapped[str | None] = mapped_column(String(64))
@@ -235,17 +243,193 @@ class DownloadJob(TimestampMixin, Base):
 
 class JobReviewOption(Base):
     __tablename__ = "job_review_options"
-    __table_args__ = (UniqueConstraint("job_id", "kind", "rank", name="uq_job_review_rank"),)
+    __table_args__ = (UniqueConstraint("decision_id", "rank", name="uq_job_review_decision_rank"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
     job_id: Mapped[str] = mapped_column(
         ForeignKey("download_jobs.id", ondelete="CASCADE"), index=True
     )
+    decision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("job_decisions.id", ondelete="CASCADE"), index=True
+    )
     kind: Mapped[str] = mapped_column(String(32))
     rank: Mapped[int] = mapped_column(Integer)
+    option_key: Mapped[str | None] = mapped_column(String(160))
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    materially_different: Mapped[bool] = mapped_column(Boolean, default=True)
     provider_payload_json: Mapped[str] = mapped_column(Text)
     score: Mapped[float] = mapped_column(Float)
     selected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EvidenceReference(TimestampMixin, Base):
+    __tablename__ = "evidence_references"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','available','unsupported','rejected','expired')",
+            name="ck_evidence_references_status",
+        ),
+        Index("ix_evidence_request_track", "request_track_id", "created_at"),
+        Index("ix_evidence_negative_until", "negative_until"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
+    request_id: Mapped[str | None] = mapped_column(
+        ForeignKey("requests.id", ondelete="CASCADE"), index=True
+    )
+    request_track_id: Mapped[str | None] = mapped_column(
+        ForeignKey("request_tracks.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("download_jobs.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(40))
+    evidence_kind: Mapped[str] = mapped_column(String(40))
+    canonical_url: Mapped[str | None] = mapped_column(String(2048))
+    provider_item_id: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    sanitized_metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    negative_reason: Mapped[str | None] = mapped_column(String(120))
+    negative_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SourceCandidate(TimestampMixin, Base):
+    __tablename__ = "source_candidates"
+    __table_args__ = (
+        CheckConstraint(
+            "policy_status IN ('pending','allowed','rejected','exhausted')",
+            name="ck_source_candidates_policy_status",
+        ),
+        CheckConstraint(
+            "probe_status IN ('pending','valid','invalid','failed')",
+            name="ck_source_candidates_probe_status",
+        ),
+        CheckConstraint(
+            "uploader_relationship IN ('official_artist','official_label','topic',"
+            "'distributor','third_party','unknown')",
+            name="ck_source_candidates_uploader_relationship",
+        ),
+        UniqueConstraint(
+            "request_track_id",
+            "provider",
+            "extractor",
+            "source_id",
+            name="uq_source_candidates_identity",
+        ),
+        Index("ix_source_candidates_job_rank", "job_id", "policy_status", "local_score"),
+        Index("ix_source_candidates_evidence", "evidence_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
+    evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("evidence_references.id", ondelete="SET NULL"), index=True
+    )
+    request_track_id: Mapped[str | None] = mapped_column(
+        ForeignKey("request_tracks.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("download_jobs.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(40))
+    extractor: Mapped[str] = mapped_column(String(80))
+    source_id: Mapped[str] = mapped_column(String(200))
+    acquisition_url: Mapped[str | None] = mapped_column(String(2048))
+    provider_title: Mapped[str] = mapped_column(String(500))
+    provider_artist: Mapped[str | None] = mapped_column(String(300))
+    uploader: Mapped[str | None] = mapped_column(String(300))
+    uploader_relationship: Mapped[str] = mapped_column(String(24), default="unknown")
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    version_signature: Mapped[str] = mapped_column(String(300), default="studio")
+    group_key: Mapped[str] = mapped_column(String(500))
+    local_score: Mapped[float] = mapped_column(Float, default=0.0)
+    policy_status: Mapped[str] = mapped_column(String(20), default="pending")
+    probe_status: Mapped[str] = mapped_column(String(20), default="pending")
+    contradictions_json: Mapped[str] = mapped_column(Text, default="[]")
+    sanitized_metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_code: Mapped[str | None] = mapped_column(String(100))
+    superseded_by_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_candidates.id", ondelete="SET NULL")
+    )
+
+
+class JobDecision(Base):
+    __tablename__ = "job_decisions"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('recording_version','acquisition_source','canonical_metadata',"
+            "'possible_duplicate')",
+            name="ck_job_decisions_category",
+        ),
+        CheckConstraint(
+            "state IN ('pending','selected','superseded','rejected')",
+            name="ck_job_decisions_state",
+        ),
+        CheckConstraint(
+            "decided_by IS NULL OR decided_by IN ('deterministic','openai','user','migration')",
+            name="ck_job_decisions_decided_by",
+        ),
+        UniqueConstraint(
+            "job_id",
+            "category",
+            "candidate_set_fingerprint",
+            "revision",
+            name="uq_job_decisions_fingerprint_revision",
+        ),
+        Index("ix_job_decisions_pending", "job_id", "state", "category"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("download_jobs.id", ondelete="CASCADE"), index=True
+    )
+    category: Mapped[str] = mapped_column(String(32))
+    candidate_set_fingerprint: Mapped[str] = mapped_column(String(64))
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(String(20), default="pending")
+    selected_payload_json: Mapped[str | None] = mapped_column(Text)
+    decided_by: Mapped[str | None] = mapped_column(String(20))
+    openai_call_id: Mapped[str | None] = mapped_column(
+        ForeignKey("openai_calls.id", ondelete="SET NULL")
+    )
+    prompt_version: Mapped[str | None] = mapped_column(String(64))
+    local_confidence: Mapped[float | None] = mapped_column(Float)
+    model_confidence: Mapped[float | None] = mapped_column(Float)
+    contradictions_json: Mapped[str] = mapped_column(Text, default="[]")
+    reason_codes_json: Mapped[str] = mapped_column(Text, default="[]")
+    round_number: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class JobArtifact(Base):
+    __tablename__ = "job_artifacts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('creating','ready','published','removed','invalid')",
+            name="ck_job_artifacts_status",
+        ),
+        UniqueConstraint("job_id", "kind", "relative_path", name="uq_job_artifacts_path"),
+        Index("ix_job_artifacts_recovery", "job_id", "status", "stage"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("download_jobs.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    stage: Mapped[str] = mapped_column(String(40))
+    relative_path: Mapped[str] = mapped_column(String(1200))
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    generation_token: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(20), default="creating")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
 
 
 class Event(Base):
@@ -415,6 +599,13 @@ class OpenAICall(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(100))
+    exception_class: Mapped[str | None] = mapped_column(String(120))
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    provider_error_code: Mapped[str | None] = mapped_column(String(120))
+    provider_error_parameter: Mapped[str | None] = mapped_column(String(120))
+    application_call_id: Mapped[str | None] = mapped_column(String(64))
+    failure_phase: Mapped[str | None] = mapped_column(String(40))
+    retryable: Mapped[bool | None] = mapped_column(Boolean)
     service_tier: Mapped[str | None] = mapped_column(String(40))
     pricing_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
     estimated_cost_microusd: Mapped[int | None] = mapped_column(BigInteger)

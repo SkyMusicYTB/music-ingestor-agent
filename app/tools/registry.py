@@ -213,6 +213,7 @@ def build_default_registry(
     musicbrainz_client: MusicBrainzClient | None = None,
     listenbrainz_client: ListenBrainzClient | None = None,
     apple_client: AppleMetadataClient | None = None,
+    media_source_tools: Sequence[ToolDefinition] = (),
     youtube_search_tool: ToolDefinition | None = None,
 ) -> ToolRegistry:
     """Build the fixed production allowlist without making network requests."""
@@ -247,7 +248,20 @@ def build_default_registry(
         registry.add_closer(listenbrainz.aclose)
     if frozenset(definition.name for definition in registry.definitions) != _DEFAULT_TOOL_NAMES:
         raise RuntimeError("default model tool allowlist is incomplete")
+    if media_source_tools:
+        names = tuple(definition.name for definition in media_source_tools)
+        if len(names) != 2 or frozenset(names) != {
+            "search_media_sources",
+            "probe_media_source",
+        }:
+            raise ValueError(
+                "media source broker must provide search_media_sources and probe_media_source"
+            )
+        for definition in media_source_tools:
+            registry.register(definition)
     if youtube_search_tool is not None:
+        if media_source_tools:
+            raise ValueError("legacy YouTube and finite media broker tools cannot be combined")
         if youtube_search_tool.name != "youtube_search_candidates":
             raise ValueError("worker broker tool must be named youtube_search_candidates")
         registry.register(youtube_search_tool)

@@ -1,33 +1,42 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from app.api.dependencies import CsrfSession, CurrentSession
-from app.db.models import DownloadJob, Event, JobReviewOption, RequestTrack
+from app.db.models import DownloadJob, Event, RequestTrack
 from app.db.models import Request as DbRequest
+from app.repositories.decisions import (
+    DecisionConflict,
+    DecisionSelection,
+    apply_review_bundle,
+)
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
 
-class ReviewBody(BaseModel):
+class ReviewCorrection(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    option_id: str | None = None
     artist: str | None = Field(default=None, max_length=300)
     title: str | None = Field(default=None, max_length=300)
     album: str | None = Field(default=None, max_length=300)
 
-    @model_validator(mode="after")
-    def selection_or_edit_required(self) -> ReviewBody:
-        if self.option_id is None and all(
-            value is None for value in (self.artist, self.title, self.album)
-        ):
-            raise ValueError("select a review option or provide a metadata correction")
-        return self
+
+class ReviewSelectionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision_id: str = Field(min_length=1, max_length=36)
+    option_id: str = Field(min_length=1, max_length=36)
+    correction: ReviewCorrection | None = None
+
+
+class ReviewBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bundle_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision: int = Field(ge=1)
+    selections: list[ReviewSelectionBody] = Field(min_length=1, max_length=4)
 
 
 def _job(item: DownloadJob) -> dict[str, object]:
@@ -91,55 +100,41 @@ def review_job(
         )
         if job is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-        if job.status != "needs_review":
-            raise HTTPException(status.HTTP_409_CONFLICT, "job is not awaiting review")
-        snapshot = json.loads(job.approved_snapshot_json)
-        if body.option_id:
-            option = session.scalar(
-                select(JobReviewOption).where(
-                    JobReviewOption.id == body.option_id, JobReviewOption.job_id == job_id
-                )
+        selections = [
+            DecisionSelection(
+                decision_id=item.decision_id,
+                option_id=item.option_id,
+                correction=(item.correction.model_dump() if item.correction is not None else None),
             )
-            if option is None:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid review option")
-            payload = json.loads(option.provider_payload_json)
-            allowed = {
-                key: payload[key]
-                for key in (
-                    "artist",
-                    "title",
-                    "album",
-                    "album_artist",
-                    "year",
-                    "recording_mbid",
-                    "release_mbid",
-                    "release_group_mbid",
-                    "source_id",
-                    "source_extractor",
-                )
-                if key in payload
-            }
-            snapshot.update(allowed)
-            option.selected_at = datetime.now(UTC)
-        for field in ("artist", "title", "album"):
-            value = getattr(body, field)
-            if value is not None:
-                snapshot[field] = value.strip()
-        if not snapshot.get("artist") or not snapshot.get("title"):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "artist and title are required")
-        job.approved_snapshot_json = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
-        job.status = "queued"
-        job.stage = "queued"
-        job.available_at = datetime.now(UTC)
-        job.error_code = None
-        job.error_message = None
+            for item in body.selections
+        ]
+        try:
+            result = apply_review_bundle(
+                session,
+                job,
+                bundle_fingerprint=body.bundle_fingerprint,
+                revision=body.revision,
+                selections=selections,
+            )
+        except DecisionConflict as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         session.add(
             Event(
                 entity_type="job",
                 entity_id=job.id,
                 event_type="job.reviewed",
-                message="Review selection accepted",
+                message=(
+                    "Review selection replayed" if result.replayed else "Review selection accepted"
+                ),
+                details_json=json.dumps(
+                    {
+                        "bundle_fingerprint": body.bundle_fingerprint,
+                        "revision": body.revision,
+                        "replayed": result.replayed,
+                    },
+                    separators=(",", ":"),
+                ),
             )
         )
         session.flush()
-        return _job(job)
+        return _job(result.job)

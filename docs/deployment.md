@@ -4,7 +4,11 @@
 
 Production is guarded to Ubuntu Server 26.04.x (`VERSION_ID=26.04`), amd64, and the distribution Python 3.14. The first-install script checks those values and installs only the required native packages: Python/venv, ffmpeg, Git, curl, CA certificates, rsync, ACL tools, unzip, and OpenSSL. It performs no distribution upgrade and never installs Python packages globally.
 
-Keep the Git checkout under an administrator's home directory. Root never needs Git credentials. Each deployment first creates its unique final `/opt/music-agent/releases/<commit>-<UTC timestamp>` directory, copies the committed tree there, and creates the Linux virtualenv directly at that permanent absolute path. The release is never renamed after virtualenv creation, so pip-generated absolute console-script shebangs remain valid. It installs a fully pinned dependency closure, normalizes the tree to root-owned and runtime-readable but not runtime-writable, and validates the interpreter, imports, web CLI, worker CLI, and shebangs as `music-agent` before activation. `/opt/music-agent/current` is the sole atomic activation pointer; all write bits are removed after successful activation.
+Keep the Git checkout under an administrator's home directory and keep the repository root and `.git` directory owned by that non-root account. Root never runs Git against the checkout and never needs Git credentials. Deployment resolves the physical checkout owner, copies the current index to an owner-readable private temporary directory, and runs every read-only Git command as that owner with optional locks and filesystem monitoring disabled. It verifies that the original index owner, group, mode, size, modification time, checksum, and lock state are unchanged before proceeding.
+
+A clean deployment is materialized from `git archive`, not by recursively copying the checkout. An explicitly authorized `--allow-dirty` deployment uses a NUL-delimited Git manifest containing modified tracked files and nonignored untracked files. Ignored files are never copied. Git metadata, environment overrides, credential/secret directories, private-key-like files, submodules, unmerged entries, and tracked symlinks are rejected. Symlink-safe content hashes must match before, inside the candidate release, and after copying; source metadata must also remain unchanged, so an `M`-to-`M` concurrent edit cannot evade the snapshot check. The manifest checksum and checkout owner are recorded in `RELEASE.json`.
+
+Each deployment creates its unique final `/opt/music-agent/releases/<commit>-<UTC timestamp>` directory and creates the Linux virtualenv directly at that permanent absolute path. The release is never renamed after virtualenv creation, so pip-generated absolute console-script shebangs remain valid. It installs a fully pinned dependency closure, normalizes the tree to `root:music-agent`, readable/traversable but not writable by the runtime account and inaccessible to unrelated local users, and validates the interpreter, imports, web CLI, worker CLI, tool executables, and shebangs as `music-agent` before activation. `/opt/music-agent/current` is the sole atomic activation pointer; all write bits are removed after successful activation.
 
 ## First installation
 
@@ -24,13 +28,13 @@ Use `--no-start` to prepare and migrate without enabling or starting services. `
 
 ## Navidrome and ACLs
 
-`configure-library-acl.sh` records a physical, non-symlink-following recursive ACL snapshot in `/var/lib/music-agent/acl-backups` before changing access. It adds:
+`configure-library-acl.sh` records and retains a physical, non-symlink-following recursive ACL snapshot in the root-only `/var/lib/music-agent-safety-backups/acl` directory before changing access. It adds:
 
 - read/write/traverse access for `music-agent` to existing library entries;
 - default write ACLs for future Music Agent entries;
 - explicit existing/default read access for the detected Navidrome account.
 
-It checks that `/srv/music` ownership did not change and tests both accounts. It does not run `chown`, change Navidrome configuration, or restart Navidrome. Directory write access inherently permits entry creation, rename, and deletion; application no-clobber/duplicate checks are therefore a required second control.
+It checks that `/srv/music` ownership did not change and tests both accounts with real operations rather than predictive mode-bit checks. As `music-agent` it lists the root, creates a securely unique nested directory and file, writes/fsyncs/closes it, and cleans both entries even on failure; this also exercises inherited default ACLs. As the detected Navidrome account it lists the root and physically opens/reads an existing nested regular file when one is present. Existing ACL entries with dormant permissions are rejected before mask recalculation could make those permissions effective. Any later failure or handled termination signal automatically restores the complete snapshot from the protected area, which the runtime account cannot rename or replace. The same protected snapshot remains available to the operator after success. It does not run `chown`, change Navidrome configuration, or restart Navidrome. Directory write access inherently permits entry creation, rename, and deletion; application no-clobber/duplicate checks are therefore a required second control.
 
 Re-run the script only when the Navidrome identity or library mount changes. The ACL snapshot can be inspected or restored with `setfacl --restore=<snapshot>` after carefully reviewing its absolute paths.
 
@@ -53,7 +57,7 @@ git pull --ff-only
 sudo bash scripts/deploy.sh
 ```
 
-Before interruption, deployment builds a complete inactive release, allows only wheels, runs `pip check`, compiles the app, validates credentials/config/tools and service-account execution, and installs parseable units. A build that fails before validation is removed; an unexpected interruption leaves a `.build-incomplete` marker, while a validated candidate has a `prepared` manifest and remains inactive. During the activation transaction it records which services were running, stops worker then web, backs up/integrity-checks SQLite, migrates and validates with the service identity, switches the symlink, starts both services, makes the release immutable, and revalidates. Any failed migration or activation restores the old symlink and the paired database backup before attempting to restart the old units. Rollback performs the same service-account virtualenv preflight before stopping either service.
+Before interruption, deployment builds a complete inactive release, allows only wheels, runs `pip check`, compiles the app, validates credential ownership/shape, configuration, strict schemas, tools, and service-account execution, and installs parseable units. Native operations require the exact managed production database, artwork, downloads, music, and backup paths from the shipped environment template. The pre-stop configuration/schema check runs under the worker role without a credential directory, so a still-running worker can never read a temporary copy of web credentials. A build that fails before validation is removed; an unexpected interruption leaves a `.build-incomplete` marker, while a validated candidate has a `prepared` manifest and remains inactive. During the activation transaction it records which services were running, stops worker then web, writes the paired SQLite snapshot under root-only `/var/lib/music-agent-safety-backups`, loads credentials for migration and full validation only while the worker is stopped, switches the symlink, makes the release immutable, completes final offline validation, and then starts both services. The web unit performs its own isolated `LoadCredential` validation before start. The candidate service identity cannot alter or delete the safety snapshot. Any failed migration or activation restores the old symlink and paired database backup before attempting to restart the old units. Rollback uses the same credentialless preflight and offline credential boundary.
 
 Do not edit an installed release or its venv. Commit a fix and deploy a new one.
 
@@ -75,7 +79,7 @@ The command checks release status and schema metadata, creates a new safety back
 
 ## Tool updates
 
-Normal deployments verify `requirements/tool-pins.env`, official GitHub URLs, and SHA-256 values. Deno and yt-dlp live in versioned root-owned directories and are found through `/opt/music-agent/tools/current/bin`.
+Normal deployments verify `requirements/tool-pins.env`, official GitHub URLs, and SHA-256 values. Deno and yt-dlp live in versioned root-owned directories and are found through `/opt/music-agent/tools/current/bin`. Every install/update repairs all managed parent/version/bin directories to `root:root` mode 0755, executables to 0755, manifests to 0644, and symlink ownership to root. Activation is refused unless both tools resolve and execute as `music-agent` using the exact systemd PATH. A failed yt-dlp probe or worker restart restores the prior link.
 
 To apply the audited yt-dlp pin:
 

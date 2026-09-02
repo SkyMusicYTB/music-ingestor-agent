@@ -32,6 +32,10 @@ class WebOrchestration(Protocol):
         self, payload: dict[str, object]
     ) -> Awaitable[dict[str, object]] | dict[str, object]: ...
 
+    def match_canonical(
+        self, payload: dict[str, object]
+    ) -> Awaitable[dict[str, object]] | dict[str, object]: ...
+
 
 @dataclass(frozen=True)
 class ClaimedTask:
@@ -44,6 +48,10 @@ class ClaimedTask:
 
 class RequestLeaseBusy(RuntimeError):
     pass
+
+
+class ConfirmationGatePending(RuntimeError):
+    """An exact request is waiting on a recoverable local safety gate."""
 
 
 class WebTaskSupervisor:
@@ -133,6 +141,15 @@ class WebTaskSupervisor:
             if not isinstance(selector_result, dict):
                 raise ValueError("source selector returned an invalid result")
             return selector_result
+        if task.kind == "match_canonical":
+            if self.orchestration is None or not hasattr(self.orchestration, "match_canonical"):
+                raise RuntimeError("AI canonical matching is unavailable")
+            match_result = self.orchestration.match_canonical(task.payload)
+            if inspect.isawaitable(match_result):
+                match_result = await match_result
+            if not isinstance(match_result, dict):
+                raise ValueError("canonical matcher returned an invalid result")
+            return match_result
         raise ValueError(f"unsupported web service task kind: {task.kind}")
 
     def _claim(self) -> ClaimedTask | None:
@@ -216,16 +233,24 @@ class WebTaskSupervisor:
     def _fail(self, task: ClaimedTask, error: Exception) -> None:
         now = datetime.now(UTC)
         request_busy = isinstance(error, RequestLeaseBusy)
-        terminal = not request_busy and (task.attempts >= 5 or isinstance(error, ValueError))
+        confirmation_pending = isinstance(error, ConfirmationGatePending)
+        terminal = not (request_busy or confirmation_pending) and (
+            task.attempts >= 5 or isinstance(error, ValueError)
+        )
         delay = (
             max(5, self.settings.lease_seconds // 2)
-            if request_busy
+            if request_busy or confirmation_pending
             else min(300, 2 ** min(task.attempts, 8))
+        )
+        retry_kind = (
+            "confirm_request"
+            if confirmation_pending and task.kind == "orchestrate_request"
+            else task.kind
         )
         with self.engine.begin() as connection:
             updated = connection.execute(
                 text(
-                    "UPDATE service_tasks SET state=:state, available_at=:available, "
+                    "UPDATE service_tasks SET state=:state, kind=:kind, available_at=:available, "
                     "lease_token=NULL, lease_expires_at=NULL, last_error=:error, updated_at=:now "
                     "WHERE id=:id AND lease_token=:token"
                 ).bindparams(
@@ -234,6 +259,7 @@ class WebTaskSupervisor:
                 ),
                 {
                     "state": "failed" if terminal else "retry_wait",
+                    "kind": retry_kind,
                     "available": now + timedelta(seconds=delay),
                     "error": str(error)[:1000],
                     "now": now,
@@ -301,25 +327,34 @@ class WebTaskSupervisor:
                 )
                 is not None
             )
+        if not decision.auto_queue:
+            return
+        if not scan_ready:
+            raise ConfirmationGatePending(
+                "exact Add request is waiting for the initial library scan"
+            )
         try:
             disk_ready = (
                 shutil.disk_usage(self.settings.music_path).free >= self.settings.min_free_bytes
             )
         except OSError:
             disk_ready = False
-        if decision.auto_queue and scan_ready and disk_ready:
-            job_ids = self.jobs.queue_approved(request_id, user_id, [tracks[0].id])
-            with self.factory.begin() as session:
-                request = session.get(Request, request_id)
-                if request:
-                    request.status = "auto_queued"
-            self.events.emit(
-                "request",
-                "request.auto_queued",
-                "Exact single-track Add request queued automatically",
-                request_id,
-                {"job_ids": job_ids},
+        if not disk_ready:
+            raise ConfirmationGatePending(
+                "exact Add request is waiting for sufficient library disk space"
             )
+        job_ids = self.jobs.queue_approved(request_id, user_id, [tracks[0].id])
+        with self.factory.begin() as session:
+            request = session.get(Request, request_id)
+            if request:
+                request.status = "auto_queued"
+        self.events.emit(
+            "request",
+            "request.auto_queued",
+            "Exact single-track Add request queued automatically",
+            request_id,
+            {"job_ids": job_ids},
+        )
 
     def _heartbeat(self, active: int) -> None:
         now = datetime.now(UTC)

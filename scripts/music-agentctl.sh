@@ -15,8 +15,8 @@ Usage:
   sudo scripts/music-agentctl.sh scan [--full]
   sudo scripts/music-agentctl.sh admin-reset
 
-Runs an allowlisted administrative CLI command as the service account with a
-temporary credential directory and safely parsed production configuration.
+Runs an allowlisted administrative CLI command as the service account with
+safely parsed production configuration and no web-service credentials.
 EOF
 }
 
@@ -45,4 +45,4 @@ music_agent_acquire_lock operations
 current_release="$(music_agent_current_release)"
 [[ -n "$current_release" && -x "$current_release/venv/bin/music-agent" ]] ||
     music_agent_die "no active Music Agent release"
-music_agent_with_credentials "$current_release/venv/bin/music-agent" "${arguments[@]}"
+music_agent_without_credentials "$current_release/venv/bin/music-agent" "${arguments[@]}"

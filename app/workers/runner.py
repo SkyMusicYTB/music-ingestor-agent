@@ -175,7 +175,14 @@ def build_runner(settings: Settings) -> tuple[WorkerRunner, ArtworkFetcher]:
     service_queue = ServiceTaskQueue(
         session_factory, target="worker", lease_seconds=settings.lease_seconds
     )
-    ytdlp = YtDlpClient()
+    ytdlp = YtDlpClient(
+        source_policy=settings.media_source_policy,
+        enabled_providers=settings.enabled_media_providers,
+        allowed_hosts=settings.allowed_media_hosts,
+        allowed_extractors=settings.allowed_media_extractors,
+        blocked_extractors=settings.blocked_media_extractors,
+        allow_generic_extractor=settings.allow_generic_extractor,
+    )
     youtube = YouTubeTool(ytdlp, max_duration_seconds=settings.max_direct_media_seconds)
     media = MediaProcessor()
     artwork_fetcher = ArtworkFetcher()
@@ -208,6 +215,9 @@ def build_runner(settings: Settings) -> tuple[WorkerRunner, ArtworkFetcher]:
         max_duration_seconds=settings.max_direct_media_seconds,
         shutdown_signal=stop_event,
         download_queue=queue,
+        source_probe_negative_ttl_seconds=settings.source_probe_negative_ttl_seconds,
+        enabled_providers=settings.enabled_media_providers,
+        max_direct_playlist_items=settings.max_direct_playlist_items,
     )
     recovery = StartupRecovery(
         downloads=queue,

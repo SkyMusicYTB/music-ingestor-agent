@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import inspect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -9,6 +8,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.config import Settings
+from app.openai_schema import compile_openai_schema
 from app.repositories.usage import UsageValues
 from app.schemas import MusicProposal
 
@@ -138,26 +138,9 @@ def source_selection_format(candidate_ids: Sequence[str]) -> dict[str, Any]:
 
 
 def strict_json_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the strict subset required by Structured Outputs/function tools."""
+    """Compile the exact strict subset accepted by the Responses API."""
 
-    result = copy.deepcopy(dict(schema))
-
-    def visit(node: Any) -> None:
-        if isinstance(node, dict):
-            node.pop("default", None)
-            if node.get("type") == "object" or "properties" in node:
-                properties = node.get("properties")
-                if isinstance(properties, dict):
-                    node["additionalProperties"] = False
-                    node["required"] = list(properties)
-            for value in node.values():
-                visit(value)
-        elif isinstance(node, list):
-            for value in node:
-                visit(value)
-
-    visit(result)
-    return result
+    return compile_openai_schema(schema)
 
 
 def response_output_items(response: Any) -> list[dict[str, Any]]:

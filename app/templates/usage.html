@@ -16,7 +16,26 @@
   <h2>Recent calls</h2>
   <div class="library-table">
     {% for call in calls %}
-    <div class="usage-row"><span><strong>{{ call.model }}</strong><small>{{ call.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ call.status }}</small></span><span>{{ call.total_tokens }} tokens<br>{% if call.estimated_cost_microusd is not none %}${{ '%.6f'|format(call.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span></div>
+    <div class="usage-row">
+      <span>
+        <strong>{{ call.model }}</strong>
+        <small>{{ call.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ call.status }}{% if call.error_category %} · {{ call.error_category }}{% endif %}</small>
+        {% if call.status == 'failed' %}
+        <details>
+          <summary>Safe diagnostic details</summary>
+          <small>
+            Application call {{ call.application_call_id }}
+            {% if call.provider_request_id %} · Provider request {{ call.provider_request_id }}{% endif %}
+            {% if call.http_status %} · HTTP {{ call.http_status }}{% endif %}
+            {% if call.provider_error_code %} · Code {{ call.provider_error_code }}{% endif %}
+            {% if call.failure_phase %} · Phase {{ call.failure_phase }}{% endif %}
+            {% if call.retryable is not none %} · Retryable: {{ 'yes' if call.retryable else 'no' }}{% endif %}
+          </small>
+        </details>
+        {% endif %}
+      </span>
+      <span>{{ call.total_tokens }} tokens<br>{% if call.estimated_cost_microusd is not none %}${{ '%.6f'|format(call.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span>
+    </div>
     {% else %}<p class="empty">No OpenAI calls have been recorded.</p>{% endfor %}
   </div>
 </section>

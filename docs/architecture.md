@@ -9,12 +9,22 @@ A typical request moves through these states:
 1. Authenticate, enforce origin/CSRF rules, parse the bounded request, and create an audit record.
 2. Search the local SQLite index before remote discovery.
 3. Use allowlisted metadata/search clients and validate candidate identifiers and URLs.
-4. Present ambiguous or multi-track results for confirmation; exact single-track requests may follow configured policy.
+4. Resolve an exact single Add automatically; present only the requested result preview for Find or fuzzy/bulk Add requests.
 5. Insert idempotent jobs into SQLite.
-6. A worker atomically leases one job, resolves permitted media, and downloads to a unique staging directory.
-7. ffprobe, metadata rules, Mutagen readback, duplicate checks, and free-space checks gate publication.
-8. Rename a completed file onto the same `/srv/music` filesystem. Record the final identity and audit outcome.
-9. Navidrome discovers the file on its normal periodic scan.
+6. A worker atomically leases one job, adopts any request-level evidence, probes and groups equivalent curated sources, and chooses from finite opaque candidate IDs.
+7. Resolve a sensible official MusicBrainz release automatically. Uploader/channel remains source provenance and never becomes the canonical artist.
+8. Try the next persisted safe source after a source-specific failure, within the configured bounded attempt budget.
+9. ffprobe, metadata rules, Mutagen readback, duplicate checks, byte/free-space reservations, and publication rules gate the result.
+10. Rename a completed file onto the same `/srv/music` filesystem. Record the final identity and audit outcome.
+11. Navidrome discovers the file on its normal periodic scan.
+
+Deterministic matching is the first authority. Borderline canonical or source matches may be adjudicated by OpenAI only over IDs in the supplied finite candidate sets and only when the local score, version, duration, and contradiction gates also pass. Provider descriptions are bounded untrusted data. Downloaded audio is never sent to OpenAI.
+
+Provider, album/release, and version constraints influence automatic selection only when they can be recovered from the user's own request. They are persisted with the request track and copied into the approved job snapshot; model-supplied descriptive metadata cannot manufacture them. An explicitly requested provider remains mandatory across retries and restarts. If it is unavailable, one durable exceptional review asks permission before the worker considers the finite set of other enabled providers.
+
+Direct collection URLs are a separate, bounded intake path. The worker requests a flat metadata preview with `--playlist-end` set to one beyond the configured cap so oversized collections fail closed. YouTube playlists, SoundCloud sets, and Bandcamp albums produce one request-level selection; selected entries then follow the ordinary single-item pipeline with `--no-playlist`. Profile and unbounded collection pages never become executable candidates.
+
+`evidence_references` distinguishes discovery pages from executable acquisition candidates. `source_candidates` separates provider artist/track metadata from uploader provenance and records probe, policy, rank, attempt, and failure state. `job_decisions` stores deterministic, OpenAI, user, and migration decisions with candidate-set fingerprints; `job_artifacts` provides recovery evidence. Exact replay is idempotent, a selected fingerprint is never presented again, and a changed candidate set receives a new revision. Exceptional review submissions select every pending decision atomically.
 
 ## SQLite concurrency and migrations
 

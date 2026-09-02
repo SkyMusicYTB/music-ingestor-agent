@@ -11,7 +11,7 @@ from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 
-EXPECTED_SCHEMA_REVISION = "0001"
+EXPECTED_SCHEMA_REVISION = "0002"
 
 
 def create_database_engine(settings: Settings) -> Engine:

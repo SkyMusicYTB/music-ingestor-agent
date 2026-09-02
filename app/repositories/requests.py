@@ -11,10 +11,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.clients.ytdlp import is_curated_collection_url
 from app.db.models import Conversation, Event, Request, RequestTrack, ServiceTask
 from app.schemas import MusicProposal
+from app.services.request_constraints import parse_explicit_request_constraints
+from app.sources import ProviderIdentity, ProviderURLPolicy, provider_for_url
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+DIRECT_SINGLE_INPUT_KINDS = frozenset({"youtube_url", "media_url"})
+DIRECT_COLLECTION_INPUT_KIND = "media_collection_url"
 _COUNT_NOUN = r"(?:songs?|tracks?|recordings?)"
 _NUMERIC_COUNT = re.compile(
     rf"\b(?P<count>\d{{1,3}})\s*(?:[-\u2013\u2014]\s*)?{_COUNT_NOUN}\b", re.I
@@ -61,15 +66,27 @@ def classify_input(value: str) -> str:
     except ValueError:
         return "natural_language"
     if parsed.scheme or parsed.netloc:
-        if parsed.scheme != "https" or (parsed.hostname or "").casefold() not in YOUTUBE_HOSTS:
-            raise ValueError("direct URLs are limited to reviewed HTTPS YouTube hosts")
-        return "youtube_url"
+        provider = provider_for_url(value.strip())
+        if provider not in {
+            ProviderIdentity.YOUTUBE,
+            ProviderIdentity.SOUNDCLOUD,
+            ProviderIdentity.BANDCAMP,
+        }:
+            raise ValueError("direct URLs are limited to reviewed curated media providers")
+        validation = ProviderURLPolicy().validate(value.strip(), provider=provider)
+        if not validation.allowed:
+            raise ValueError("direct media URL does not satisfy the source policy")
+        if is_curated_collection_url(value.strip()):
+            return DIRECT_COLLECTION_INPUT_KIND
+        return "youtube_url" if provider is ProviderIdentity.YOUTUBE else "media_url"
     return "natural_language"
 
 
 def parse_requested_count(value: str, *, input_kind: str) -> int | None:
-    if input_kind == "youtube_url":
+    if input_kind in DIRECT_SINGLE_INPUT_KINDS:
         return 1
+    if input_kind == DIRECT_COLLECTION_INPUT_KIND:
+        return None
     normalized = unicodedata.normalize("NFKC", value)
     match = _NUMERIC_COUNT.search(normalized) or _ACTION_COUNT.search(normalized)
     count: int | None = int(match.group("count")) if match else None
@@ -140,7 +157,8 @@ class RequestRepository:
                 session.flush()
                 task_kind = (
                     "resolve_direct_request"
-                    if request.input_kind == "youtube_url"
+                    if request.input_kind
+                    in {*DIRECT_SINGLE_INPUT_KINDS, DIRECT_COLLECTION_INPUT_KIND}
                     else "orchestrate_request"
                 )
                 target = "worker" if task_kind == "resolve_direct_request" else "web"
@@ -209,9 +227,16 @@ class RequestRepository:
             request = session.get(Request, request_id)
             if request is None:
                 raise LookupError(request_id)
+            request_constraints = parse_explicit_request_constraints(
+                request.raw_text,
+                input_kind=request.input_kind,
+            )
             session.query(RequestTrack).filter(RequestTrack.request_id == request_id).delete()
             ids: list[str] = []
             for ordinal, item in enumerate(proposal.tracks, start=1):
+                display_evidence = [str(value) for value in item.evidence]
+                if item.source_url is not None:
+                    display_evidence.append(str(item.source_url))
                 track = RequestTrack(
                     request_id=request_id,
                     ordinal=ordinal,
@@ -221,14 +246,31 @@ class RequestRepository:
                     album_artist=item.album_artist,
                     year=item.year,
                     duration_seconds=item.duration_seconds,
-                    recording_mbid=item.recording_mbid,
-                    release_mbid=item.release_mbid,
-                    release_group_mbid=item.release_group_mbid,
-                    source_url=str(item.source_url) if item.source_url else None,
-                    version_signature=item.version or "studio",
+                    recording_mbid=None,
+                    release_mbid=None,
+                    release_group_mbid=None,
+                    suggested_recording_mbid=item.recording_mbid,
+                    suggested_release_mbid=item.release_mbid,
+                    suggested_release_group_mbid=item.release_group_mbid,
+                    canonical_identity_verified=False,
+                    source_url=None,
+                    version_signature=request_constraints.version or item.version or "studio",
                     rationale=item.rationale,
-                    evidence_json=json.dumps(item.evidence, ensure_ascii=False),
+                    evidence_json=json.dumps(
+                        list(dict.fromkeys(display_evidence)), ensure_ascii=False
+                    ),
                     metadata_confidence=item.confidence,
+                    metadata_provenance_json=json.dumps(
+                        {
+                            "automatic_association": False,
+                            "album_constraint_explicit": request_constraints.album is not None,
+                            "request_constraints": request_constraints.as_provenance(),
+                            "source": "unverified_model_output",
+                            "suggested_recording_mbid": item.recording_mbid,
+                            "suggested_release_mbid": item.release_mbid,
+                        },
+                        separators=(",", ":"),
+                    ),
                     selected=True,
                 )
                 session.add(track)

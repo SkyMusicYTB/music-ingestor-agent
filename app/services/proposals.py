@@ -17,6 +17,7 @@ from app.services.duplicates import (
     version_signature,
     versions_compatible,
 )
+from app.services.request_constraints import parse_explicit_request_constraints
 
 
 class ProposalLeaseLost(RuntimeError):
@@ -34,6 +35,9 @@ class VerifiedMetadata:
     release_mbid: str | None
     release_group_mbid: str | None
     score: float
+    decided_by: str = "deterministic"
+    model_confidence: float | None = None
+    openai_call_id: str | None = None
 
 
 class ProposalService:
@@ -60,20 +64,22 @@ class ProposalService:
                 raise LookupError(request_id)
             if expected_lease_token is not None and request.lease_token != expected_lease_token:
                 raise ProposalLeaseLost(request_id)
+            request_constraints = parse_explicit_request_constraints(
+                request.raw_text,
+                input_kind=request.input_kind,
+            )
             session.execute(delete(RequestTrack).where(RequestTrack.request_id == request_id))
             identifiers: list[str] = []
             selected_count = 0
             warning_count = 0
             for ordinal, item in enumerate(proposal.tracks, start=1):
-                signature = version_signature(item.version, item.title, item.album)
+                signature = request_constraints.version or version_signature(
+                    item.version, item.title, item.album
+                )
                 verified = _verified_match(item, signature, verified_metadata or {})
-                recording_mbid = (
-                    verified.recording_mbid if verified is not None else item.recording_mbid
-                )
-                release_mbid = verified.release_mbid if verified is not None else item.release_mbid
-                release_group_mbid = (
-                    verified.release_group_mbid if verified is not None else item.release_group_mbid
-                )
+                recording_mbid = verified.recording_mbid if verified is not None else None
+                release_mbid = verified.release_mbid if verified is not None else None
+                release_group_mbid = verified.release_group_mbid if verified is not None else None
                 duplicate = self._duplicates.find(
                     session,
                     DuplicateCandidate(
@@ -87,6 +93,10 @@ class ProposalService:
                 selected = duplicate.status != "owned"
                 selected_count += int(selected)
                 warning_count += int(duplicate.status == "possible")
+                display_evidence = [str(value) for value in item.evidence]
+                if item.source_url is not None:
+                    display_evidence.append(str(item.source_url))
+                display_evidence = list(dict.fromkeys(display_evidence))
                 track = RequestTrack(
                     request_id=request_id,
                     ordinal=ordinal,
@@ -99,25 +109,59 @@ class ProposalService:
                     recording_mbid=recording_mbid,
                     release_mbid=release_mbid,
                     release_group_mbid=release_group_mbid,
-                    source_url=str(item.source_url) if item.source_url else None,
+                    suggested_recording_mbid=(item.recording_mbid if verified is None else None),
+                    suggested_release_mbid=(item.release_mbid if verified is None else None),
+                    suggested_release_group_mbid=(
+                        item.release_group_mbid if verified is None else None
+                    ),
+                    canonical_identity_verified=verified is not None,
+                    # Model-returned URLs are evidence only. Executable source URLs are
+                    # accepted exclusively from a worker-owned, policy-validated candidate.
+                    source_url=None,
                     version_signature=signature,
                     rationale=item.rationale,
-                    evidence_json=json.dumps(item.evidence, ensure_ascii=False),
+                    evidence_json=json.dumps(display_evidence, ensure_ascii=False),
                     duplicate_status=duplicate.status,
                     duplicate_track_id=duplicate.track_id,
                     selected=selected,
-                    metadata_confidence=(verified.score / 100.0 if verified is not None else None),
+                    metadata_confidence=(
+                        verified.model_confidence
+                        if verified is not None and verified.model_confidence is not None
+                        else verified.score / 100.0
+                        if verified is not None
+                        else None
+                    ),
                     metadata_provenance_json=json.dumps(
                         {
                             "automatic_association": verified is not None,
+                            # Model-proposed album/version text remains descriptive.
+                            # Only constraints recovered from the user's own request
+                            # are allowed to influence release/source precedence.
+                            "album_constraint_explicit": request_constraints.album is not None,
+                            "request_constraints": request_constraints.as_provenance(),
                             "source": (
-                                "musicbrainz_search_recordings"
+                                "openai_canonical_match"
+                                if verified is not None and verified.decided_by == "openai"
+                                else "musicbrainz_search_recordings"
                                 if verified is not None
                                 else "unverified_model_output"
                             ),
                             "recording_mbid": recording_mbid,
                             "release_mbid": release_mbid,
+                            "suggested_recording_mbid": (
+                                item.recording_mbid if verified is None else None
+                            ),
+                            "suggested_release_mbid": (
+                                item.release_mbid if verified is None else None
+                            ),
                             "score": verified.score if verified is not None else None,
+                            "model_confidence": (
+                                verified.model_confidence if verified is not None else None
+                            ),
+                            "openai_call_id": (
+                                verified.openai_call_id if verified is not None else None
+                            ),
+                            "decided_by": verified.decided_by if verified is not None else None,
                         },
                         separators=(",", ":"),
                     ),

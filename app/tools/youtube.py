@@ -11,7 +11,12 @@ from pydantic import Field
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.clients.openai import strict_json_schema
-from app.clients.ytdlp import CancellationSignal, YtDlpClient
+from app.clients.ytdlp import (
+    CancellationSignal,
+    SourceValidationError,
+    YtDlpClient,
+    validate_public_media_metadata,
+)
 from app.db.models import ServiceTask
 from app.schemas import StrictModel
 from app.services.source_selection import (
@@ -165,6 +170,10 @@ def build_youtube_search_tool(
 
 def _candidate_from_entry(value: object, max_duration_seconds: int) -> SourceCandidate | None:
     if not isinstance(value, dict):
+        return None
+    try:
+        validate_public_media_metadata(value)
+    except SourceValidationError:
         return None
     source_id = value.get("id")
     title = value.get("title")

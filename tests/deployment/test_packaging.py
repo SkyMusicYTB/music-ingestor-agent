@@ -116,11 +116,14 @@ def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -
         "migrations/env.py",
         "migrations/script.py.mako",
         "migrations/versions/0001_initial_schema.py",
+        "migrations/versions/0002_source_decisions_and_hardening.py",
         "app/templates/base.html",
         "app/static/app.css",
         "app/static/app.js",
         "app/prompts/orchestrator_v1.txt",
         "app/prompts/source_selector_v1.txt",
+        "app/prompts/source_matcher_v2.txt",
+        "app/prompts/canonical_matcher_v2.txt",
     }
     assert not required.difference(names)
 
@@ -147,7 +150,7 @@ def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -
         migrate(settings)
         engine = create_database_engine(settings)
         try:
-            assert current_revision(engine) == "0001"
+            assert current_revision(engine) == "0002"
         finally:
             engine.dispose()
         """

@@ -4,13 +4,14 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
 from app.clients.ytdlp import DownloadCancelled
-from app.db.models import ServiceTask
+from app.db.models import Conversation, DownloadJob, Request, RequestTrack, ServiceTask, User
 from app.services.source_selection import SourceCandidate, TrackIntent, select_source
 from app.workers.processor import DownloadJobProcessor, SourceNeedsReview
 from app.workers.queue import JobLease
@@ -95,16 +96,58 @@ def _ambiguous_decision():
     )
 
 
-def _lease() -> JobLease:
+def _lease(session_factory) -> JobLease:
+    token = "fence"  # noqa: S105 - inert fencing fixture
+    snapshot = {
+        "artist": "Example Artist",
+        "title": "My Song",
+        "duration_seconds": 180,
+        "version_signature": "studio",
+    }
+    with session_factory.begin() as session:
+        user = User(
+            username="source-selector",
+            username_normalized="source-selector",
+            password_hash="fixture-hash",  # noqa: S106 - inert fixture
+        )
+        session.add(user)
+        session.flush()
+        conversation = Conversation(user_id=user.id, title="source selector")
+        session.add(conversation)
+        session.flush()
+        request = Request(
+            user_id=user.id,
+            conversation_id=conversation.id,
+            raw_text="add My Song by Example Artist",
+            action="add",
+            idempotency_key="source-selector",
+        )
+        session.add(request)
+        session.flush()
+        track = RequestTrack(
+            request_id=request.id,
+            ordinal=1,
+            artist="Example Artist",
+            title="My Song",
+        )
+        session.add(track)
+        session.flush()
+        job = DownloadJob(
+            request_track_id=track.id,
+            approved_snapshot_json=json.dumps(snapshot),
+            dedup_key="source-selector",
+            status="active",
+            stage="waiting_ai",
+            lease_token=token,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
     return JobLease(
-        job_id="11111111-1111-1111-1111-111111111111",
-        token="fence",  # noqa: S106 - inert fencing fixture
-        approved_snapshot={
-            "artist": "Example Artist",
-            "title": "My Song",
-            "duration_seconds": 180,
-            "version_signature": "studio",
-        },
+        job_id=job_id,
+        token=token,
+        approved_snapshot=snapshot,
         retry_count=0,
     )
 
@@ -151,7 +194,7 @@ def test_ambiguous_source_uses_finite_id_web_broker(
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             processor._resolve_ambiguous_source,
-            _lease(),
+            _lease(session_factory),
             _SelectionMonitor(),
             _ambiguous_decision(),
         )
@@ -174,7 +217,7 @@ def test_failed_source_selector_falls_back_to_review(session_factory) -> None:
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             processor._resolve_ambiguous_source,
-            _lease(),
+            _lease(session_factory),
             _SelectionMonitor(),
             _ambiguous_decision(),
         )
@@ -194,7 +237,7 @@ def test_ambiguous_source_wait_observes_worker_shutdown(session_factory) -> None
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             processor._resolve_ambiguous_source,
-            _lease(),
+            _lease(session_factory),
             _SelectionMonitor(),
             _ambiguous_decision(),
             shutdown,
