@@ -38,12 +38,22 @@ class TimestampMixin:
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("role IN ('admin','user')", name="ck_users_role"),
+        Index("ix_users_role_active", "role", "is_active"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
     username: Mapped[str] = mapped_column(String(80))
     username_normalized: Mapped[str] = mapped_column(String(80), unique=True)
     password_hash: Mapped[str] = mapped_column(String(512))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role: Mapped[str] = mapped_column(String(16), default="user", server_default="user")
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=utc_now)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -61,6 +71,7 @@ class Session(Base):
     idle_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     absolute_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reauthenticated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     user: Mapped[User] = relationship()
 
 
@@ -117,6 +128,12 @@ class Request(TimestampMixin, Base):
     discovered_count: Mapped[int] = mapped_column(Integer, default=0)
     selected_count: Mapped[int] = mapped_column(Integer, default=0)
     warning_count: Mapped[int] = mapped_column(Integer, default=0)
+    orchestration_attempt_id: Mapped[str | None] = mapped_column(String(36))
+    model_rounds_used: Mapped[int | None] = mapped_column(Integer)
+    configured_model_rounds: Mapped[int | None] = mapped_column(Integer)
+    configured_tool_calls: Mapped[int | None] = mapped_column(Integer)
+    configured_agent_seconds: Mapped[int | None] = mapped_column(Integer)
+    termination_reason: Mapped[str | None] = mapped_column(String(40))
     idempotency_key: Mapped[str] = mapped_column(String(128))
     lease_token: Mapped[str | None] = mapped_column(String(64))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -203,6 +220,7 @@ class DownloadJob(TimestampMixin, Base):
         ),
         Index("ix_download_jobs_claim", "status", "available_at", "priority", "created_at"),
         Index("ix_download_jobs_lease", "lease_expires_at"),
+        Index("ix_download_jobs_history", "dismissed_at", "status", "created_at", "id"),
         Index(
             "uq_download_jobs_active_dedup",
             "dedup_key",
@@ -239,6 +257,7 @@ class DownloadJob(TimestampMixin, Base):
     final_relative_path: Mapped[str | None] = mapped_column(String(1200))
     final_sha256: Mapped[str | None] = mapped_column(String(64))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class JobReviewOption(Base):
@@ -434,7 +453,18 @@ class JobArtifact(Base):
 
 class Event(Base):
     __tablename__ = "events"
-    __table_args__ = (Index("ix_events_entity", "entity_type", "entity_id", "id"),)
+    __table_args__ = (
+        Index("ix_events_entity", "entity_type", "entity_id", "id"),
+        Index("ix_events_audience_owner_id", "audience", "user_id", "id"),
+        CheckConstraint(
+            "audience IN ('user','all_authenticated','admin')", name="ck_events_audience"
+        ),
+        CheckConstraint(
+            "(audience = 'user' AND user_id IS NOT NULL) "
+            "OR (audience != 'user' AND user_id IS NULL)",
+            name="ck_events_owner",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     entity_type: Mapped[str] = mapped_column(String(32))
@@ -442,6 +472,8 @@ class Event(Base):
     event_type: Mapped[str] = mapped_column(String(64))
     message: Mapped[str] = mapped_column(String(500))
     details_json: Mapped[str] = mapped_column(Text, default="{}")
+    audience: Mapped[str] = mapped_column(String(24), default="admin", server_default="admin")
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -515,12 +547,16 @@ class Track(TimestampMixin, Base):
     source_url: Mapped[str | None] = mapped_column(String(2048))
     provenance_json: Mapped[str] = mapped_column(Text, default="{}")
     scan_generation: Mapped[int] = mapped_column(Integer, default=0)
+    parser_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    file_extension: Mapped[str | None] = mapped_column(String(16))
+    container: Mapped[str | None] = mapped_column(String(64))
 
 
 class ScanRun(Base):
     __tablename__ = "scan_runs"
     __table_args__ = (
         CheckConstraint("status IN ('running','completed','failed')", name="ck_scan_status"),
+        Index("uq_scan_runs_running", "status", unique=True, sqlite_where=text("status='running'")),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
@@ -534,6 +570,12 @@ class ScanRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(String(1000))
+    parser_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    service_task_id: Mapped[str | None] = mapped_column(ForeignKey("service_tasks.id"))
+    lease_token: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    traversal_complete: Mapped[bool | None] = mapped_column(Boolean)
+    summary_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
 
 
 class ArtworkCache(TimestampMixin, Base):
@@ -579,10 +621,22 @@ class ExternalCache(Base):
 
 class OpenAICall(Base):
     __tablename__ = "openai_calls"
-    __table_args__ = (Index("ix_openai_calls_created_model", "created_at", "model"),)
+    __table_args__ = (
+        Index("ix_openai_calls_created_model", "created_at", "model"),
+        Index("ix_openai_calls_owner_created", "owner_user_id", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid7)
     request_id: Mapped[str | None] = mapped_column(ForeignKey("requests.id", ondelete="SET NULL"))
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    orchestration_attempt_id: Mapped[str | None] = mapped_column(String(36))
+    model_round: Mapped[int | None] = mapped_column(Integer)
+    phase: Mapped[str | None] = mapped_column(String(40))
+    configured_model_rounds: Mapped[int | None] = mapped_column(Integer)
+    configured_tool_calls: Mapped[int | None] = mapped_column(Integer)
+    configured_agent_seconds: Mapped[int | None] = mapped_column(Integer)
+    termination_reason: Mapped[str | None] = mapped_column(String(40))
+    usage_reported: Mapped[bool | None] = mapped_column(Boolean, default=False)
     response_id: Mapped[str | None] = mapped_column(String(100))
     provider_request_id: Mapped[str | None] = mapped_column(String(100))
     model: Mapped[str] = mapped_column(String(100))

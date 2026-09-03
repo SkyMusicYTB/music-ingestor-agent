@@ -89,6 +89,7 @@ def run_bounded_process(
     stderr_tail_limit: int = 16 * 1024,
     on_frame: FrameCallback | None = None,
     capture_stdout: bool = True,
+    pass_fds: tuple[int, ...] = (),
 ) -> BoundedProcessResult:
     """Run one fixed-argv child with pre-allocation output bounds.
 
@@ -114,6 +115,7 @@ def run_bounded_process(
         shell=False,
         env=dict(environment),
         start_new_session=True,
+        pass_fds=pass_fds,
     )
     assert process.stdout is not None
     assert process.stderr is not None

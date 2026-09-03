@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.db.engine import immediate_session
 from app.db.models import (
     DownloadJob,
-    Event,
     EvidenceReference,
     JobDecision,
     JobReviewOption,
@@ -18,10 +19,27 @@ from app.db.models import (
     RequestTrack,
     SourceCandidate,
 )
+from app.repositories.events import make_event
 from app.services.duplicates import normalize_text
 from app.sources import EXECUTABLE_EVIDENCE_KINDS
 
 _ACQUISITION_PROVIDERS = ("bandcamp", "soundcloud", "youtube")
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+JOB_VIEWS = ("visible", "active", "attention", "finished", "hidden")
+
+
+@dataclass(frozen=True)
+class JobPage:
+    jobs: list[DownloadJob]
+    page: int
+    page_size: int
+    total: int
+    counts: dict[str, int]
+    view: str
+
+    @property
+    def pages(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
 
 
 def _provider_list(value: object) -> list[str]:
@@ -166,7 +184,8 @@ class JobRepository:
                         job.active_source_candidate_id = approved_source.id
                     job_ids.append(job.id)
                     session.add(
-                        Event(
+                        make_event(
+                            session,
                             entity_type="job",
                             entity_id=job.id,
                             event_type="job.queued",
@@ -192,8 +211,90 @@ class JobRepository:
                 )
             )
 
+    def page_for_user(
+        self, user_id: str, *, view: str = "visible", page: int = 1, page_size: int = 50
+    ) -> JobPage:
+        if view not in JOB_VIEWS or page_size not in {25, 50, 100} or page < 1:
+            raise ValueError("invalid download view or pagination")
+        visible = DownloadJob.dismissed_at.is_(None)
+        filters = {
+            "visible": visible,
+            "active": visible
+            & DownloadJob.status.not_in(TERMINAL_STATUSES | {"needs_review", "waiting_for_space"}),
+            "attention": visible
+            & DownloadJob.status.in_({"needs_review", "waiting_for_space", "failed"}),
+            "finished": visible & DownloadJob.status.in_(TERMINAL_STATUSES),
+            "hidden": DownloadJob.dismissed_at.is_not(None),
+        }
+        with self.factory() as session:
+            base = (
+                select(DownloadJob)
+                .join(RequestTrack)
+                .join(Request)
+                .where(Request.user_id == user_id)
+            )
+            counts = {
+                name: int(
+                    session.scalar(
+                        select(func.count()).select_from(base.where(predicate).subquery())
+                    )
+                    or 0
+                )
+                for name, predicate in filters.items()
+            }
+            total = counts[view]
+            page = min(page, max(1, (total + page_size - 1) // page_size))
+            jobs = list(
+                session.scalars(
+                    base.where(filters[view])
+                    .order_by(
+                        case((DownloadJob.status.in_(TERMINAL_STATUSES), 1), else_=0),
+                        DownloadJob.created_at.desc(),
+                        DownloadJob.id.desc(),
+                    )
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            )
+            return JobPage(jobs, page, page_size, total, counts, view)
+
+    def clear_finished(self, user_id: str, statuses: list[str] | None = None) -> int:
+        selected = set(statuses) if statuses is not None else set(TERMINAL_STATUSES)
+        if (
+            not selected
+            or not selected <= TERMINAL_STATUSES
+            or (statuses is not None and len(selected) != len(statuses))
+        ):
+            raise ValueError("choose a unique subset of completed, failed and cancelled")
+        with immediate_session(self.factory) as session:
+            owned_tracks = select(RequestTrack.id).join(Request).where(Request.user_id == user_id)
+            result = session.execute(
+                update(DownloadJob)
+                .where(
+                    DownloadJob.request_track_id.in_(owned_tracks),
+                    DownloadJob.status.in_(selected),
+                    DownloadJob.dismissed_at.is_(None),
+                )
+                .values(dismissed_at=datetime.now(UTC))
+                .execution_options(synchronize_session=False)
+            )
+            count = int(result.rowcount)
+            if count:
+                session.add(
+                    make_event(
+                        session,
+                        entity_type="job",
+                        event_type="job.history_cleared",
+                        message="Finished downloads removed from your list",
+                        audience="user",
+                        user_id=user_id,
+                        details={"count": count},
+                    )
+                )
+            return count
+
     def mutate_for_user(self, job_id: str, user_id: str, operation: str) -> DownloadJob:
-        with self.factory.begin() as session:
+        with immediate_session(self.factory) as session:
             job = session.scalar(
                 select(DownloadJob)
                 .join(RequestTrack)
@@ -202,7 +303,17 @@ class JobRepository:
             )
             if job is None:
                 raise LookupError("job not found")
-            if operation == "cancel":
+            if operation == "dismiss":
+                if job.status not in TERMINAL_STATUSES:
+                    raise ValueError("only finished jobs can be removed from the list")
+                if job.dismissed_at is not None:
+                    return job
+                job.dismissed_at = datetime.now(UTC)
+            elif operation == "restore":
+                if job.dismissed_at is None:
+                    return job
+                job.dismissed_at = None
+            elif operation == "cancel":
                 if job.status in {"completed", "cancelled", "failed"}:
                     raise ValueError("job is not cancellable")
                 timestamp = datetime.now(UTC)
@@ -250,10 +361,12 @@ class JobRepository:
                 job.available_at = datetime.now(UTC)
                 job.error_code = None
                 job.error_message = None
+                job.dismissed_at = None
             else:
                 raise ValueError("unsupported job operation")
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="job",
                     entity_id=job.id,
                     event_type=f"job.{operation}",

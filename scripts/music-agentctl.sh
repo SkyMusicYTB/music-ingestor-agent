@@ -13,7 +13,9 @@ Usage:
   sudo scripts/music-agentctl.sh validate
   sudo scripts/music-agentctl.sh migrate
   sudo scripts/music-agentctl.sh scan [--full]
-  sudo scripts/music-agentctl.sh admin-reset
+  sudo scripts/music-agentctl.sh admin-reset [--username NAME] [--recover]
+  sudo scripts/music-agentctl.sh user-list [--json]
+  sudo scripts/music-agentctl.sh library-audit [--json] [--verbose] [--limit N]
 
 Runs an allowlisted administrative CLI command as the service account with
 safely parsed production configuration and no web-service credentials.
@@ -23,9 +25,38 @@ EOF
 [[ $# -ge 1 ]] || { usage >&2; exit 64; }
 subcommand="$1"; shift
 case "$subcommand" in
-    validate|migrate|admin-reset)
+    validate|migrate)
         [[ $# -eq 0 ]] || { usage >&2; exit 64; }
         arguments=("$subcommand")
+        ;;
+    admin-reset)
+        arguments=(admin-reset)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --username)
+                    [[ $# -ge 2 && "$2" != -* && ${#2} -le 80 ]] || { usage >&2; exit 64; }
+                    arguments+=(--username "$2"); shift 2 ;;
+                --recover) arguments+=(--recover); shift ;;
+                *) usage >&2; exit 64 ;;
+            esac
+        done
+        ;;
+    user-list)
+        [[ $# -eq 0 || ( $# -eq 1 && "$1" == "--json" ) ]] || { usage >&2; exit 64; }
+        arguments=(user-list "$@")
+        ;;
+    library-audit)
+        arguments=(library-audit)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json|--verbose) arguments+=("$1"); shift ;;
+                --limit)
+                    [[ $# -ge 2 && "$2" =~ ^[0-9]{1,4}$ ]] || { usage >&2; exit 64; }
+                    [[ "$2" -ge 1 && "$2" -le 1000 ]] || { usage >&2; exit 64; }
+                    arguments+=(--limit "$2"); shift 2 ;;
+                *) usage >&2; exit 64 ;;
+            esac
+        done
         ;;
     scan)
         if [[ $# -eq 0 ]]; then

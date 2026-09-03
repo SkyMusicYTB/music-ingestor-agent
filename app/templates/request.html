@@ -6,6 +6,8 @@
   <p class="eyebrow">{{ item.action|title }} request</p>
   <div class="section-heading"><h1>{{ item.raw_text }}</h1><span class="status status-{{ item.status }}">{{ item.status|replace('_', ' ') }}</span></div>
   {% if item.error_message %}<div class="alert error">{{ item.error_message }}</div>{% endif %}
+  {% if item.status == 'degraded' %}<div class="alert warning">Partial results: {{ tracks|length }} available{% if item.requested_count %} of {{ item.requested_count }} requested{% endif %}. Review these before adding; no missing tracks were invented.</div>{% endif %}
+  {% if item.termination_reason %}<details><summary>Execution details</summary><p>{{ item.termination_reason|replace('_', ' ') }} · {{ item.model_rounds_used or 0 }} of {{ item.configured_model_rounds }} model rounds · built-in tool cap {{ item.configured_tool_calls }} per response{% if item.configured_agent_seconds is not none %} · {{ item.configured_agent_seconds }}s overall deadline{% endif %}.</p></details>{% endif %}
   {% if item.status in ['pending', 'orchestrating'] %}<div class="progress-card"><span class="spinner"></span> Building a proposal…</div>{% endif %}
   {% if item.status == 'auto_queued' %}<div class="alert success"><strong>Matched and queued automatically.</strong> No source or metadata choice was needed. Follow progress on <a href="/downloads">Downloads</a>.</div>{% endif %}
   {% if tracks and item.status not in ['auto_queued', 'queued'] %}

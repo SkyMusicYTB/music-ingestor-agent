@@ -15,6 +15,7 @@ def _call(*, created_at: datetime, cost: int | None) -> OpenAICall:
         prompt_version="test-v1",
         prompt_hash="0" * 64,
         status="completed",
+        usage_reported=True,
         input_tokens=100,
         output_tokens=50,
         reasoning_tokens=10,

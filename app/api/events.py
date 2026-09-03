@@ -7,16 +7,18 @@ from collections.abc import AsyncGenerator
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.api.dependencies import CurrentSession
+from app.api.dependencies import BackgroundSession
+from app.services.security import SESSION_COOKIE
 
 router = APIRouter(tags=["events"])
+_MAX_EVENT_ID = 9_223_372_036_854_775_807
 
 
 @router.get("/api/v1/events")
 async def events(
     request: Request,
-    authenticated: CurrentSession,
-    after: int | None = Query(default=None, ge=0, le=9_223_372_036_854_775_807),
+    authenticated: BackgroundSession,
+    after: int | None = Query(default=None, ge=0, le=_MAX_EVENT_ID),
 ) -> StreamingResponse:
     last_id = _initial_event_id(request.headers.get("last-event-id"), after)
 
@@ -45,7 +47,22 @@ async def _event_stream(request: Request, last_id: int | None) -> AsyncGenerator
     while True:
         if await request.is_disconnected():
             return
-        rows = request.app.state.events.after(last_id)
+        # SSE is not user activity: it must neither extend idle sessions nor
+        # retain privileges after a reset, role change or forced change.
+        authenticated = request.app.state.auth.resolve_session(
+            request.cookies.get(SESSION_COOKIE), touch=False
+        )
+        if authenticated is None or authenticated.must_change_password:
+            yield "event: signed_out\ndata: {}\n\n"
+            return
+        _minimum, maximum = request.app.state.events.bounds()
+        through = maximum or 0
+        rows = request.app.state.events.visible_after(
+            last_id,
+            user_id=authenticated.user_id,
+            is_admin=authenticated.role == "admin",
+            through=through,
+        )
         if rows:
             quiet_ticks = 0
             for item in rows:
@@ -63,7 +80,15 @@ async def _event_stream(request: Request, last_id: int | None) -> AsyncGenerator
                 )
                 yield f"id: {item.id}\nevent: update\ndata: {data}\n\n"
                 last_id = item.id
+            # Never jump beyond an authorized full batch: more visible rows
+            # may exist before the captured global tail.
+            if len(rows) < 100 and through > last_id:
+                last_id = through
+                yield f"id: {last_id}\nevent: checkpoint\ndata: {{}}\n\n"
         else:
+            if through > last_id:
+                last_id = through
+                yield f"id: {last_id}\nevent: checkpoint\ndata: {{}}\n\n"
             quiet_ticks += 1
             if quiet_ticks >= 15:
                 yield ": heartbeat\n\n"
@@ -75,9 +100,12 @@ def _last_event_id(value: str | None) -> int | None:
     if value is None:
         return None
     try:
-        return max(0, int(value))
+        event_id = int(value)
     except ValueError:
         return None
+    # SQLite binds signed 64-bit integers. Malformed/oversized header cursors
+    # fall back to the validated page cursor, just like other invalid headers.
+    return max(0, event_id) if event_id <= _MAX_EVENT_ID else None
 
 
 def _initial_event_id(header_value: str | None, after: int | None) -> int | None:

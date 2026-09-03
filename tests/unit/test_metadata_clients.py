@@ -12,7 +12,7 @@ from app.clients.apple_metadata import AppleMetadataClient, AppleMetadataDisable
 from app.clients.cover_art import CoverArtClient
 from app.clients.listenbrainz import ListenBrainzClient
 from app.clients.musicbrainz import MusicBrainzClient
-from app.clients.openai import OpenAIResponsesClient, music_proposal_format
+from app.clients.openai import OpenAIResponsesClient, music_proposal_format, response_usage
 from app.config import Settings
 
 MBID = "f59c5520-5f46-4d2c-b2c4-822eabf53419"
@@ -217,3 +217,32 @@ async def test_openai_adapter_disables_storage_and_parallel_tools() -> None:
         "exhausted",
         "tracks",
     }
+
+
+@pytest.mark.asyncio
+async def test_openai_adapter_tool_free_synthesis_explicitly_forbids_tools() -> None:
+    captured: dict[str, object] = {}
+
+    class Responses:
+        async def create(self, **kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {"id": "response", "output": []}
+
+    adapter = OpenAIResponsesClient(
+        settings(max_agent_steps=50, openai_max_tool_calls=2, openai_model="gpt-5.6-luna"),
+        client=SimpleNamespace(responses=Responses()),
+    )
+    await adapter.create_response(input_items="final", instructions="synthesize", tools=[])
+    assert captured["tool_choice"] == "none"
+    assert captured["tools"] == []
+    assert captured["max_tool_calls"] == 2
+    assert captured["model"] == "gpt-5.6-luna"
+
+
+@pytest.mark.parametrize("payload", [{}, {"usage": None}, {"usage": {}}])
+def test_missing_provider_usage_is_unknown_not_known_zero(payload: dict[str, object]) -> None:
+    assert response_usage(payload).reported is False
+
+
+def test_real_zero_provider_usage_is_distinct_from_missing_usage() -> None:
+    assert response_usage({"usage": {"input_tokens": 0, "output_tokens": 0}}).reported is True

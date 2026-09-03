@@ -25,10 +25,18 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": redact(record.getMessage()),
         }
-        for key in ("request_id", "job_id", "tool_call_id", "service"):
+        for key in (
+            "request_id",
+            "job_id",
+            "tool_call_id",
+            "service",
+            "scan_id",
+            "relative_path",
+            "reason",
+        ):
             value = getattr(record, key, None)
             if value is not None:
-                body[key] = redact(value)
+                body[key] = redact(value)[:300]
         if record.exc_info:
             body["exception"] = redact(self.formatException(record.exc_info))
         return json.dumps(body, ensure_ascii=False, separators=(",", ":"))

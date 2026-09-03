@@ -40,7 +40,7 @@ def engine(settings: Settings) -> Engine:
     Base.metadata.create_all(result)
     with result.begin() as connection:
         connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
-        connection.execute(text("INSERT INTO alembic_version VALUES ('0002')"))
+        connection.execute(text("INSERT INTO alembic_version VALUES ('0004')"))
     yield result
     result.dispose()
 

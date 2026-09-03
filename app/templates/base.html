@@ -17,7 +17,8 @@
       <a href="/downloads">Downloads</a>
       <a href="/library">Library</a>
       <a href="/usage">Usage</a>
-      <a href="/settings">Settings</a>
+      <a href="/account">Account</a>
+      {% if user.role == 'admin' %}<a href="/admin/users">Users</a><a href="/settings">Settings</a>{% endif %}
     </nav>
     <form action="/logout" method="post" class="logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

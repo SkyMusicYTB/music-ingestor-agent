@@ -35,7 +35,7 @@ def test_deploy_builds_virtualenv_at_final_nonrelocated_path() -> None:
 
 def test_pre_activation_probe_executes_both_entry_points_as_service_user() -> None:
     validator = repository_text("scripts/validate.sh")
-    probe_call = '"$release/venv/bin/python" "$RELEASE_ACCESS_PROBE" "$release"'
+    probe_call = '"$release/venv/bin/python" -I -B - "$release" < "$RELEASE_ACCESS_PROBE"'
 
     assert validator.count('runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i') >= 3
     assert probe_call in validator

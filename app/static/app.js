@@ -43,7 +43,10 @@ async function api(path, options = {}) {
   if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, {...options, headers, credentials: "same-origin"});
   const payload = await response.json().catch(() => ({detail: "Unexpected server response"}));
-  if (!response.ok) throw new Error(payload.detail || "Request failed");
+  if (!response.ok) {
+    const message = typeof payload.detail === "string" ? payload.detail : payload.detail?.message;
+    throw new Error(message || "Check the entered values and try again.");
+  }
   return payload;
 }
 
@@ -97,18 +100,81 @@ if (refine) {
   });
 }
 
-document.querySelectorAll(".job-action").forEach((button) => {
-  button.addEventListener("click", async () => {
-    const row = button.closest("[data-job-id]");
-    try {
-      await api(`/api/v1/jobs/${row.dataset.jobId}/${button.dataset.action}`, {method: "POST"});
-      window.location.reload();
-    } catch (failure) { window.alert(failure.message); }
-  });
+let refreshPending = false;
+let refreshRunning = false;
+let refreshGeneration = 0;
+const editedReviews = new Set();
+
+export async function refreshFragment(force = false) {
+  const generation = ++refreshGeneration;
+  const page = document.body.dataset.livePage;
+  const container = document.querySelector(`#${page}-content`);
+  if (!container) return;
+  if (refreshRunning || editedReviews.size || document.querySelector("dialog[open]") || (!force && container.contains(document.activeElement))) {
+    refreshPending = true;
+    return;
+  }
+  refreshRunning = true;
+  const focused = document.activeElement;
+  const focusedId = focused?.id;
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set("fragment", "true");
+    const response = await fetch(url, {credentials: "same-origin", headers: {Accept: "text/html"}});
+    if (!response.ok || response.redirected) throw new Error("Please sign in again to refresh.");
+    const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+    const replacement = parsed.querySelector(`#${page}-content`);
+    if (!replacement) throw new Error("Could not refresh this view.");
+    // Editing may have begun while the network request was in flight.
+    if (editedReviews.size || document.querySelector("dialog[open]") || (!force && container.contains(document.activeElement))) {
+      refreshPending = true;
+      return;
+    }
+    container.replaceWith(replacement);
+    if (focusedId) document.getElementById(focusedId)?.focus();
+    else if (force) document.querySelector(`#${page}-status`)?.focus();
+    refreshPending = generation !== refreshGeneration;
+    const status = document.querySelector(`#${page}-status`);
+    if (status) status.textContent = "List updated.";
+  } catch (failure) {
+    const status = document.querySelector(`#${page}-status`);
+    if (status) status.textContent = failure.message;
+  } finally {
+    refreshRunning = false;
+    // A newer event can arrive after this fetch captured server state. Keep
+    // that request, but let editing/focus/dialog guards defer its replacement.
+    if (refreshPending && generation !== refreshGeneration) {
+      setTimeout(() => refreshFragment(), 0);
+    }
+  }
+}
+
+document.addEventListener("input", (event) => {
+  const form = event.target.closest(".review-form");
+  if (form) editedReviews.add(form.dataset.jobId);
+});
+document.addEventListener("focusout", () => {
+  if (refreshPending) setTimeout(() => refreshFragment(), 100);
 });
 
-document.querySelectorAll(".review-form").forEach((form) => {
-  form.addEventListener("submit", async (event) => {
+document.addEventListener("click", async (event) => {
+    const button = event.target.closest(".job-action");
+    if (!button || button.disabled) return;
+    const row = button.closest("[data-job-id]");
+    button.disabled = true;
+    const error = row.querySelector(".job-error");
+    error.textContent = "";
+    try {
+      await api(`/api/v1/jobs/${row.dataset.jobId}/${button.dataset.action}`, {method: "POST"});
+      if (button.dataset.action === "cancel") editedReviews.delete(row.dataset.jobId);
+      await refreshFragment(true);
+    } catch (failure) { error.textContent = failure.message; }
+    finally { button.disabled = false; }
+});
+
+document.addEventListener("submit", async (event) => {
+    const form = event.target.closest(".review-form");
+    if (!form) return;
     event.preventDefault();
     const details = form.querySelector("details.review-correction");
     const manual = details && details.open;
@@ -137,13 +203,37 @@ document.querySelectorAll(".review-form").forEach((form) => {
       return;
     }
     try {
+      form.querySelector("button[type=submit]").disabled = true;
       await api(`/api/v1/jobs/${form.dataset.jobId}/review`, {
         method: "POST",
         body: JSON.stringify(payload)
       });
-      window.location.reload();
+      editedReviews.delete(form.dataset.jobId);
+      await refreshFragment(true);
     } catch (failure) { error.textContent = failure.message; }
-  });
+    finally { form.querySelector("button[type=submit]").disabled = false; }
+});
+
+const clearDialog = document.querySelector("#clear-finished-dialog");
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button");
+  if (!button || !clearDialog) return;
+  if (button.id === "clear-finished") {
+    clearDialog.querySelector(".form-error").textContent = "";
+    clearDialog.showModal();
+  } else if (button.id === "cancel-clear-finished") {
+    clearDialog.close();
+    if (refreshPending) await refreshFragment();
+  } else if (button.id === "confirm-clear-finished") {
+    button.disabled = true;
+    try {
+      const result = await api("/api/v1/jobs/clear-finished", {method: "POST", body: "{}"});
+      clearDialog.close();
+      await refreshFragment(true);
+      document.querySelector("#downloads-status").textContent = `${result.dismissed} finished downloads hidden. Music and history are retained.`;
+    } catch (failure) { clearDialog.querySelector(".form-error").textContent = failure.message; }
+    finally { button.disabled = false; }
+  }
 });
 
 document.querySelectorAll(".track-art").forEach((image) => {
@@ -161,12 +251,23 @@ const rescan = document.querySelector("#rescan-button");
 if (rescan) {
   rescan.addEventListener("click", async () => {
     rescan.disabled = true;
-    try { await api("/api/v1/library/rescan", {method: "POST"}); }
-    catch (failure) { window.alert(failure.message); rescan.disabled = false; }
+    try {
+      await api("/api/v1/library/rescan", {method: "POST"});
+      await refreshFragment(true);
+      document.querySelector("#library-status").textContent = "Full rescan queued. Existing music is unchanged.";
+    } catch (failure) {
+      document.querySelector("#library-status").textContent = failure.message;
+      rescan.disabled = false;
+    }
   });
+  setInterval(async () => {
+    const state = document.querySelector("[data-scan-state]")?.dataset.scanState;
+    if (["queued", "running", "retry_wait"].includes(state)) await refreshFragment();
+    else rescan.disabled = false;
+  }, 5000);
 }
 
-if (document.cookie.includes("music_agent_session") || csrfToken()) {
+if (document.body.dataset.livePage !== "password-change" && (document.cookie.includes("music_agent_session") || csrfToken())) {
   const live = document.querySelector("#live-status");
   const cursor = document.body.dataset.eventCursor;
   const eventUrl = /^\d+$/.test(cursor)
@@ -179,11 +280,19 @@ if (document.cookie.includes("music_agent_session") || csrfToken()) {
     live.textContent = data.message;
     live.classList.add("visible");
     const page = document.body.dataset.livePage;
-    if (page === "request" || page === "downloads" || page === "library") {
+    if (page === "downloads" || page === "library") {
+      clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => refreshFragment(), 1200);
+    } else if (page === "request" && data.entity_type === "request" && data.entity_id === document.querySelector("section[data-request-id]")?.dataset.requestId) {
       clearTimeout(reloadTimer);
       reloadTimer = setTimeout(() => window.location.reload(), 1200);
     }
   });
-  stream.addEventListener("reset", () => window.location.reload());
+  stream.addEventListener("reset", () => {
+    if (document.body.dataset.accountSecretVisible === "true") return;
+    if (["downloads", "library"].includes(document.body.dataset.livePage)) refreshFragment();
+    else window.location.reload();
+  });
+  stream.addEventListener("signed_out", () => { stream.close(); window.location.assign("/login"); });
   stream.onerror = () => { live.textContent = "Reconnecting to live updates…"; live.classList.add("visible"); };
 }

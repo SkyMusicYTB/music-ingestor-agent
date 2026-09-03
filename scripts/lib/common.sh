@@ -13,6 +13,8 @@ readonly MUSIC_AGENT_NATIVE_MUSIC_PATH="/srv/music"
 readonly MUSIC_AGENT_NATIVE_BACKUP_PATH="/var/lib/music-agent/backups"
 MUSIC_AGENT_DIRECTORY_WRITE_DENIAL_PROBE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/directory_write_denial_probe.py"
 readonly MUSIC_AGENT_DIRECTORY_WRITE_DENIAL_PROBE
+MUSIC_AGENT_READINESS_PROBE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/readiness_probe.py"
+readonly MUSIC_AGENT_READINESS_PROBE
 
 if [[ "${MUSIC_AGENT_TEST_MODE:-0}" == "1" ]]; then
     : "${MUSIC_AGENT_ROOT_PREFIX:?MUSIC_AGENT_ROOT_PREFIX is required in test mode}"
@@ -260,6 +262,38 @@ music_agent_start_services() {
     music_agent_systemctl start music-agent-web.service || failed=1
     music_agent_systemctl start music-agent-worker.service || failed=1
     return "$failed"
+}
+
+music_agent_check_readiness() (
+    local release="${1:?release required}" mode="${2:-wait}"
+    local probe="$release/scripts/lib/readiness_probe.py"
+    # Deploy may be launched from a private administrator checkout. Use the
+    # readable candidate helper; rollback to older code uses the current helper.
+    [[ -f "$probe" ]] || probe="$MUSIC_AGENT_READINESS_PROBE"
+    local arguments=()
+    [[ "$mode" == "wait" || "$mode" == "check" ]] || return 64
+    [[ "$mode" != "check" ]] || arguments+=(--check)
+    music_agent_require_command timeout
+    music_agent_parse_env_file "$MUSIC_AGENT_ENV_FILE"
+    music_agent_assert_managed_production_config
+    # Bound the entire process, including DNS, slow HTTP headers and body reads.
+    # Run credential-free as the service account, even from a root deployment.
+    timeout --kill-after=5s 65s runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
+        "PATH=$MUSIC_AGENT_PATH" \
+        "HOME=$MUSIC_AGENT_STATE_DIR" \
+        "PYTHONDONTWRITEBYTECODE=1" \
+        "${MUSIC_AGENT_CONFIG_ENV[@]}" \
+        "MUSIC_AGENT_SERVICE_ROLE=worker" \
+        "$release/venv/bin/python" -I -B - --release "$release" "${arguments[@]}" < "$probe"
+)
+
+music_agent_wait_ready() {
+    local release="${1:?release required}"
+    music_agent_systemctl is-active --quiet music-agent-web.service &&
+        music_agent_systemctl is-active --quiet music-agent-worker.service &&
+        music_agent_check_readiness "$release" &&
+        music_agent_systemctl is-active --quiet music-agent-web.service &&
+        music_agent_systemctl is-active --quiet music-agent-worker.service
 }
 
 music_agent_parse_env_file() {

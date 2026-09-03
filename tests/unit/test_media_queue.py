@@ -85,6 +85,46 @@ def test_claim_is_atomic_and_all_mutations_are_fenced(session_factory) -> None:
     queue.set_progress(lease, stage="downloading", progress=0.5, now=now)
 
 
+def test_initial_scan_wait_preserves_retry_budget_and_honors_cancel(session_factory):
+    now = datetime.now(UTC)
+    job_id = _add_job(session_factory, suffix="scan-wait", available_at=now)
+    queue = DownloadJobQueue(session_factory, lease_seconds=30)
+    lease = queue.claim_next()
+    assert queue.defer_for_library_scan(lease) == "queued"
+    with session_factory() as session:
+        job = session.get(DownloadJob, job_id)
+        assert job.retry_count == 0 and job.lease_token is None
+    lease = queue.claim_next(now=now + timedelta(seconds=60))
+    queue.request_cancel(job_id)
+    assert queue.defer_for_library_scan(lease) == "cancelled"
+
+
+def test_processor_does_not_acquire_or_publish_without_initial_scan(
+    session_factory, settings, monkeypatch, tmp_path
+):
+    from app.workers.processor import DownloadJobProcessor, InitialLibraryScanPending
+
+    active_settings = settings.model_copy(update={"initial_scan_required": True})
+    queue = DownloadJobQueue(session_factory, lease_seconds=30)
+    _add_job(session_factory, suffix="scan-gate", available_at=datetime.now(UTC))
+    processor = DownloadJobProcessor(
+        settings=active_settings, queue=queue, ytdlp=object(), session_factory=session_factory
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("acquisition ran before the scan gate")
+
+    monkeypatch.setattr(processor, "_acquire_valid_source", forbidden)
+    lease = queue.claim_next()
+    assert processor.process(lease).status == "queued"
+    source = tmp_path / "source.mp3"
+    source.write_bytes(b"audio")
+    with pytest.raises(InitialLibraryScanPending):
+        processor._publish_or_adopt(source, "Artist/Album/01 - Song.mp3", source_id="source")
+    assert source.exists()
+    assert not (settings.music_path / "Artist").exists()
+
+
 def test_cancel_running_job_is_cooperative_and_fenced(session_factory) -> None:
     now = datetime(2026, 9, 1, tzinfo=UTC)
     _add_job(session_factory, suffix="cancel", available_at=now)

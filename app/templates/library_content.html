@@ -1,0 +1,27 @@
+<div id="library-content">
+<p class="eyebrow">{{ result.total }} matching tracks · {% for name, count in result.format_counts|dictsort %}{{ name|replace('.', '')|upper }} {{ count }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
+{% if scan_status %}
+<section aria-label="Library scan status" data-scan-state="{{ scan_status.state }}">
+  <p>Scan: {{ scan_status.state|replace('_', ' ')|capitalize }}{% if scan_status.scan %}{% if scan_status.scan.status == 'completed' and (scan_status.scan.error_count or scan_status.scan.summary.get('counts', {}).get('skipped_video') or scan_status.scan.summary.get('counts', {}).get('unsupported_extension') or scan_status.scan.summary.get('counts', {}).get('unsupported_codec')) %} with warnings{% endif %} · {{ scan_status.scan.scanned_files }} candidates · {{ scan_status.scan.changed_files }} changed · {{ scan_status.scan.error_count }} errors{% endif %}</p>
+  {% if scan_status.scan and scan_status.scan.summary %}
+    {% set summary = scan_status.scan.summary %}
+    {% if summary.counts %}<p>{{ summary.counts.indexed }} indexed · {{ summary.counts.unchanged }} unchanged · {{ summary.counts.metadata_fallback }} metadata fallbacks · {{ summary.counts.unsupported_extension }} unsupported extensions · {{ summary.counts.unsupported_codec }} unsupported codecs · {{ summary.counts.skipped_video }} video files skipped · {{ summary.counts.unreadable }} unreadable</p>{% endif %}
+    {% if summary.coverage_complete == false %}<p role="status">Scan coverage is incomplete. Previously indexed files have been preserved.</p>{% endif %}
+    {% if user.role == 'admin' and summary.samples %}<details><summary>Scan diagnostics (up to 100 files)</summary><ul>{% for issue in summary.samples %}<li>{{ issue.relative_path }} — {{ issue.reason_code|replace('_', ' ') }}</li>{% endfor %}</ul></details>{% endif %}
+  {% endif %}
+</section>
+{% endif %}
+<div class="library-table" role="table" aria-label="Music library">
+  {% for item in result.items %}
+  <div class="library-row" role="row">
+    <span role="cell"><strong>{{ item.title }}</strong><small>{{ item.artist }}{% if item.album %} · {{ item.album }}{% endif %}{% if item.year %} · {{ item.year }}{% endif %}</small></span>
+    <span role="cell">{% if item.duration_seconds %}{{ (item.duration_seconds // 60)|int }}:{{ '%02d'|format((item.duration_seconds % 60)|int) }} · {% endif %}Codec: {{ (item.codec or 'unknown')|upper }} · Container: {{ item.container or 'unknown' }} · Extension: {{ (item.file_extension or item.filepath.rsplit('.', 1)[-1])|replace('.', '')|upper }}{% if not item.is_present %} · Missing{% endif %}</span>
+  </div>
+  {% else %}<p class="empty">No matching tracks.</p>{% endfor %}
+</div>
+<nav class="pagination" aria-label="Library pages">
+  {% if result.page > 1 %}<a href="{{ request.url.remove_query_params('fragment').include_query_params(page=result.page - 1) }}">Previous</a>{% endif %}
+  <span>Page {{ result.page }} of {{ ((result.total + result.page_size - 1) // result.page_size) or 1 }} · {{ result.total }} records</span>
+  {% if result.page * result.page_size < result.total %}<a href="{{ request.url.remove_query_params('fragment').include_query_params(page=result.page + 1) }}">Next</a>{% endif %}
+</nav>
+</div>

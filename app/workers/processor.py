@@ -35,6 +35,7 @@ from app.repositories.decisions import (
     selected_decision,
     selected_payload,
 )
+from app.repositories.library import LibraryRepository
 from app.services.artwork import (
     Artwork,
     ArtworkCacheService,
@@ -142,6 +143,10 @@ class PublicationConflict(RuntimeError):
     pass
 
 
+class InitialLibraryScanPending(RuntimeError):
+    """Acquisition must wait for a covered baseline without spending retries."""
+
+
 class _FileContentCollision(RuntimeError):
     pass
 
@@ -198,6 +203,8 @@ class DownloadJobProcessor:
         monitor = LeaseMonitor(self.queue, lease)
         try:
             with monitor:
+                self._ensure_library_ready()
+                self.queue.clear_library_wait(lease)
                 self.settings.downloads_path.mkdir(parents=True, exist_ok=True)
                 ensure_free_space(
                     self.settings.downloads_path,
@@ -313,6 +320,15 @@ class DownloadJobProcessor:
                 status="completed",
                 relative_path=publication.relative_path,
             )
+        except InitialLibraryScanPending:
+            monitor.stop()
+            try:
+                status = self.queue.defer_for_library_scan(lease)
+            except LeaseLostError:
+                status = "lease_lost"
+            if status == "cancelled":
+                cleanup_staging_directory(staging)
+            return ProcessOutcome(job_id=lease.job_id, status=status)
         except (SourceNeedsReview, JobNeedsReview) as exc:
             monitor.stop()
             if isinstance(exc, SourceNeedsReview):
@@ -1220,6 +1236,7 @@ class DownloadJobProcessor:
     def _publish_or_adopt(
         self, source: Path, relative_path: str, *, source_id: str | None
     ) -> PublicationResult:
+        self._ensure_library_ready()
         try:
             return self._publish_candidate(source, relative_path)
         except _FileContentCollision as exc:
@@ -1234,6 +1251,13 @@ class DownloadJobProcessor:
                 raise PublicationConflict(
                     "source-specific library destination already has different content"
                 ) from collision_exc
+
+    def _ensure_library_ready(self) -> None:
+        if self.settings.initial_scan_required and (
+            self.session_factory is None
+            or not LibraryRepository(self.session_factory).initial_scan_complete()
+        ):
+            raise InitialLibraryScanPending("waiting for the initial library scan")
 
     def _publish_candidate(self, source: Path, relative_path: str) -> PublicationResult:
         try:

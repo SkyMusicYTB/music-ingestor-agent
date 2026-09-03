@@ -22,15 +22,15 @@ from app.clients.ytdlp import (
     validate_public_media_metadata,
 )
 from app.db.models import (
-    Event,
     EvidenceReference,
     Request,
     RequestTrack,
     ServiceTask,
     SourceCandidate,
 )
+from app.repositories.events import make_event
 from app.services.duplicates import normalize_text, strip_provider_suffixes
-from app.services.library_scan import LibraryScanner
+from app.services.library_scan import LibraryScanner, ScanAlreadyRunning
 from app.services.request_constraints import ExplicitRequestConstraints
 from app.sources import (
     EXECUTABLE_EVIDENCE_KINDS,
@@ -107,6 +107,9 @@ class WorkerServiceTaskHandler:
             return ServiceTaskOutcome(lease.task_id, lease.kind, True)
         except LeaseLostError:
             return ServiceTaskOutcome(lease.task_id, lease.kind, False)
+        except ScanAlreadyRunning:
+            self.queue.defer_library_scan(lease)
+            return ServiceTaskOutcome(lease.task_id, lease.kind, False)
         except Exception as exc:
             monitor.stop()
             if (
@@ -146,7 +149,9 @@ class WorkerServiceTaskHandler:
             full = lease.payload.get("full", False)
             if not isinstance(full, bool):
                 raise ValueError("library_scan.full must be a boolean")
-            scan = self.scanner.run(full=full, cancel_signal=self.shutdown_signal)
+            scan = self.scanner.run(
+                full=full, cancel_signal=self.shutdown_signal, service_task_id=lease.task_id
+            )
             result = {
                 "scan_id": scan.id,
                 "kind": scan.kind,
@@ -318,7 +323,8 @@ class WorkerServiceTaskHandler:
             request.status = "preview"
             _ensure_confirmation_task(session, request_id)
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type="request.direct_resolved",
@@ -500,7 +506,8 @@ class WorkerServiceTaskHandler:
             request.status = "preview"
             _ensure_confirmation_task(session, request_id)
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type="request.collection_resolved",
@@ -984,7 +991,8 @@ class WorkerServiceTaskHandler:
             request.error_code = error_code
             request.error_message = safe_message[:500]
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type="request.direct_failed",

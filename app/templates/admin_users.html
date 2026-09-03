@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}Users · Music Agent{% endblock %}
+{% block live_page %}users{% endblock %}
+{% block content %}
+<section>
+  <p class="eyebrow">Administrator tools</p>
+  <h1>Users</h1>
+  <p>Local username/password accounts share one music library. Deactivation preserves history and music; previously approved work continues.</p>
+  <p><a href="/usage?scope=all">View all-user usage</a></p>
+  <details class="job-row">
+    <summary>Create a user</summary>
+    <form data-account-action="create-user" class="stack">
+      <label>Username <input name="username" autocomplete="off" maxlength="80" required></label>
+      <label>Role <select name="role"><option value="user">User</option><option value="admin">Admin</option></select></label>
+      <label>Temporary password <input type="password" name="temporary_password" autocomplete="new-password" minlength="12" maxlength="1024" placeholder="Leave blank to generate securely"></label>
+      <small>A generated password is shown once. Share it privately outside the app.</small>
+      <label class="check"><input type="checkbox" name="must_change_password" checked>Require password change at first sign-in</label>
+      <p class="form-error" role="alert" aria-live="polite"></p>
+      <button type="submit">Create user</button>
+    </form>
+  </details>
+</section>
+<section>
+  <form method="get" action="/admin/users" class="inline-form">
+    <label class="sr-only" for="user-search">Search username</label>
+    <input id="user-search" name="q" value="{{ q }}" maxlength="80" placeholder="Search username">
+    <label>Per page <select name="page_size">{% for size in [25, 50, 100] %}<option value="{{ size }}" {% if size == result.page_size %}selected{% endif %}>{{ size }}</option>{% endfor %}</select></label>
+    <button type="submit" class="secondary">Search</button>
+  </form>
+  <p>{{ result.total }} account{{ '' if result.total == 1 else 's' }} · page {{ result.page }}</p>
+  {% for account in result['items'] %}
+  <article class="job-row">
+    <div class="section-heading">
+      <h2>{{ account.username }}{{ ' (you)' if account.id == user.user_id else '' }}</h2>
+      <div class="badges"><span>{{ account.role|title }}</span><span>{{ 'Active' if account.is_active else 'Disabled' }}</span>{% if account.must_change_password %}<span>Password change required</span>{% endif %}</div>
+    </div>
+    <small>Created {{ account.created_at }}{% if account.creator %} by {{ account.creator }}{% endif %} · Last sign-in {{ account.last_login_at or 'never' }}</small>
+    <small>{{ account.active_sessions }} active sessions · {{ account.request_count }} requests · {{ account.download_count }} downloads · {{ account.usage.calls }} AI calls · {{ account.usage.tokens }} tokens</small>
+    <small>Estimated AI cost: {% if account.usage.estimated_cost_microusd is not none %}${{ '%.4f'|format(account.usage.estimated_cost_microusd / 1000000) }}{% else %}Not configured{% endif %}</small>
+    {% if account.id != user.user_id %}
+    <details>
+      <summary>Manage account</summary>
+      <div class="action-row">
+        <form data-account-action="set-active" data-user-id="{{ account.id }}" data-username="{{ account.username }}" data-value="{{ 'false' if account.is_active else 'true' }}" class="stack">
+          <button type="submit" class="secondary small">{{ 'Deactivate' if account.is_active else 'Activate' }}</button><p class="form-error" role="alert"></p>
+        </form>
+        <form data-account-action="set-role" data-user-id="{{ account.id }}" data-username="{{ account.username }}" data-value="{{ 'user' if account.role == 'admin' else 'admin' }}" class="stack">
+          <button type="submit" class="secondary small">{{ 'Demote to User' if account.role == 'admin' else 'Promote to Admin' }}</button><p class="form-error" role="alert"></p>
+        </form>
+        <form data-account-action="revoke-sessions" data-user-id="{{ account.id }}" data-username="{{ account.username }}" class="stack">
+          <button type="submit" class="secondary small">Revoke all sessions</button><p class="form-error" role="alert"></p>
+        </form>
+        <form data-account-action="set-password-required" data-user-id="{{ account.id }}" data-username="{{ account.username }}" data-value="{{ 'false' if account.must_change_password else 'true' }}" class="stack">
+          <button type="submit" class="secondary small">{{ 'Remove password-change requirement' if account.must_change_password else 'Require password change' }}</button><p class="form-error" role="alert"></p>
+        </form>
+      </div>
+      <form data-account-action="reset-password" data-user-id="{{ account.id }}" data-username="{{ account.username }}" class="stack">
+        <label>New temporary password <input type="password" name="temporary_password" autocomplete="new-password" minlength="12" maxlength="1024" placeholder="Leave blank to generate securely"></label>
+        <label class="check"><input type="checkbox" name="must_change_password" checked>Require password change at next sign-in</label>
+        <p class="form-error" role="alert" aria-live="polite"></p><button type="submit" class="secondary">Reset password</button>
+      </form>
+    </details>
+    {% else %}<p><a href="/account">Manage your password and sessions in Account</a>. Another administrator must change your role or deactivate your account.</p>{% endif %}
+  </article>
+  {% else %}<p class="empty">No matching accounts.</p>{% endfor %}
+  <nav class="pagination" aria-label="User list pages">
+    {% if result.page > 1 %}<a href="/admin/users?q={{ q|urlencode }}&amp;page={{ result.page - 1 }}&amp;page_size={{ result.page_size }}">Previous</a>{% endif %}
+    {% if result.page * result.page_size < result.total %}<a href="/admin/users?q={{ q|urlencode }}&amp;page={{ result.page + 1 }}&amp;page_size={{ result.page_size }}">Next</a>{% endif %}
+  </nav>
+</section>
+{% include "account_dialogs.html" %}
+<script type="module" src="{{ asset_url('accounts.js') }}"></script>
+{% endblock %}

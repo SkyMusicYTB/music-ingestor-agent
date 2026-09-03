@@ -12,7 +12,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.clients.ytdlp import is_curated_collection_url
-from app.db.models import Conversation, Event, Request, RequestTrack, ServiceTask
+from app.db.models import Conversation, Request, RequestTrack, ServiceTask
+from app.repositories.events import make_event
 from app.schemas import MusicProposal
 from app.services.request_constraints import parse_explicit_request_constraints
 from app.sources import ProviderIdentity, ProviderURLPolicy, provider_for_url
@@ -170,7 +171,8 @@ class RequestRepository:
                     )
                 )
                 session.add(
-                    Event(
+                    make_event(
+                        session,
                         entity_type="request",
                         entity_id=request.id,
                         event_type="request.created",
@@ -279,7 +281,8 @@ class RequestRepository:
             request.discovered_count = len(ids)
             request.status = "needs_clarification" if proposal.clarification else "preview"
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type="request.proposal",

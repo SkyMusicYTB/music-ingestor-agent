@@ -178,7 +178,7 @@ class _FakeYouTube:
 
 
 class _UnusedScanner:
-    def run(self, *, full: bool, cancel_signal=None):
+    def run(self, *, full: bool, cancel_signal=None, service_task_id=None):
         raise AssertionError(f"unexpected scan full={full}")
 
 
@@ -186,7 +186,7 @@ class _CompletedScanner:
     def __init__(self, music_root: Path) -> None:
         self.music_root = music_root
 
-    def run(self, *, full: bool, cancel_signal=None):
+    def run(self, *, full: bool, cancel_signal=None, service_task_id=None):
         assert not full
         return SimpleNamespace(
             id="scan-id",

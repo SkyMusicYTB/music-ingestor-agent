@@ -8,7 +8,8 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
-from app.db.models import Event, Request, RequestTrack
+from app.db.models import Request, RequestTrack
+from app.repositories.events import make_event
 from app.schemas import MusicProposal
 from app.services.duplicates import (
     DuplicateCandidate,
@@ -180,7 +181,8 @@ class ProposalService:
             request.lease_token = None
             request.lease_expires_at = None
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type="request.proposal",

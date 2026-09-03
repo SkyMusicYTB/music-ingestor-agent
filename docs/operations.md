@@ -26,13 +26,21 @@ journalctl -u music-agent-backup.service
 Run application commands with the installed venv. `admin-reset` reads the new password from a TTY; do not pipe it or place it in shell history.
 
 ```bash
-sudo /opt/music-agent/current/scripts/music-agentctl.sh admin-reset
+sudo /opt/music-agent/current/scripts/music-agentctl.sh user-list
+sudo /opt/music-agent/current/scripts/music-agentctl.sh admin-reset --username NAME
+sudo /opt/music-agent/current/scripts/music-agentctl.sh library-audit --json --verbose
 sudo /opt/music-agent/current/scripts/music-agentctl.sh scan
 sudo /opt/music-agent/current/scripts/music-agentctl.sh scan --full
 sudo /opt/music-agent/current/scripts/validate.sh --services
 ```
 
 A full scan reconciles `/srv/music` with the SQLite index. It does not send the full library to OpenAI. While the worker is running, it also schedules an idempotent incremental scan every 30 minutes; unchanged files are matched by size and modification time, so their tags are not reread. Navidrome discovers safely published files through its configured periodic scan; the deployment does not rely on an undocumented rescan API and never restarts it.
+
+Schema 0004 adds explicit local roles, private activity/usage, hidden download history,
+parser-version rescans and safe mixed-format probing. The existing admin's identity and
+password survive. Recovery targets that account only, rather than choosing an oldest
+account at runtime. See the [production update guide](production-update.md) for the
+format matrix, legacy 50-round compatibility, reauthentication policy and safe rollout.
 
 ## Configuration changes
 

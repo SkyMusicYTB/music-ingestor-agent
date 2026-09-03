@@ -3,198 +3,210 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
+import threading
 from collections.abc import Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Protocol
 
-from mutagen import File as MutagenFile  # type: ignore[attr-defined]
-from mutagen import MutagenError  # type: ignore[attr-defined]
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db.models import Album, Event, ScanRun, Track
-from app.services.duplicates import normalize_text, version_signature
+from app.db.models import Album, ScanRun, Track
+from app.repositories.events import make_event
+from app.services.duplicates import normalize_text
+from app.services.library_formats import (
+    DEFERRED_EXTENSIONS,
+    IGNORED_EXTENSIONS,
+    PARSER_VERSION,
+    SUPPORTED_CODECS,
+    SUPPORTED_EXTENSIONS,
+    extension_for,
+)
+from app.services.library_metadata import (
+    LibraryReadError,
+    _first,
+    _number,
+    _tag_text,
+    _year,
+    read_audio_metadata,
+    validate_file_snapshot,
+)
+from app.services.library_presence import (
+    library_presence,
+    open_library_directory,
+    open_library_file,
+)
 
 logger = logging.getLogger(__name__)
-
-SUPPORTED_EXTENSIONS = {".mp3", ".m4a", ".mp4", ".flac", ".ogg", ".opus"}
 SCAN_BATCH_SIZE = 200
+LEASE_SECONDS = 120
 
 
 class ScanCancellation(Protocol):
     def is_set(self) -> bool: ...
 
 
-@dataclass(frozen=True, slots=True)
+class ScanAlreadyRunning(RuntimeError):
+    def __init__(self, scan_id: str) -> None:
+        self.scan_id = scan_id
+        super().__init__(f"library scan {scan_id} is already running")
+
+
+@dataclass
+class ScanDiagnostics:
+    scan_id: str | None = None
+    counts: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(
+            (
+                "physical_candidates",
+                "indexed",
+                "unchanged",
+                "newly_indexed",
+                "updated",
+                "missing",
+                "unsupported_extension",
+                "unsupported_codec",
+                "unreadable",
+                "metadata_fallback",
+                "skipped_video",
+                "errors",
+                "ignored",
+                "source_aliases",
+                "unresolved",
+            ),
+            0,
+        )
+    )
+    by_extension: dict[str, int] = field(default_factory=dict)
+    by_codec: dict[str, int] = field(default_factory=dict)
+    samples: list[dict[str, str]] = field(default_factory=list)
+    omitted_samples: int = 0
+    traversal_complete: bool = True
+
+    def issue(self, relative: str, reason: str) -> None:
+        key = {
+            "video_bearing": "skipped_video",
+            "unsupported_extension": "unsupported_extension",
+            "unsupported_codec": "unsupported_codec",
+            "unreadable": "unreadable",
+            "directory_unreadable": "unreadable",
+        }.get(reason, "errors")
+        self.counts[key] += 1
+        if reason in {
+            "unreadable",
+            "directory_unreadable",
+            "probe_unavailable",
+            "probe_resource_limit",
+            "file_changed",
+        }:
+            self.counts["unresolved"] += 1
+        if reason == "directory_unreadable":
+            self.traversal_complete = False
+        safe_path = "".join(c if c.isprintable() else "?" for c in relative)[:300]
+        if len(self.samples) < 100:
+            self.samples.append({"relative_path": safe_path, "reason_code": reason})
+            logger.warning(
+                "library file skipped: %s (%s)",
+                safe_path,
+                reason,
+                extra={"scan_id": self.scan_id, "relative_path": safe_path, "reason": reason},
+            )
+        else:
+            self.omitted_samples += 1
+
+    def payload(self, *, details: bool = True) -> dict[str, object]:
+        result: dict[str, object] = {
+            "version": 1,
+            "parser_version": PARSER_VERSION,
+            "counts": self.counts,
+            "by_extension": self.by_extension,
+            "by_codec": self.by_codec,
+            "traversal_complete": self.traversal_complete,
+            "coverage_complete": self.traversal_complete and self.counts["unresolved"] == 0,
+            "omitted_samples": self.omitted_samples,
+        }
+        if details:
+            result["samples"] = self.samples
+        return result
+
+
+def _raise_if_cancelled(signal: ScanCancellation | None) -> None:
+    if signal is not None and signal.is_set():
+        raise InterruptedError("library scan interrupted for worker shutdown or lease loss")
+
+
+def iter_library_candidates(
+    root: Path, diagnostics: ScanDiagnostics, cancel_signal: ScanCancellation | None = None
+) -> Iterator[Path]:
+    root = root.resolve(strict=True)
+    stack = [""]
+    while stack:
+        _raise_if_cancelled(cancel_signal)
+        relative_directory = stack.pop()
+        try:
+            with (
+                open_library_directory(root, relative_directory) as directory,
+                os.scandir(directory) as entries,
+            ):
+                for entry in entries:
+                    _raise_if_cancelled(cancel_signal)
+                    relative = (Path(relative_directory) / entry.name).as_posix()
+                    if entry.name.startswith("."):
+                        diagnostics.counts["ignored"] += 1
+                        continue
+                    try:
+                        if entry.is_symlink():
+                            diagnostics.counts["ignored"] += 1
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(relative)
+                        elif entry.is_file(follow_symlinks=False):
+                            extension = extension_for(relative)
+                            if extension in SUPPORTED_EXTENSIONS:
+                                diagnostics.counts["physical_candidates"] += 1
+                                diagnostics.by_extension[extension] = (
+                                    diagnostics.by_extension.get(extension, 0) + 1
+                                )
+                                yield root / relative
+                            elif extension in IGNORED_EXTENSIONS:
+                                diagnostics.counts["ignored"] += 1
+                            else:
+                                diagnostics.counts["unsupported_extension"] += 1
+                                bucket = extension if extension in DEFERRED_EXTENSIONS else "other"
+                                diagnostics.by_extension[bucket] = (
+                                    diagnostics.by_extension.get(bucket, 0) + 1
+                                )
+                    except OSError:
+                        diagnostics.issue(relative, "unreadable")
+        except (OSError, ValueError):
+            diagnostics.issue(relative_directory or ".", "directory_unreadable")
+
+
+def _iter_audio_files(root: Path, cancel_signal: ScanCancellation | None = None) -> Iterator[Path]:
+    yield from iter_library_candidates(root, ScanDiagnostics(), cancel_signal)
+
+
+def scan_has_coverage(scan: ScanRun) -> bool:
+    if scan.status != "completed":
+        return False
+    if scan.parser_version == 0:
+        return True
+    try:
+        payload = json.loads(scan.summary_json)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("coverage_complete") is True
+
+
+@dataclass(frozen=True)
 class _ScanEntry:
     relative: str
     size: int
     mtime_ns: int
     metadata: dict[str, object] | None
-
-
-def _first(tags: Any, *keys: str) -> str | None:
-    if tags is None:
-        return None
-    for key in keys:
-        try:
-            value = tags.get(key)
-        except (AttributeError, KeyError):
-            continue
-        if value is None:
-            continue
-        converted = _tag_text(value)
-        if converted is not None:
-            return converted
-    return None
-
-
-def _tag_text(value: object) -> str | None:
-    if hasattr(value, "text"):
-        return _tag_text(value.text)
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", "replace")
-    if isinstance(value, list | tuple):
-        if not value:
-            return None
-        if (
-            len(value) >= 2
-            and isinstance(value[0], int)
-            and not isinstance(value[0], bool)
-            and isinstance(value[1], int)
-            and not isinstance(value[1], bool)
-        ):
-            return f"{value[0]}/{value[1]}" if value[1] > 0 else str(value[0])
-        return _tag_text(value[0])
-    if value is None:
-        return None
-    cleaned = str(value).strip()
-    return cleaned or None
-
-
-def _number(value: str | None) -> tuple[int | None, int | None]:
-    if not value:
-        return None, None
-    pieces = value.split("/", 1)
-    try:
-        number = int(pieces[0])
-    except (ValueError, TypeError):
-        return None, None
-    try:
-        total = int(pieces[1]) if len(pieces) == 2 else None
-    except (ValueError, TypeError):
-        total = None
-    return number, total
-
-
-def _year(value: str | None) -> int | None:
-    if not value:
-        return None
-    try:
-        result = int(value[:4])
-    except ValueError:
-        return None
-    return result if 1800 <= result <= 2200 else None
-
-
-def _raise_if_cancelled(signal: ScanCancellation | None) -> None:
-    if signal is not None and signal.is_set():
-        raise InterruptedError("library scan was cancelled for worker shutdown")
-
-
-def _iter_audio_files(root: Path, cancel_signal: ScanCancellation | None = None) -> Iterator[Path]:
-    root = root.resolve(strict=True)
-    stack = [root]
-    while stack:
-        _raise_if_cancelled(cancel_signal)
-        directory = stack.pop()
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    _raise_if_cancelled(cancel_signal)
-                    try:
-                        if entry.is_symlink():
-                            continue
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                        elif (
-                            entry.is_file(follow_symlinks=False)
-                            and Path(entry.name).suffix.casefold() in SUPPORTED_EXTENSIONS
-                        ):
-                            yield Path(entry.path)
-                    except OSError:
-                        logger.warning("unable to stat library entry", extra={"path": entry.path})
-        except OSError:
-            logger.exception("unable to scan library directory", extra={"path": str(directory)})
-
-
-def _raw_tag(tags: Any, key: str) -> str | None:
-    if tags is None:
-        return None
-    # Vorbis comments
-    result = _first(tags, key, key.upper(), key.lower())
-    if result:
-        return result
-    # ID3 TXXX frames
-    try:
-        frames = tags.getall("TXXX")
-    except AttributeError:
-        frames = []
-    for frame in frames:
-        if getattr(frame, "desc", "").casefold() == key.casefold():
-            text = getattr(frame, "text", [])
-            if text:
-                return str(text[0])
-    # MP4 freeform atoms
-    return _first(tags, f"----:com.apple.iTunes:{key.upper()}")
-
-
-def read_audio_metadata(path: Path) -> dict[str, object]:
-    audio = MutagenFile(path, easy=False)
-    if audio is None or getattr(audio, "info", None) is None:
-        raise ValueError("unsupported or unreadable audio")
-    tags = getattr(audio, "tags", None)
-    easy = MutagenFile(path, easy=True)
-    easy_tags = getattr(easy, "tags", None)
-    artist = _first(easy_tags, "artist") or _first(tags, "TPE1", "\xa9ART") or "Unknown Artist"
-    title = _first(easy_tags, "title") or _first(tags, "TIT2", "\xa9nam") or path.stem
-    album = _first(easy_tags, "album") or _first(tags, "TALB", "\xa9alb")
-    album_artist = _first(easy_tags, "albumartist") or _first(tags, "TPE2", "aART")
-    date = _first(easy_tags, "date") or _first(tags, "TDRC", "\xa9day")
-    genre = _first(easy_tags, "genre") or _first(tags, "TCON", "\xa9gen")
-    track_number, track_total = _number(
-        _first(easy_tags, "tracknumber") or _first(tags, "TRCK", "trkn")
-    )
-    disc_number, disc_total = _number(
-        _first(easy_tags, "discnumber") or _first(tags, "TPOS", "disk")
-    )
-    codec = type(audio).__name__.casefold()
-    bitrate = getattr(audio.info, "bitrate", None)
-    return {
-        "artist": artist,
-        "title": title,
-        "album": album,
-        "album_artist": album_artist,
-        "genre": genre,
-        "year": _year(date),
-        "track_number": track_number,
-        "track_total": track_total,
-        "disc_number": disc_number,
-        "disc_total": disc_total,
-        "duration_seconds": float(audio.info.length),
-        "codec": codec,
-        "bitrate": int(bitrate) if bitrate else None,
-        "recording_mbid": _raw_tag(tags, "MUSICBRAINZ_TRACKID"),
-        "release_mbid": _raw_tag(tags, "MUSICBRAINZ_ALBUMID"),
-        "release_group_mbid": _raw_tag(tags, "MUSICBRAINZ_RELEASEGROUPID"),
-        "source_extractor": _raw_tag(tags, "MUSIC_AGENT_SOURCE_EXTRACTOR"),
-        "source_id": _raw_tag(tags, "MUSIC_AGENT_SOURCE_ID"),
-        "source_url": _raw_tag(tags, "MUSIC_AGENT_SOURCE_URL"),
-        "job_id": _raw_tag(tags, "MUSIC_AGENT_JOB_ID"),
-        "version_signature": version_signature(title, album),
-    }
+    new_record: bool = False
 
 
 class LibraryScanner:
@@ -202,134 +214,239 @@ class LibraryScanner:
         self.factory = factory
         self.music_root = music_root
 
-    def run(self, full: bool = False, *, cancel_signal: ScanCancellation | None = None) -> ScanRun:
-        _raise_if_cancelled(cancel_signal)
-        self.music_root.mkdir(parents=True, exist_ok=True)
-        root = self.music_root.resolve(strict=True)
-        with self.factory.begin() as session:
+    def _claim(self, full: bool, service_task_id: str | None) -> tuple[str, int, str]:
+        now = datetime.now(UTC)
+        with self.factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            active = session.scalar(select(ScanRun).where(ScanRun.status == "running"))
+            if active is not None:
+                expires = active.lease_expires_at
+                if expires and expires.replace(tzinfo=UTC) > now:
+                    raise ScanAlreadyRunning(active.id)
+                active.status = "failed"
+                active.error_message = "scan interrupted before completion"
+                active.completed_at = now
+                session.flush()
             generation = int(session.scalar(select(func.max(ScanRun.generation))) or 0) + 1
-            has_initial = session.scalar(
-                select(ScanRun.id).where(ScanRun.kind == "initial", ScanRun.status == "completed")
+            initial = any(
+                scan_has_coverage(scan)
+                for scan in session.scalars(
+                    select(ScanRun).where(ScanRun.kind == "initial", ScanRun.status == "completed")
+                )
             )
+            token = secrets.token_hex(32)
             scan = ScanRun(
-                kind="initial" if has_initial is None else ("full" if full else "incremental"),
+                kind=("full" if full else "incremental") if initial else "initial",
                 generation=generation,
                 status="running",
+                parser_version=PARSER_VERSION,
+                service_task_id=service_task_id,
+                lease_token=token,
+                lease_expires_at=now + timedelta(seconds=LEASE_SECONDS),
+                traversal_complete=False,
             )
             session.add(scan)
             session.flush()
             scan_id = scan.id
-        scanned = changed = errors = 0
-        album_cache: dict[str, str] = {}
-        with self.factory() as session:
-            known = {
-                row.filepath: (row.file_size, row.file_mtime_ns)
-                for row in session.scalars(select(Track))
-            }
-        pending: list[_ScanEntry] = []
+            session.commit()
+        return scan_id, generation, token
+
+    @staticmethod
+    def _fence(session: Session, scan_id: str, token: str) -> ScanRun:
+        row = session.scalar(
+            select(ScanRun).where(
+                ScanRun.id == scan_id,
+                ScanRun.lease_token == token,
+                ScanRun.status == "running",
+                ScanRun.lease_expires_at > datetime.now(UTC),
+            )
+        )
+        if row is None:
+            raise InterruptedError("library scan lease lost")
+        row.lease_expires_at = datetime.now(UTC) + timedelta(seconds=LEASE_SECONDS)
+        return row
+
+    def run(
+        self,
+        full: bool = False,
+        *,
+        cancel_signal: ScanCancellation | None = None,
+        service_task_id: str | None = None,
+    ) -> ScanRun:
+        _raise_if_cancelled(cancel_signal)
+        root = self.music_root.resolve(strict=True)
+        scan_id, generation, token = self._claim(full, service_task_id)
+        diagnostics = ScanDiagnostics(scan_id=scan_id)
+        stop = threading.Event()
+        lease_lost = threading.Event()
+
+        def heartbeat() -> None:
+            while not stop.wait(20):
+                try:
+                    with self.factory() as session:
+                        session.execute(text("BEGIN IMMEDIATE"))
+                        self._fence(session, scan_id, token)
+                        session.commit()
+                except Exception:
+                    lease_lost.set()
+                    return
+
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
         try:
-            for path in _iter_audio_files(root, cancel_signal):
-                _raise_if_cancelled(cancel_signal)
-                scanned += 1
-                relative = PurePosixPath(path.relative_to(root).as_posix()).as_posix()
-                stat_result = path.stat(follow_symlinks=False)
+            with self.factory() as session:
+                known = {
+                    r.filepath: (r.id, r.file_size, r.file_mtime_ns, r.parser_version)
+                    for r in session.scalars(select(Track))
+                }
+            seen: set[str] = set()
+            pending: list[_ScanEntry] = []
+            for path in iter_library_candidates(root, diagnostics, cancel_signal):
+                _raise_if_cancelled(lease_lost)
+                relative = path.relative_to(root).as_posix()
+                seen.add(relative)
                 previous = known.get(relative)
-                metadata: dict[str, object] | None = None
-                if full or previous != (stat_result.st_size, stat_result.st_mtime_ns):
-                    try:
-                        metadata = read_audio_metadata(path)
-                    except (MutagenError, OSError, ValueError, TypeError):
-                        errors += 1
-                        logger.exception("failed to read audio tags", extra={"path": relative})
-                        # A previously indexed but now unreadable file is still present.
-                        if previous is None:
-                            continue
+                try:
+                    with open_library_file(root, relative) as physical:
+                        file_stat = os.fstat(physical.fileno())
+                    metadata = None
+                    if (
+                        not full
+                        and previous is not None
+                        and previous[1:]
+                        == (file_stat.st_size, file_stat.st_mtime_ns, PARSER_VERSION)
+                    ):
+                        diagnostics.counts["unchanged"] += 1
                     else:
-                        changed += 1
-                pending.append(
-                    _ScanEntry(
-                        relative=relative,
-                        size=stat_result.st_size,
-                        mtime_ns=stat_result.st_mtime_ns,
-                        metadata=metadata,
+                        metadata = read_audio_metadata(path, music_root=root)
+                        if metadata.pop("_metadata_fallback", False):
+                            diagnostics.counts["metadata_fallback"] += 1
+                    size = (
+                        int(str(metadata.get("_file_size", file_stat.st_size)))
+                        if metadata
+                        else file_stat.st_size
                     )
-                )
+                    mtime = (
+                        int(str(metadata.get("_file_mtime_ns", file_stat.st_mtime_ns)))
+                        if metadata
+                        else file_stat.st_mtime_ns
+                    )
+                    pending.append(_ScanEntry(relative, size, mtime, metadata, previous is None))
+                except (OSError, ValueError, TypeError) as error:
+                    diagnostics.issue(
+                        relative,
+                        error.reason if isinstance(error, LibraryReadError) else "unreadable",
+                    )
+                    if previous:
+                        pending.append(_ScanEntry(relative, previous[1], previous[2], None))
                 if len(pending) >= SCAN_BATCH_SIZE:
-                    self._flush_batch(pending, generation, album_cache)
+                    self._flush_batch(pending, generation, scan_id, token, diagnostics)
                     pending.clear()
-            _raise_if_cancelled(cancel_signal)
             if pending:
-                self._flush_batch(pending, generation, album_cache)
+                self._flush_batch(pending, generation, scan_id, token, diagnostics)
             _raise_if_cancelled(cancel_signal)
-            with self.factory.begin() as session:
-                missing_result = session.execute(
-                    update(Track)
-                    .where(Track.is_present, Track.scan_generation != generation)
-                    .values(is_present=False)
+            _raise_if_cancelled(lease_lost)
+            for relative, snapshot in known.items():
+                if relative in seen:
+                    continue
+                _raise_if_cancelled(cancel_signal)
+                presence = library_presence(root, relative)
+                if presence == "missing":
+                    with self.factory() as session:
+                        session.execute(text("BEGIN IMMEDIATE"))
+                        self._fence(session, scan_id, token)
+                        result = session.execute(
+                            update(Track)
+                            .where(
+                                Track.id == snapshot[0],
+                                Track.filepath == relative,
+                                Track.file_size == snapshot[1],
+                                Track.file_mtime_ns == snapshot[2],
+                                Track.scan_generation < generation,
+                                Track.is_present,
+                            )
+                            .values(is_present=False)
+                        )
+                        diagnostics.counts["missing"] += int(result.rowcount or 0)
+                        session.commit()
+                elif presence in {"unreadable", "unsafe"}:
+                    diagnostics.issue(relative, presence)
+            with self.factory() as session:
+                session.execute(text("BEGIN IMMEDIATE"))
+                scan = self._fence(session, scan_id, token)
+                scan.status = "completed"
+                scan.scanned_files = diagnostics.counts["physical_candidates"]
+                scan.changed_files = (
+                    diagnostics.counts["newly_indexed"] + diagnostics.counts["updated"]
                 )
-                missing = int(missing_result.rowcount or 0)
-                completed_scan = session.get(ScanRun, scan_id)
-                assert completed_scan is not None
-                completed_scan.status = "completed"
-                completed_scan.scanned_files = scanned
-                completed_scan.changed_files = changed
-                completed_scan.missing_files = missing
-                completed_scan.error_count = errors
-                completed_scan.completed_at = datetime.now(UTC)
+                scan.missing_files = diagnostics.counts["missing"]
+                scan.error_count = diagnostics.counts["errors"] + diagnostics.counts["unreadable"]
+                scan.traversal_complete = diagnostics.traversal_complete
+                scan.summary_json = json.dumps(diagnostics.payload(), separators=(",", ":"))
+                scan.completed_at = datetime.now(UTC)
+                scan.lease_token = None
+                scan.lease_expires_at = None
                 session.add(
-                    Event(
+                    make_event(
+                        session,
                         entity_type="library",
-                        entity_id=completed_scan.id,
+                        entity_id=scan.id,
                         event_type="library.scan_completed",
-                        message=f"Library scan completed: {scanned} files",
-                        details_json=(
-                            f'{{"scanned":{scanned},"changed":{changed},"missing":{missing},'
-                            f'"errors":{errors}}}'
-                        ),
+                        message="Library scan completed",
+                        details={
+                            "scanned": scan.scanned_files,
+                            "changed": scan.changed_files,
+                            "missing": scan.missing_files,
+                            "errors": scan.error_count,
+                        },
+                        audience="all_authenticated",
                     )
                 )
-                session.flush()
-                session.expunge(completed_scan)
-                return completed_scan
-        except Exception as error:
+                session.commit()
+                session.expunge(scan)
+                return scan
+        except Exception:
             with self.factory.begin() as session:
-                failed_scan = session.get(ScanRun, scan_id)
-                if failed_scan:
-                    failed_scan.status = "failed"
-                    failed_scan.scanned_files = scanned
-                    failed_scan.changed_files = changed
-                    failed_scan.error_count = errors + 1
-                    failed_scan.error_message = str(error)[:1000]
-                    failed_scan.completed_at = datetime.now(UTC)
+                row = session.scalar(
+                    select(ScanRun).where(
+                        ScanRun.id == scan_id,
+                        ScanRun.lease_token == token,
+                        ScanRun.status == "running",
+                    )
+                )
+                if row:
+                    row.status = "failed"
+                    row.error_count = diagnostics.counts["errors"] + 1
+                    row.error_message = "library scan interrupted; inspect bounded scan diagnostics"
+                    row.summary_json = json.dumps(diagnostics.payload(), separators=(",", ":"))
+                    row.completed_at = datetime.now(UTC)
+                    row.lease_token = None
+                    row.lease_expires_at = None
             raise
+        finally:
+            stop.set()
+            thread.join(timeout=2)
 
     def index_one(self, path: Path) -> Track:
         root = self.music_root.resolve(strict=True)
-        resolved = path.resolve(strict=True)
-        if path.is_symlink() or not resolved.is_relative_to(root):
-            raise ValueError("published path escapes music root")
-        relative = resolved.relative_to(root).as_posix()
-        stat_result = resolved.stat(follow_symlinks=False)
-        metadata = read_audio_metadata(resolved)
-        with self.factory.begin() as session:
+        relative = path.relative_to(root).as_posix()
+        metadata = read_audio_metadata(path, music_root=root)
+        file_stat = validate_file_snapshot(root, relative, metadata)
+        with self.factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
             generation = int(session.scalar(select(func.max(ScanRun.generation))) or 0)
-            album_id = self._album_id(session, metadata, {})
-            values = self._track_values(
-                relative,
-                stat_result.st_size,
-                stat_result.st_mtime_ns,
-                metadata,
-                album_id,
+            track, _alias = self._upsert(
+                session,
+                _ScanEntry(
+                    relative,
+                    int(str(metadata.get("_file_size", file_stat.st_size))),
+                    int(str(metadata.get("_file_mtime_ns", file_stat.st_mtime_ns))),
+                    metadata,
+                ),
                 generation,
             )
-            track = session.scalar(select(Track).where(Track.filepath == relative))
-            if track is None:
-                track = Track(**values)
-                session.add(track)
-            else:
-                for key, value in values.items():
-                    setattr(track, key, value)
-            session.flush()
+            session.commit()
+            assert track is not None
             session.expunge(track)
             return track
 
@@ -337,82 +454,120 @@ class LibraryScanner:
         self,
         entries: list[_ScanEntry],
         generation: int,
-        album_cache: dict[str, str],
+        scan_id: str,
+        token: str,
+        diagnostics: ScanDiagnostics,
     ) -> None:
-        paths = [entry.relative for entry in entries]
-        with self.factory.begin() as session:
-            existing = {
-                track.filepath: track
-                for track in session.scalars(select(Track).where(Track.filepath.in_(paths)))
-            }
-            for entry in entries:
-                track = existing.get(entry.relative)
-                if entry.metadata is None:
-                    if track is not None:
-                        track.is_present = True
-                        track.scan_generation = generation
+        root = self.music_root.resolve(strict=True)
+        validated = []
+        for entry in entries:
+            if entry.metadata is not None:
+                try:
+                    validate_file_snapshot(root, entry.relative, entry.metadata)
+                except LibraryReadError as error:
+                    diagnostics.issue(entry.relative, error.reason)
                     continue
-                album_id = self._album_id(session, entry.metadata, album_cache)
-                values = self._track_values(
-                    entry.relative,
-                    entry.size,
-                    entry.mtime_ns,
-                    entry.metadata,
-                    album_id,
-                    generation,
-                )
-                if track is None:
-                    session.add(Track(**values))
-                else:
-                    for key, value in values.items():
-                        setattr(track, key, value)
+            validated.append(entry)
+        with self.factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            scan = self._fence(session, scan_id, token)
+            for entry in validated:
+                track, alias = self._upsert(session, entry, generation)
+                if track:
+                    if entry.metadata is not None:
+                        diagnostics.counts["newly_indexed" if entry.new_record else "updated"] += 1
+                    diagnostics.counts["indexed"] += 1
+                    codec = (track.codec or "unknown")[:64]
+                    if codec not in SUPPORTED_CODECS:
+                        codec = "other"
+                    diagnostics.by_codec[codec] = diagnostics.by_codec.get(codec, 0) + 1
+                    diagnostics.counts["source_aliases"] += int(alias)
+            scan.scanned_files = diagnostics.counts["physical_candidates"]
+            scan.changed_files = diagnostics.counts["newly_indexed"] + diagnostics.counts["updated"]
+            scan.summary_json = json.dumps(diagnostics.payload(), separators=(",", ":"))
+            session.commit()
 
-    @staticmethod
-    def _track_values(
-        relative: str,
-        size: int,
-        mtime_ns: int,
-        metadata: dict[str, object],
-        album_id: str | None,
-        generation: int,
-    ) -> dict[str, object]:
-        track_metadata = {key: value for key, value in metadata.items() if key != "job_id"}
-        values: dict[str, object] = {
-            **track_metadata,
-            "album_id": album_id,
+    def _upsert(
+        self, session: Session, entry: _ScanEntry, generation: int
+    ) -> tuple[Track | None, bool]:
+        track = session.scalar(select(Track).where(Track.filepath == entry.relative))
+        if entry.metadata is None:
+            if track:
+                track.is_present = True
+                track.scan_generation = generation
+            return track, False
+        metadata = {
+            key: value
+            for key, value in entry.metadata.items()
+            if not key.startswith("_") and key != "job_id"
+        }
+        try:
+            provenance = json.loads(track.provenance_json) if track else {}
+        except ValueError:
+            provenance = {}
+        if not isinstance(provenance, dict):
+            provenance = {}
+        # A changed file must not retain a previous source's deduplication alias.
+        # Reconstruct it only from provenance actually read from the current file.
+        provenance.pop("source_alias", None)
+        job_id = entry.metadata.get("job_id")
+        if isinstance(job_id, str) and job_id:
+            provenance["job_id"] = job_id
+        extractor, source_id = metadata.get("source_extractor"), metadata.get("source_id")
+        alias = False
+        if extractor and source_id:
+            owner = session.scalar(
+                select(Track).where(
+                    Track.source_extractor == extractor,
+                    Track.source_id == source_id,
+                    Track.filepath != entry.relative,
+                )
+            )
+            if owner:
+                provenance["source_alias"] = {
+                    "extractor": extractor,
+                    "id": source_id,
+                    "url": metadata.get("source_url"),
+                    "owner_track_id": owner.id,
+                }
+                metadata["source_extractor"] = metadata["source_id"] = None
+                alias = True
+        values = {
+            **metadata,
+            "album_id": self._album_id(session, metadata),
             "artist_normalized": normalize_text(str(metadata["artist"])),
             "title_normalized": normalize_text(str(metadata["title"])),
-            "filepath": relative,
+            "filepath": entry.relative,
+            "file_extension": extension_for(entry.relative),
             "is_present": True,
-            "file_mtime_ns": mtime_ns,
-            "file_size": size,
+            "file_mtime_ns": entry.mtime_ns,
+            "file_size": entry.size,
             "scan_generation": generation,
+            "parser_version": PARSER_VERSION,
+            "provenance_json": json.dumps(provenance, separators=(",", ":")),
         }
-        job_id = metadata.get("job_id")
-        if isinstance(job_id, str) and job_id:
-            values["provenance_json"] = json.dumps(
-                {"job_id": job_id}, ensure_ascii=False, separators=(",", ":")
-            )
-        return values
+        if track is None:
+            track = Track(**values)
+            session.add(track)
+        else:
+            for key, value in values.items():
+                setattr(track, key, value)
+        session.flush()
+        return track, alias
 
     @staticmethod
-    def _album_id(
-        session: Session, metadata: dict[str, object], cache: dict[str, str]
-    ) -> str | None:
+    def _album_id(session: Session, metadata: dict[str, object]) -> str | None:
         album = metadata.get("album")
         if not album:
             return None
         artist = str(metadata.get("album_artist") or metadata["artist"])
         year = metadata.get("year")
-        numeric_year = year if isinstance(year, int) and not isinstance(year, bool) else None
         release_mbid = metadata.get("release_mbid")
         identity = (
             f"mbid:{release_mbid}"
             if release_mbid
-            else f"text:{normalize_text(artist)}:{normalize_text(str(album))}:{numeric_year or ''}"
+            else f"text:{normalize_text(artist)}:{normalize_text(str(album))}:{year or ''}"
         )
-        if identity in cache:
-            return cache[identity]
         existing = session.scalar(select(Album).where(Album.identity_key == identity))
         if existing is None:
             existing = Album(
@@ -421,15 +576,26 @@ class LibraryScanner:
                 artist_normalized=normalize_text(artist),
                 title=str(album),
                 title_normalized=normalize_text(str(album)),
-                year=numeric_year,
+                year=year if isinstance(year, int) else None,
                 release_mbid=str(release_mbid) if release_mbid else None,
-                release_group_mbid=(
-                    str(metadata["release_group_mbid"])
-                    if metadata.get("release_group_mbid")
-                    else None
-                ),
+                release_group_mbid=str(metadata["release_group_mbid"])
+                if metadata.get("release_group_mbid")
+                else None,
             )
             session.add(existing)
             session.flush()
-        cache[identity] = existing.id
         return existing.id
+
+
+__all__ = [
+    "LibraryScanner",
+    "ScanAlreadyRunning",
+    "ScanDiagnostics",
+    "_first",
+    "_number",
+    "_tag_text",
+    "_year",
+    "iter_library_candidates",
+    "read_audio_metadata",
+    "scan_has_coverage",
+]

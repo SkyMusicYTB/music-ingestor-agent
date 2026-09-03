@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from starlette.responses import Response
 
-from app.api.dependencies import CurrentSession
-from app.api.health import health_snapshot
-from app.api.usage import usage_snapshot
+from app.api.dependencies import CurrentAdmin, CurrentSession, FragmentSession
+from app.api.health import detailed_health_snapshot
+from app.api.usage import latest_execution_summary, usage_snapshot
 from app.db.models import (
     ArtworkCache,
     JobDecision,
@@ -180,9 +180,21 @@ def request_page(request_id: str, request: Request, authenticated: CurrentSessio
 
 
 @router.get("/downloads")
-def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
+def downloads_page(
+    request: Request,
+    authenticated: FragmentSession,
+    view: Literal["visible", "active", "attention", "finished", "hidden"] = "visible",
+    page: int = Query(default=1, ge=1, le=1_000_000),
+    page_size: int = Query(default=50, ge=25, le=100),
+    fragment: bool = False,
+) -> Response:
     event_cursor = _event_cursor(request)
-    jobs = request.app.state.jobs.list_for_user(authenticated.user_id)
+    if page_size not in {25, 50, 100}:
+        raise HTTPException(422, "page_size must be 25, 50 or 100")
+    result = request.app.state.jobs.page_for_user(
+        authenticated.user_id, view=view, page=page, page_size=page_size
+    )
+    jobs = result.jobs
     job_ids = [job.id for job in jobs]
     reviews: dict[str, list[dict[str, object]]] = {job_id: [] for job_id in job_ids}
     review_bundles: dict[str, dict[str, object]] = {}
@@ -248,9 +260,9 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
         ][:20]
     for option in options:
         if option.decision_id in pending_decision_ids:
-            view = _review_option_view(option)
-            if view["recommended"] or view["materially_different"]:
-                reviews.setdefault(option.job_id, []).append(view)
+            option_view = _review_option_view(option)
+            if option_view["recommended"] or option_view["materially_different"]:
+                reviews.setdefault(option.job_id, []).append(option_view)
     option_decision_ids = {
         option.decision_id for option in options if option.decision_id in pending_decision_ids
     }
@@ -310,12 +322,13 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
             match_details[job_id].append(detail)
     return _render(
         request,
-        "downloads.html",
+        "downloads_content.html" if fragment else "downloads.html",
         _context(
             request,
             authenticated,
             event_cursor=event_cursor,
             jobs=jobs,
+            result=result,
             reviews=reviews,
             review_bundles=review_bundles,
             snapshots=snapshots,
@@ -329,29 +342,50 @@ def downloads_page(request: Request, authenticated: CurrentSession) -> Response:
 @router.get("/library")
 def library_page(
     request: Request,
-    authenticated: CurrentSession,
+    authenticated: FragmentSession,
     q: str = Query(default="", max_length=300),
-    page: int = Query(default=1, ge=1),
+    page: int = Query(default=1, ge=1, le=1_000_000),
+    page_size: int = Query(default=50, ge=25, le=100),
+    format: str | None = Query(default=None, max_length=16),
+    codec: str | None = Query(default=None, max_length=64),
+    presence: Literal["present", "missing", "all"] = "present",
+    fragment: bool = False,
 ) -> Response:
     event_cursor = _event_cursor(request)
-    result = request.app.state.library.search(q, page, 50)
+    if page_size not in {25, 50, 100}:
+        raise HTTPException(422, "page_size must be 25, 50 or 100")
+    result = request.app.state.library.search(
+        q, page, page_size, format=format, codec=codec, presence=presence
+    )
     return _render(
         request,
-        "library.html",
+        "library_content.html" if fragment else "library.html",
         _context(
             request,
             authenticated,
             event_cursor=event_cursor,
             result=result,
             query=q,
+            format_filter=format or "",
+            codec_filter=codec or "",
+            presence_filter=presence,
+            scan_status=request.app.state.library.scan_status(
+                include_details=authenticated.role == "admin"
+            ),
         ),
     )
 
 
 @router.get("/usage")
-def usage_page(request: Request, authenticated: CurrentSession) -> Response:
+def usage_page(
+    request: Request, authenticated: CurrentSession, scope: Literal["own", "all", "system"] = "own"
+) -> Response:
     event_cursor = _event_cursor(request)
-    aggregates = usage_snapshot(request.app.state.session_factory)
+    if scope != "own" and authenticated.role != "admin":
+        raise HTTPException(403, "administrator access required")
+    aggregates = usage_snapshot(
+        request.app.state.session_factory, user_id=authenticated.user_id, scope=scope
+    )
     return _render(
         request,
         "usage.html",
@@ -361,17 +395,22 @@ def usage_page(request: Request, authenticated: CurrentSession) -> Response:
             event_cursor=event_cursor,
             calls=aggregates["recent"],
             aggregates=aggregates,
+            execution_settings=request.app.state.settings,
         ),
     )
 
 
 @router.get("/settings")
-def settings_page(request: Request, authenticated: CurrentSession) -> Response:
+def settings_page(request: Request, authenticated: CurrentAdmin) -> Response:
     event_cursor = _event_cursor(request)
     settings = request.app.state.settings
-    visible = {
+    visible: dict[str, object] = {
         "Environment": settings.environment,
         "Model": settings.openai_model,
+        "Model rounds": settings.max_model_rounds,
+        "Built-in tools per response": settings.openai_max_tool_calls,
+        "Overall model deadline": f"{settings.max_agent_seconds} seconds",
+        "Budget configuration": settings.model_rounds_configuration_source,
         "Web search": settings.openai_web_search_enabled,
         "Music library": str(settings.music_path),
         "Downloads": str(settings.downloads_path),
@@ -385,6 +424,21 @@ def settings_page(request: Request, authenticated: CurrentSession) -> Response:
         "Review policy": settings.review_policy,
         "SQLite journal": "DELETE / synchronous FULL",
     }
+    execution = latest_execution_summary(request.app.state.session_factory)
+    if execution is None:
+        visible["Last recorded model execution"] = "No completed execution recorded"
+    else:
+        visible["Last execution termination"] = execution["termination_reason"]
+        visible["Last execution rounds"] = (
+            f"{execution['model_rounds_used']} / {execution['configured_model_rounds']}"
+        )
+        visible["Last execution built-in tool cap"] = execution["configured_tool_calls"]
+        visible["Last execution deadline"] = (
+            f"{execution['configured_agent_seconds']} seconds"
+            if execution["configured_agent_seconds"] is not None
+            else "Not recorded"
+        )
+        visible["Last execution recorded at"] = execution["recorded_at"]
     return _render(
         request,
         "settings.html",
@@ -398,9 +452,9 @@ def settings_page(request: Request, authenticated: CurrentSession) -> Response:
 
 
 @router.get("/health")
-def health_page(request: Request, authenticated: CurrentSession) -> Response:
+def health_page(request: Request, authenticated: CurrentAdmin) -> Response:
     event_cursor = _event_cursor(request)
-    healthy, checks = health_snapshot(request)
+    healthy, checks = detailed_health_snapshot(request)
     return _render(
         request,
         "health.html",

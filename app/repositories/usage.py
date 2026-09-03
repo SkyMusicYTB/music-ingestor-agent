@@ -7,11 +7,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.db.models import OpenAICall, OpenAIToolCall
+from app.db.models import OpenAICall, OpenAIToolCall, Request
 
 
 @dataclass(frozen=True, slots=True)
 class UsageValues:
+    reported: bool = True
     input_tokens: int = 0
     cached_input_tokens: int = 0
     cache_write_tokens: int = 0
@@ -36,9 +37,26 @@ class OpenAIUsageRepository:
         prompt_version: str,
         prompt_hash: str,
         pricing_snapshot: Mapping[str, Any],
+        orchestration_attempt_id: str | None = None,
+        model_round: int | None = None,
+        phase: str | None = None,
+        configured_model_rounds: int | None = None,
+        configured_tool_calls: int | None = None,
+        configured_agent_seconds: int | None = None,
     ) -> OpenAICall:
+        owner = self._session.get(Request, request_id) if request_id is not None else None
+        if request_id is not None and owner is None:
+            raise LookupError("OpenAI call request does not exist")
         row = OpenAICall(
             request_id=request_id,
+            owner_user_id=owner.user_id if owner is not None else None,
+            orchestration_attempt_id=orchestration_attempt_id,
+            model_round=model_round,
+            phase=phase,
+            configured_model_rounds=configured_model_rounds,
+            configured_tool_calls=configured_tool_calls,
+            configured_agent_seconds=configured_agent_seconds,
+            usage_reported=False,
             model=model,
             prompt_version=prompt_version,
             prompt_hash=prompt_hash,
@@ -62,6 +80,7 @@ class OpenAIUsageRepository:
         estimated_cost_microusd: int | None,
     ) -> None:
         row.response_id = _bounded_token(response_id, 100)
+        row.usage_reported = usage.reported
         if provider_request_id is not None or row.provider_request_id is None:
             row.provider_request_id = _bounded_token(provider_request_id, 100)
         row.input_tokens = usage.input_tokens
@@ -74,7 +93,7 @@ class OpenAIUsageRepository:
         row.web_search_context = usage.web_search_context
         row.latency_ms = max(0, latency_ms)
         row.service_tier = _bounded_token(service_tier, 40)
-        row.estimated_cost_microusd = estimated_cost_microusd
+        row.estimated_cost_microusd = estimated_cost_microusd if usage.reported else None
         row.status = "completed"
         row.error_code = None
 

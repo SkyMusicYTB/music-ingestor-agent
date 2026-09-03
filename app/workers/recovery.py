@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.services.library_scan import LibraryScanner, ScanCancellation
+from app.services.library_scan import LibraryScanner, ScanAlreadyRunning, ScanCancellation
 from app.workers.cleanup import cleanup_orphaned_staging
 from app.workers.queue import DownloadJobQueue, ServiceTaskQueue
 
@@ -36,7 +36,12 @@ class StartupRecovery:
     def run(self) -> RecoveryReport:
         recovered_downloads = self.downloads.recover_expired()
         recovered_tasks = self.service_tasks.recover_expired()
-        scan = self.scanner.run(full=False, cancel_signal=self.shutdown_signal)
+        try:
+            scan_kind = self.scanner.run(full=False, cancel_signal=self.shutdown_signal).kind
+        except ScanAlreadyRunning:
+            # A CLI scan may own the lease. Acquisition/publication independently
+            # remain gated until a covered initial baseline is available.
+            scan_kind = "already_running"
         adopted = self.downloads.adopt_published_jobs(self.scanner.music_root)
         preserved = self.downloads.staging_job_ids_to_preserve()
         removed = cleanup_orphaned_staging(
@@ -48,5 +53,5 @@ class StartupRecovery:
             service_task_leases=recovered_tasks,
             adopted_publications=adopted,
             staging_directories=removed,
-            scan_kind=scan.kind,
+            scan_kind=scan_kind,
         )

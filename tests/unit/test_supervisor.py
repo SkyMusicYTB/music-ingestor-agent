@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -77,6 +78,64 @@ def _supervisor(engine: Engine, factory: sessionmaker[Session], settings) -> Web
         jobs=JobRepository(factory),
         events=EventRepository(factory),
     )
+
+
+@pytest.mark.asyncio
+async def test_discovery_is_not_preempted_by_a_competing_supervisor_timeout(
+    engine: Engine,
+    session_factory: sessionmaker[Session],
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(
+        engine, session_factory, settings.model_copy(update={"max_agent_seconds": 0.001})
+    )
+    task = ClaimedTask("task", "orchestrate_request", {}, "fixture-lease", 1)
+    completed: list[str] = []
+    monkeypatch.setattr(supervisor, "_claim", lambda: task)
+    monkeypatch.setattr(supervisor, "_heartbeat", lambda _active: None)
+
+    async def execute(_task: ClaimedTask) -> None:
+        await asyncio.sleep(0.02)
+
+    def complete(claimed: ClaimedTask, _result: object) -> None:
+        completed.append(claimed.id)
+        supervisor.stop()
+
+    monkeypatch.setattr(supervisor, "_execute", execute)
+    monkeypatch.setattr(supervisor, "_complete", complete)
+    await supervisor.run()
+    assert completed == ["task"]
+
+
+@pytest.mark.asyncio
+async def test_active_task_renews_service_heartbeat_and_cancels_on_lease_loss(
+    engine: Engine,
+    session_factory: sessionmaker[Session],
+    settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(engine, session_factory, settings)
+    task = ClaimedTask("task", "orchestrate_request", {}, "fixture-lease", 1)
+    heartbeats: list[int] = []
+    ownership = iter([True, False])
+    monkeypatch.setattr(supervisor, "_extend_task_lease", lambda _task: next(ownership))
+    monkeypatch.setattr(supervisor, "_heartbeat", heartbeats.append)
+
+    async def immediate_sleep(_seconds: float) -> None:
+        return None
+
+    async def blocked_execution() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("app.services.supervisor.asyncio.sleep", immediate_sleep)
+    execution = asyncio.create_task(blocked_execution())
+    lease_lost = asyncio.Event()
+    await supervisor._renew_task_lease(task, execution, lease_lost)
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+    assert lease_lost.is_set()
+    assert heartbeats == [1]
 
 
 def _exact_confirmation_rows(
@@ -355,3 +414,30 @@ async def test_low_disk_confirmation_retries_and_autoqueues_once_after_recovery(
         assert session.get(Request, request_id).status == "auto_queued"  # type: ignore[union-attr]
         assert session.get(ServiceTask, task_id).state == "completed"  # type: ignore[union-attr]
         assert session.scalar(select(func.count(DownloadJob.id))) == 1
+
+
+def test_completed_initial_scan_without_coverage_cannot_autoqueue(
+    engine: Engine, session_factory: sessionmaker[Session], settings
+) -> None:
+    request_id, _task_id, _token = _exact_confirmation_rows(
+        session_factory, suffix="incomplete-scan", task_kind="confirm_request"
+    )
+    with session_factory.begin() as session:
+        session.add(
+            ScanRun(
+                kind="initial",
+                generation=1,
+                status="completed",
+                parser_version=1,
+                traversal_complete=False,
+                summary_json='{"coverage_complete":false}',
+            )
+        )
+    supervisor = _supervisor(
+        engine, session_factory, settings.model_copy(update={"initial_scan_required": True})
+    )
+    with pytest.raises(ConfirmationGatePending, match="initial library scan"):
+        supervisor._apply_confirmation(request_id)
+    with session_factory() as session:
+        assert session.get(Request, request_id).status == "preview"  # type: ignore[union-attr]
+        assert session.scalar(select(func.count(DownloadJob.id))) == 0

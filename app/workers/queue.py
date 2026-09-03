@@ -7,12 +7,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.enums import JobStage, JobStatus, TaskState, TaskTarget
-from app.db.models import DownloadJob, Event, JobDecision, Request, ServiceTask, Track
+from app.db.models import DownloadJob, JobDecision, Request, ServiceTask, Track
 from app.repositories.decisions import candidate_set_fingerprint, create_pending_decision
+from app.repositories.events import make_event
 from app.services.filesystem import sha256_file, validate_relative_path
 
 
@@ -88,7 +89,8 @@ def _job_event(
     details: dict[str, Any] | None = None,
 ) -> None:
     session.add(
-        Event(
+        make_event(
+            session,
             entity_type="job",
             entity_id=job_id,
             event_type=event_type,
@@ -149,8 +151,14 @@ class DownloadJobQueue:
                 stage=JobStage.RESOLVING_SOURCE.value,
                 lease_token=token,
                 lease_expires_at=expires,
-                error_code=None,
-                error_message=None,
+                error_code=case(
+                    (DownloadJob.error_code == "initial_scan_pending", DownloadJob.error_code),
+                    else_=None,
+                ),
+                error_message=case(
+                    (DownloadJob.error_code == "initial_scan_pending", DownloadJob.error_message),
+                    else_=None,
+                ),
                 updated_at=timestamp,
             )
             .returning(
@@ -158,11 +166,12 @@ class DownloadJobQueue:
                 DownloadJob.lease_token,
                 DownloadJob.approved_snapshot_json,
                 DownloadJob.retry_count,
+                DownloadJob.error_code,
             )
         )
         with self.session_factory() as session:
             row = session.execute(statement).mappings().one_or_none()
-            if row is not None:
+            if row is not None and row["error_code"] != "initial_scan_pending":
                 _job_event(
                     session,
                     str(row["id"]),
@@ -685,6 +694,55 @@ class DownloadJobQueue:
             session.commit()
         return result_status
 
+    def clear_library_wait(self, lease: JobLease) -> None:
+        with self.session_factory.begin() as session:
+            session.execute(
+                update(DownloadJob)
+                .where(
+                    DownloadJob.id == lease.job_id,
+                    DownloadJob.lease_token == lease.token,
+                    DownloadJob.error_code == "initial_scan_pending",
+                )
+                .values(error_code=None, error_message=None)
+            )
+
+    def defer_for_library_scan(self, lease: JobLease) -> str:
+        """Keep work queued until the shared initial index covers the library."""
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            job = session.scalar(
+                select(DownloadJob).where(
+                    DownloadJob.id == lease.job_id,
+                    DownloadJob.lease_token == lease.token,
+                    DownloadJob.status.in_(["active", "cancel_requested"]),
+                )
+            )
+            if job is None:
+                raise LeaseLostError("download lease lost while waiting for library scan")
+            already_waiting = job.error_code == "initial_scan_pending"
+            if job.status == "cancel_requested":
+                job.status = "cancelled"
+                job.completed_at = utc_now()
+                _job_event(session, job.id, "job.cancelled", "Download cancelled")
+            else:
+                job.status = "queued"
+                job.stage = "queued"
+                job.available_at = utc_now() + timedelta(seconds=30)
+                job.error_code = "initial_scan_pending"
+                job.error_message = "Waiting for the initial library scan to complete"
+                if not already_waiting:
+                    _job_event(
+                        session,
+                        job.id,
+                        "job.waiting_library",
+                        "Download is waiting for the initial library scan",
+                    )
+            job.lease_token = None
+            job.lease_expires_at = None
+            result = job.status
+            session.commit()
+            return result
+
     def wait_for_space(
         self,
         lease: JobLease,
@@ -797,7 +855,7 @@ class DownloadJobQueue:
         adopted = 0
         with self.session_factory() as session:
             tracks = list(session.scalars(select(Track).where(Track.provenance_json != "{}")))
-            by_job: dict[str, Track] = {}
+            by_job: dict[str, list[Track]] = {}
             for track in tracks:
                 try:
                     provenance = json.loads(track.provenance_json or "{}")
@@ -805,7 +863,7 @@ class DownloadJobQueue:
                     continue
                 job_id = provenance.get("job_id") if isinstance(provenance, dict) else None
                 if isinstance(job_id, str) and job_id:
-                    by_job[job_id] = track
+                    by_job.setdefault(job_id, []).append(track)
             jobs = list(
                 session.scalars(
                     select(DownloadJob).where(
@@ -818,7 +876,19 @@ class DownloadJobQueue:
                 )
             )
             for job in jobs:
-                track = by_job[job.id]
+                candidates = by_job[job.id]
+                preferred = [
+                    track
+                    for track in candidates
+                    if track.id == job.final_track_id or track.filepath == job.final_relative_path
+                ]
+                if len(preferred) == 1:
+                    track = preferred[0]
+                elif len(candidates) == 1:
+                    track = candidates[0]
+                else:
+                    # Copied provenance does not authorize an arbitrary relink.
+                    continue
                 relative = validate_relative_path(track.filepath)
                 path = music_root.resolve(strict=True).joinpath(*relative.parts)
                 if path.is_symlink() or not path.is_file():
@@ -878,7 +948,8 @@ class ServiceTaskQueue:
         if self.target != TaskTarget.WORKER.value:
             raise ValueError("library scans can only target the worker service")
         timestamp = now or utc_now()
-        with self.session_factory.begin() as session:
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
             existing = session.scalar(
                 select(ServiceTask.id)
                 .where(
@@ -907,7 +978,31 @@ class ServiceTaskQueue:
             )
             session.add(task)
             session.flush()
+            session.commit()
             return task.id
+
+    def defer_library_scan(self, lease: ServiceTaskLease) -> None:
+        """A busy singleton scanner is contention, not a provider failure."""
+        if lease.kind != "library_scan":
+            raise ValueError("only scans may use the scan contention defer")
+        with self.session_factory.begin() as session:
+            result = session.execute(
+                update(ServiceTask)
+                .where(
+                    ServiceTask.id == lease.task_id,
+                    ServiceTask.lease_token == lease.token,
+                    ServiceTask.state == "running",
+                )
+                .values(
+                    state="retry_wait",
+                    available_at=utc_now() + timedelta(seconds=15),
+                    lease_token=None,
+                    lease_expires_at=None,
+                    attempts=func.max(0, ServiceTask.attempts - 1),
+                )
+            )
+            if result.rowcount != 1:
+                raise LeaseLostError("scan task lease lost")
 
     def claim_next(self, *, now: datetime | None = None) -> ServiceTaskLease | None:
         timestamp = now or utc_now()
@@ -1112,7 +1207,8 @@ class ServiceTaskQueue:
                             "Direct YouTube validation could not resume after worker failure."
                         )
                         session.add(
-                            Event(
+                            make_event(
+                                session,
                                 entity_type="request",
                                 entity_id=request.id,
                                 event_type="request.direct_failed",

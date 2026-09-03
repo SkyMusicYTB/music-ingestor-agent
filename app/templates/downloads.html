@@ -3,76 +3,15 @@
 {% block live_page %}downloads{% endblock %}
 {% block content %}
 <section>
-  <p class="eyebrow">Persistent queue</p>
-  <h1>Downloads</h1>
-  {% if jobs %}
-  <div class="job-list">
-    {% for job in jobs %}
-    <article class="job-row" data-job-id="{{ job.id }}">
-      <div class="section-heading"><strong>{{ friendly_stage(job.stage) }}</strong><span class="status status-{{ job.status }}">{{ job.status|replace('_', ' ') }}</span></div>
-      {% set snapshot = snapshots.get(job.id, {}) %}
-      {% set bundle = review_bundles.get(job.id) %}
-      {% if snapshot.get('title') %}<p><strong>{{ snapshot.get('title') }}</strong>{% if snapshot.get('artist') %} · {{ snapshot.get('artist') }}{% endif %}{% if snapshot.get('album') %} · {{ snapshot.get('album') }}{% endif %}</p>{% endif %}
-      <progress max="1" value="{{ job.progress }}">{{ (job.progress * 100)|round }}%</progress>
-      {% if job.final_relative_path %}<p><code>{{ job.final_relative_path }}</code></p>{% endif %}
-      {% if job.error_message %}<div class="alert error">{{ job.error_message }}</div>{% endif %}
-      {% for warning in warnings.get(job.id, []) %}<div class="alert warning">{{ warning.message }}</div>{% endfor %}
-      {% if match_details.get(job.id) %}
-      <details>
-        <summary>How this was matched</summary>
-        {% for decision in match_details.get(job.id, []) %}
-        <p><strong>{{ decision.category|replace('_', ' ')|title }}</strong>
-          {% if decision.artist %} · {{ decision.artist }} — {{ decision.title }}{% endif %}
-          {% if decision.album %} · {{ decision.album }}{% endif %}
-          {% if decision.provider %} · {{ decision.provider|title }}{% endif %}
-          {% if decision.uploader %} · uploaded by {{ decision.uploader }}{% endif %}
-          {% if decision.confidence is not none %} · {{ (decision.confidence * 100)|round|int }}% confidence{% endif %}
-          · decided by {{ decision.decided_by|replace('_', ' ') }}
-        </p>
-        {% endfor %}
-      </details>
-      {% endif %}
-      <div class="action-row">
-        {% if job.status not in ['completed', 'cancelled', 'failed'] %}<button class="small secondary job-action" data-action="cancel">Cancel</button>{% endif %}
-        {% if job.status in ['failed', 'waiting_for_space'] or (job.status == 'needs_review' and (not bundle or not bundle.has_options)) %}<button class="small job-action" data-action="retry">Retry</button>{% endif %}
-      </div>
-      {% if job.status == 'needs_review' %}
-      {% if bundle and bundle.has_options %}
-      <form class="review-form stack" data-job-id="{{ job.id }}" data-bundle-fingerprint="{{ bundle.fingerprint }}" data-revision="{{ bundle.revision }}">
-        <div class="alert warning"><strong>One exceptional choice is needed.</strong> The recommended option is preselected; ordinary source and release differences were already resolved automatically.</div>
-        {% for decision in bundle.decisions %}
-        <fieldset data-decision-id="{{ decision.id }}">
-          <legend>{{ decision.category|replace('_', ' ')|title }}</legend>
-          {% if decision.reason_codes %}<p>{{ decision.reason_codes[0] }}</p>{% endif %}
-          {% set decision_options = reviews.get(job.id, [])|selectattr('decision_id', 'equalto', decision.id)|list %}
-          {% for option in decision_options[:3] %}
-          <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}" {% if option.recommended %}checked{% endif %}> <span><strong>{% if option.recommended %}Recommended{% else %}Alternative {{ option.rank }}{% endif %}</strong> · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider|title }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
-          {% endfor %}
-          {% if decision_options|length > 3 %}
-          <details><summary>Show more materially different options</summary>
-            {% for option in decision_options[3:] %}
-            <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}"> <span>Alternative {{ option.rank }} · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider|title }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
-            {% endfor %}
-          </details>
-          {% endif %}
-        </fieldset>
-        {% endfor %}
-        <details class="review-correction">
-          <summary>Correct text metadata (optional)</summary>
-          <label>Artist <input name="artist" maxlength="300" value="{{ snapshot.get('artist') or '' }}"></label>
-          <label>Title <input name="title" maxlength="300" value="{{ snapshot.get('title') or '' }}"></label>
-          <label>Album <input name="album" maxlength="300" value="{{ snapshot.get('album') or '' }}"></label>
-        </details>
-        <button type="submit" class="small">Accept and continue</button>
-        <p class="form-error" role="alert"></p>
-      </form>
-      {% else %}
-      <div class="alert warning">No safe permitted source is currently available. You can retry after changing provider availability, or cancel this item.</div>
-      {% endif %}
-      {% endif %}
-    </article>
-    {% endfor %}
-  </div>
-  {% else %}<p class="empty">The download queue is empty.</p>{% endif %}
+  <p class="eyebrow">Persistent queue</p><h1>Downloads</h1>
+  <p>Removing a finished download only hides its card. Music, decisions and history are kept.</p>
+  <p id="downloads-status" role="status" aria-live="polite" tabindex="-1"></p>
+  {% include "downloads_content.html" %}
 </section>
+<dialog id="clear-finished-dialog" aria-labelledby="clear-finished-title">
+  <h2 id="clear-finished-title">Clear finished downloads?</h2>
+  <p>Completed, failed and cancelled cards will move to Hidden history. No music or history is deleted. Active downloads and reviews stay visible.</p>
+  <p class="form-error" role="alert"></p>
+  <div class="action-row"><button id="confirm-clear-finished">Clear finished</button><button id="cancel-clear-finished" class="secondary">Keep list</button></div>
+</dialog>
 {% endblock %}

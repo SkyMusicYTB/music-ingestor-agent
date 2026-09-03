@@ -3,6 +3,7 @@ Object.defineProperty(globalThis, "document", {
     cookie: "",
     querySelector: () => null,
     querySelectorAll: () => [],
+    addEventListener: () => {},
     body: {dataset: {}},
   },
   configurable: true,

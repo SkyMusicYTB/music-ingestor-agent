@@ -4,12 +4,15 @@
 <section>
   <p class="eyebrow">Responses API accounting</p>
   <h1>OpenAI usage</h1>
-  <p>Reasoning tokens are shown as an output breakdown and are not charged twice. A dash means pricing is not configured.</p>
+  <p>{{ 'Your usage' if aggregates.scope == 'own' else ('System / unattributed usage' if aggregates.scope == 'system' else 'All users and system usage') }}</p>
+  {% if user.role == 'admin' %}<nav class="action-row"><a href="/usage">My usage</a><a href="/usage?scope=all">All usage</a><a href="/usage?scope=system">System / unattributed</a></nav>{% endif %}
+  <p>Model: {{ execution_settings.openai_model }} · {{ execution_settings.max_model_rounds }} model rounds · {{ execution_settings.openai_max_tool_calls }} built-in calls per response · {{ execution_settings.max_agent_seconds }}s deadline · {{ execution_settings.model_rounds_configuration_source }} configuration.</p>
+  <p>Reasoning tokens are part of output, not charged twice. A dash means usage or pricing is unknown. Token totals include only reported usage.</p>
   {% for heading, rows in [('Daily', aggregates.daily), ('Monthly', aggregates.monthly)] %}
   <h2>{{ heading }}</h2>
   <div class="library-table">
     {% for row in rows %}
-    <div class="usage-row"><span><strong>{{ row.period }}</strong><small>{{ row.calls }} calls · {{ row.web_searches }} web searches · {{ row.reasoning_tokens }} reasoning tokens</small></span><span>{{ row.total_tokens }} tokens<br>{% if row.estimated_cost_microusd is not none %}${{ '%.6f'|format(row.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span></div>
+    <div class="usage-row"><span><strong>{{ row.period }}</strong><small>{{ row.calls }} calls · {{ row.web_searches }} web searches · {{ row.reasoning_tokens }} reasoning tokens{% if row.unknown_usage_calls %} · {{ row.unknown_usage_calls }} calls with unknown usage{% endif %}</small></span><span>{{ row.total_tokens }} known tokens<br>{% if row.estimated_cost_microusd is not none %}${{ '%.6f'|format(row.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span></div>
     {% else %}<p class="empty">No usage for this period.</p>{% endfor %}
   </div>
   {% endfor %}
@@ -20,6 +23,7 @@
       <span>
         <strong>{{ call.model }}</strong>
         <small>{{ call.created_at.strftime('%Y-%m-%d %H:%M') }} · {{ call.status }}{% if call.error_category %} · {{ call.error_category }}{% endif %}</small>
+        {% if call.termination_reason %}<small>{{ call.termination_reason|replace('_', ' ') }}{% if call.model_round %} · round {{ call.model_round }} of {{ call.configured_model_rounds }}{% endif %}{% if call.configured_agent_seconds is not none %} · {{ call.configured_agent_seconds }}s overall deadline{% endif %}</small>{% endif %}
         {% if call.status == 'failed' %}
         <details>
           <summary>Safe diagnostic details</summary>
@@ -34,7 +38,7 @@
         </details>
         {% endif %}
       </span>
-      <span>{{ call.total_tokens }} tokens<br>{% if call.estimated_cost_microusd is not none %}${{ '%.6f'|format(call.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span>
+      <span>{% if call.usage_reported %}{{ call.total_tokens }} tokens{% else %}Usage unknown{% endif %}<br>{% if call.estimated_cost_microusd is not none %}${{ '%.6f'|format(call.estimated_cost_microusd / 1000000) }}{% else %}—{% endif %}</span>
     </div>
     {% else %}<p class="empty">No OpenAI calls have been recorded.</p>{% endfor %}
   </div>

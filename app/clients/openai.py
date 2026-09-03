@@ -34,7 +34,7 @@ class OpenAIResponsesClient:
     def __init__(self, settings: Settings, *, client: Any | None = None) -> None:
         self.model = settings.openai_model
         self.reasoning_effort = settings.openai_reasoning_effort
-        self.max_tool_calls = settings.max_agent_steps
+        self.max_tool_calls = settings.openai_max_tool_calls
         self.max_output_tokens = settings.openai_max_output_tokens
         self._owns_client = client is None
         self._client = client
@@ -88,7 +88,7 @@ class OpenAIResponsesClient:
             "input": input_items,
             "instructions": instructions,
             "tools": request_tools,
-            "tool_choice": "auto",
+            "tool_choice": "auto" if request_tools else "none",
             "parallel_tool_calls": False,
             "store": False,
             "include": include,
@@ -199,6 +199,12 @@ def response_usage(response: Any, *, web_search_context: str | None = None) -> U
     input_tokens = _integer(_value(usage, "input_tokens", 0))
     output_tokens = _integer(_value(usage, "output_tokens", 0))
     return UsageValues(
+        reported=all(
+            isinstance(_value(usage, name, None), int)
+            and not isinstance(_value(usage, name, None), bool)
+            and _value(usage, name, -1) >= 0
+            for name in ("input_tokens", "output_tokens")
+        ),
         input_tokens=input_tokens,
         cached_input_tokens=_integer(_value(input_details, "cached_tokens", 0)),
         cache_write_tokens=_integer(_value(input_details, "cache_write_tokens", 0)),

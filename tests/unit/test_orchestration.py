@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from app.config import Settings
 from app.db.models import (
     Base,
     Conversation,
+    DownloadJob,
     EvidenceReference,
     OpenAICall,
     OpenAIToolCall,
@@ -25,6 +27,7 @@ from app.db.models import (
 )
 from app.services.confirmation import confirmation_decision
 from app.services.orchestration import InvalidProposalError, OrchestrationService
+from app.services.orchestration_budget import current_attempt
 from app.tools.registry import ToolDefinition, ToolRegistry
 
 
@@ -155,13 +158,15 @@ def _canonical_track() -> dict[str, object]:
 
 
 def settings(tmp_path: Path, **overrides: object) -> Settings:
+    values: dict[str, object] = {"max_agent_steps": 6, "max_agent_seconds": 20}
+    if "max_model_rounds" in overrides:
+        values.pop("max_agent_steps")
+    values.update(overrides)
     return Settings(
         environment="test",
         music_path=tmp_path / "music",
         database_path=tmp_path / "test.db",
-        max_agent_steps=6,
-        max_agent_seconds=20,
-        **overrides,
+        **values,
     )
 
 
@@ -232,7 +237,336 @@ async def test_serial_tool_loop_replays_output_and_accounts_usage(tmp_path: Path
     assert sum(item.get("type") == "function_call_output" for item in second_input) == 2
     assert len(str(fake.calls[0]["safety_identifier"])) == 64
     assert fake.calls[0]["prompt_cache_key"] == fake.calls[1]["prompt_cache_key"]
-    assert fake.calls[0]["max_tool_calls"] == 6
+    assert fake.calls[0]["max_tool_calls"] == 10
+
+
+def _tool_response(query: str, identifier: str = "call") -> dict[str, object]:
+    return response(
+        [
+            {
+                "type": "function_call",
+                "call_id": identifier,
+                "name": "search_test",
+                "arguments": json.dumps({"query": query}),
+            }
+        ]
+    )
+
+
+def _search_registry(factory: sessionmaker[Session]) -> ToolRegistry:
+    registry = ToolRegistry(factory)
+
+    async def search(arguments: dict[str, Any]) -> dict[str, object]:
+        return {"items": [arguments["query"]]}
+
+    registry.register(
+        ToolDefinition(
+            name="search_test",
+            description="Bounded fake search",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            handler=search,
+        )
+    )
+    return registry
+
+
+@pytest.mark.asyncio
+async def test_fifty_rounds_keep_legitimate_progress_and_reserve_final_synthesis(
+    tmp_path: Path,
+) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    fake = FakeOpenAI(
+        [_tool_response(f"distinct track {index}", f"call_{index}") for index in range(49)]
+        + [response([], proposal(tracks=[track()]))]
+    )
+    service = OrchestrationService(
+        settings(tmp_path, max_agent_steps=50, openai_max_tool_calls=3),
+        factory,
+        _search_registry(factory),
+        openai_client=fake,
+    )
+    await service.run_request(request_id)
+    assert len(fake.calls) == 50
+    assert all(call["tools"] for call in fake.calls[:-1])
+    assert fake.calls[-1]["tools"] == []
+    assert fake.calls[-1]["enable_web_search"] is False
+    assert "FINAL SYNTHESIS" in fake.calls[-1]["instructions"]
+    assert all(call["max_tool_calls"] == 3 for call in fake.calls)
+    with factory() as session:
+        request = session.get(Request, request_id)
+        calls = list(session.scalars(select(OpenAICall).order_by(OpenAICall.created_at)))
+    assert request.model_rounds_used == 50
+    assert request.configured_model_rounds == 50
+    assert request.configured_agent_seconds == 20
+    assert request.termination_reason == "forced_final_synthesis"
+    assert len(calls) == 50
+    assert sum(call.total_tokens for call in calls) == 750
+    assert [call.model_round for call in calls] == list(range(1, 51))
+    assert {call.owner_user_id for call in calls} == {request.user_id}
+    assert {call.orchestration_attempt_id for call in calls} == {request.orchestration_attempt_id}
+    assert all(call.usage_reported for call in calls)
+    assert all(call.configured_agent_seconds == 20 for call in calls)
+    assert calls[-1].phase == "final_synthesis"
+
+
+@pytest.mark.asyncio
+async def test_one_round_is_immediately_tool_free(tmp_path: Path) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    fake = FakeOpenAI([response([], proposal(tracks=[track()]))])
+    service = OrchestrationService(
+        settings(tmp_path, max_model_rounds=1),
+        factory,
+        _search_registry(factory),
+        openai_client=fake,
+    )
+    await service.run_request(request_id)
+    assert len(fake.calls) == 1 and fake.calls[0]["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_repair_cannot_escape_final_round_budget(tmp_path: Path) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    fake = FakeOpenAI([response([], "not-json"), response([], proposal(tracks=[track()]))])
+    service = OrchestrationService(
+        settings(tmp_path, max_model_rounds=1), factory, ToolRegistry(factory), openai_client=fake
+    )
+    await service.run_request(request_id)
+    assert len(fake.calls) == 1
+    with factory() as session:
+        request = session.get(Request, request_id)
+    assert request.status == "incomplete"
+    assert request.termination_reason == "model_round_exhaustion"
+
+
+@pytest.mark.asyncio
+async def test_web_recovery_consumes_a_real_reserved_round(tmp_path: Path) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    fake = FakeOpenAI(
+        [
+            response([], proposal()),
+            UnsupportedWebError("web search is unsupported by this model"),
+            response([], proposal()),
+        ]
+    )
+    service = OrchestrationService(
+        settings(tmp_path, max_model_rounds=3, openai_web_search_enabled=True),
+        factory,
+        ToolRegistry(factory),
+        openai_client=fake,
+    )
+    await service.run_request(request_id)
+    assert [call["enable_web_search"] for call in fake.calls] == [False, True, False]
+    assert fake.calls[-1]["tools"] == []
+    with factory() as session:
+        request = session.get(Request, request_id)
+        calls = list(session.scalars(select(OpenAICall).order_by(OpenAICall.created_at)))
+    assert request.model_rounds_used == 3
+    assert [call.model_round for call in calls] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_equivalent_repeated_calls_force_bounded_synthesis(tmp_path: Path) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    fake = FakeOpenAI(
+        [
+            _tool_response("trip hop", "one"),
+            _tool_response(" Trip   Hop ", "two"),
+            _tool_response("TRIP HOP", "three"),
+            response([], proposal(tracks=[track()])),
+        ]
+    )
+    service = OrchestrationService(
+        settings(tmp_path, max_model_rounds=50),
+        factory,
+        _search_registry(factory),
+        openai_client=fake,
+    )
+    await service.run_request(request_id)
+    assert len(fake.calls) == 4 and fake.calls[-1]["tools"] == []
+    with factory() as session:
+        assert session.get(Request, request_id).termination_reason == "no_progress_synthesis"
+
+
+@pytest.mark.asyncio
+async def test_new_evidence_later_in_same_turn_resets_no_progress(tmp_path: Path) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    repeated = _tool_response("trip hop", "three")
+    enriched = _tool_response("different recording", "four")
+    fake = FakeOpenAI(
+        [
+            _tool_response("trip hop", "one"),
+            _tool_response("trip hop", "two"),
+            response([*repeated["output"], *enriched["output"]]),
+            response([], proposal(tracks=[track()])),
+        ]
+    )
+    service = OrchestrationService(
+        settings(tmp_path, max_model_rounds=50),
+        factory,
+        _search_registry(factory),
+        openai_client=fake,
+    )
+    await service.run_request(request_id)
+    assert len(fake.calls) == 4 and fake.calls[-1]["tools"]
+    with factory() as session:
+        assert session.get(Request, request_id).termination_reason == "normal_synthesis"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["provider", "malformed", "unexpected_tool", "empty"])
+async def test_strong_partial_results_survive_final_round_failure(
+    tmp_path: Path, failure: str
+) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    with factory.begin() as session:
+        session.get(Request, request_id).requested_count = 5
+    final: dict[str, object] | Exception = {
+        "provider": RuntimeError("provider failed"),
+        "malformed": response([], "not json"),
+        "unexpected_tool": _tool_response("must never execute"),
+        "empty": response([], proposal()),
+    }[failure]
+    fake = FakeOpenAI([response([], proposal(tracks=[track()], exhausted=False)), final])
+    service = OrchestrationService(
+        settings(tmp_path, max_model_rounds=2),
+        factory,
+        _search_registry(factory),
+        openai_client=fake,
+    )
+    await service.run_request(request_id)
+    with factory() as session:
+        request = session.get(Request, request_id)
+        tracks = list(
+            session.scalars(select(RequestTrack).where(RequestTrack.request_id == request_id))
+        )
+        calls = list(session.scalars(select(OpenAICall)))
+        assert list(session.scalars(select(OpenAIToolCall))) == []
+    assert len(fake.calls) == 2
+    assert request.status == "degraded"
+    assert request.discovered_count == 1
+    assert tracks[0].title == "Teardrop"
+    assert request.termination_reason in {
+        "provider_failure",
+        "model_round_exhaustion",
+        "forced_final_synthesis",
+    }
+    assert calls[0].total_tokens == 15
+    assert calls[0].usage_reported is True
+
+
+@pytest.mark.asyncio
+async def test_wall_deadline_preserves_partial_and_finalizes_cancelled_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    with factory.begin() as session:
+        session.get(Request, request_id).requested_count = 5
+
+    class SlowAfterPartial(FakeOpenAI):
+        async def create_response(self, **kwargs: object) -> dict[str, object]:
+            if self.calls:
+                self.calls.append(kwargs)
+                await asyncio.Event().wait()
+            return await super().create_response(**kwargs)
+
+    original_timeout = asyncio.timeout_at
+    monkeypatch.setattr(
+        "app.services.orchestration.asyncio.timeout_at",
+        lambda _deadline: original_timeout(asyncio.get_running_loop().time() + 0.02),
+    )
+    fake = SlowAfterPartial([response([], proposal(tracks=[track()], exhausted=False))])
+    service = OrchestrationService(
+        settings(tmp_path), factory, ToolRegistry(factory), openai_client=fake
+    )
+    await service.run_request(request_id)
+    with factory() as session:
+        request = session.get(Request, request_id)
+        calls = list(session.scalars(select(OpenAICall).order_by(OpenAICall.created_at)))
+    assert request.status == "degraded" and request.discovered_count == 1
+    assert request.termination_reason == "wall_time_exhaustion"
+    assert [call.status for call in calls] == ["completed", "failed"]
+    assert calls[1].usage_reported is False
+    assert calls[1].estimated_cost_microusd is None
+    assert current_attempt.get() is None
+
+
+@pytest.mark.asyncio
+async def test_lost_request_lease_prevents_next_paid_call_and_stale_publication(
+    tmp_path: Path,
+) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    registry = ToolRegistry(factory)
+
+    async def take_lease(_arguments: dict[str, Any]) -> dict[str, object]:
+        with factory.begin() as session:
+            session.get(Request, request_id).lease_token = "new-owner-token"  # noqa: S105 - fixture
+        return {"items": ["one"]}
+
+    registry.register(
+        ToolDefinition(
+            name="search_test",
+            description="Lease race fixture",
+            parameters={"type": "object", "properties": {}},
+            handler=take_lease,
+        )
+    )
+    fake = FakeOpenAI([_tool_response("one"), response([], proposal(tracks=[track()]))])
+    service = OrchestrationService(settings(tmp_path), factory, registry, openai_client=fake)
+    await service.run_request(request_id)
+    with factory() as session:
+        request = session.get(Request, request_id)
+        assert session.scalar(select(RequestTrack)) is None
+    assert len(fake.calls) == 1
+    assert request.status == "orchestrating"
+    assert request.lease_token == "new-owner-token"  # noqa: S105 - inert fencing fixture
+    assert request.termination_reason is None
+
+
+def test_ai_matcher_rejects_cross_request_job_ownership(tmp_path: Path) -> None:
+    factory = database()
+    request_id = request_row(factory)
+    with factory.begin() as session:
+        source = session.get(Request, request_id)
+        other = Request(
+            user_id=source.user_id,
+            conversation_id=source.conversation_id,
+            raw_text="other",
+            action="find",
+            idempotency_key="another-request",
+        )
+        session.add(other)
+        session.flush()
+        item = RequestTrack(request_id=request_id, ordinal=1, artist="Artist", title="Title")
+        session.add(item)
+        session.flush()
+        job = DownloadJob(
+            request_track_id=item.id, approved_snapshot_json="{}", dedup_key="fixture"
+        )
+        session.add(job)
+        session.flush()
+        other_id, job_id = other.id, job.id
+    service = OrchestrationService(
+        settings(tmp_path), factory, ToolRegistry(factory), openai_client=FakeOpenAI([])
+    )
+    assert service._validated_match_request({"job_id": job_id}) == request_id
+    with pytest.raises(ValueError, match="do not agree"):
+        service._validated_match_request({"job_id": job_id, "request_id": other_id})
+    with pytest.raises(ValueError, match="does not exist"):
+        service._validated_match_request({"request_id": "missing"})
 
 
 @pytest.mark.asyncio
@@ -717,7 +1051,6 @@ async def test_source_selector_accepts_only_supplied_ids_and_omits_urls(
     result = await service.select_source(
         {
             "request_id": request_id,
-            "job_id": "job_1",
             "intent": {
                 "artist": "Artist",
                 "title": "Song",
@@ -776,7 +1109,6 @@ async def test_v2_source_matcher_returns_only_finite_id_and_separates_uploader(
         {
             "schema_version": 2,
             "request_id": request_id,
-            "job_id": "job_1",
             "intent": {
                 "artist": "Coldplay",
                 "title": "Yellow",
@@ -855,7 +1187,6 @@ async def test_v2_source_matcher_rejects_model_invented_candidate_id(tmp_path: P
         await service.select_source(
             {
                 "schema_version": 2,
-                "job_id": "job_1",
                 "intent": {"artist": "Coldplay", "title": "Yellow"},
                 "candidates": [
                     {
@@ -916,7 +1247,6 @@ async def test_canonical_matcher_selects_only_supplied_recording_and_release_ids
         {
             "schema_version": 2,
             "request_id": request_id,
-            "job_id": "job_1",
             "intent": {
                 "artist": "Coldplay",
                 "title": "Yellow",
@@ -1006,7 +1336,6 @@ async def test_canonical_matcher_rejects_inconsistent_recording_release_pair(
     )
     payload = {
         "schema_version": 2,
-        "job_id": "job_1",
         "intent": {"artist": "Artist", "title": "Song"},
         "recording_candidates": [
             {

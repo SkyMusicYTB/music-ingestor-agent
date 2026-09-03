@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Account · Music Agent{% endblock %}
+{% block live_page %}account{% endblock %}
+{% block content %}
+<section>
+  <p class="eyebrow">Your local account</p>
+  <h1>Account</h1>
+  <dl class="settings-list">
+    <div><dt>Username</dt><dd>{{ account.username }}</dd></div>
+    <div><dt>Role</dt><dd>{{ account.role|title }}</dd></div>
+    <div><dt>Status</dt><dd>{{ 'Active' if account.is_active else 'Disabled' }}</dd></div>
+    <div><dt>Last sign-in</dt><dd>{{ account.last_login_at or 'Not recorded' }}</dd></div>
+    <div><dt>Password changed</dt><dd>{{ account.password_changed_at or 'Not recorded' }}</dd></div>
+  </dl>
+  <p>All users share the music library. Your requests, downloads and usage are private to your account.</p>
+  <div class="action-row">
+    <a href="/account/change-password">Change password</a>
+    <form data-account-action="revoke-other-sessions" class="stack">
+      <button type="submit" class="secondary">Sign out all other sessions</button>
+      <p class="form-error" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+</section>
+{% include "account_dialogs.html" %}
+<script type="module" src="{{ asset_url('accounts.js') }}"></script>
+{% endblock %}

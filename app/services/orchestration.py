@@ -34,7 +34,8 @@ from app.clients.openai import (
     source_selection_format,
 )
 from app.config import Settings
-from app.db.models import Event, OpenAICall, Request
+from app.db.models import DownloadJob, OpenAICall, Request, RequestTrack
+from app.repositories.events import make_event
 from app.repositories.usage import OpenAIUsageRepository
 from app.schemas import MusicProposal, ProposalTrack, StrictModel
 from app.services.conversations import ConversationService, OrchestrationContext
@@ -46,6 +47,11 @@ from app.services.duplicates import (
     versions_compatible,
 )
 from app.services.metadata_matching import normalize_text
+from app.services.orchestration_budget import (
+    DiscoveryAttempt,
+    NoProgressDetector,
+    current_attempt,
+)
 from app.services.proposals import (
     ProposalLeaseLost,
     ProposalService,
@@ -169,13 +175,34 @@ class OrchestrationService:
         lease_token = self._claim(request_id)
         if lease_token is None:
             return
+        attempt = DiscoveryAttempt(
+            request_id=request_id,
+            attempt_id=str(uuid.uuid4()),
+            lease_token=lease_token,
+            deadline=time.monotonic() + self._settings.max_agent_seconds,
+        )
+        context_token = current_attempt.set(attempt)
+        with self._session_factory.begin() as session:
+            session.execute(
+                update(Request)
+                .where(Request.id == request_id, Request.lease_token == lease_token)
+                .values(
+                    orchestration_attempt_id=attempt.attempt_id,
+                    model_rounds_used=0,
+                    configured_model_rounds=self._settings.max_model_rounds,
+                    configured_tool_calls=self._settings.openai_max_tool_calls,
+                    configured_agent_seconds=self._settings.max_agent_seconds,
+                    termination_reason=None,
+                )
+            )
         heartbeat = asyncio.create_task(
-            self._renew_request_lease(request_id, lease_token),
+            self._renew_request_lease(request_id, lease_token, asyncio.current_task(), attempt),
             name=f"orchestration-lease-{request_id}",
         )
         try:
             configured = getattr(self._openai, "configured", True)
             if not configured:
+                attempt.termination_reason = "provider_failure"
                 self._mark_terminal(
                     request_id,
                     lease_token,
@@ -186,8 +213,12 @@ class OrchestrationService:
                 return
             context = self._conversations.orchestration_context(request_id)
             with media_tool_authorization(context.user_id, context.request_id):
-                async with asyncio.timeout(self._settings.max_agent_seconds):
+                # One deadline owner; reserve at most one second for bounded
+                # local persistence after a provider/tool timeout.
+                async with asyncio.timeout_at(attempt.deadline - 1.0):
                     proposal, degraded_reason, verified_metadata = await self._run_loop(context)
+            self._assert_request_lease(attempt)
+            attempt.termination_reason = attempt.termination_reason or "normal_synthesis"
             self._proposals.store(
                 request_id,
                 proposal,
@@ -197,10 +228,17 @@ class OrchestrationService:
                 verified_metadata=verified_metadata,
             )
         except asyncio.CancelledError:
+            attempt.termination_reason = "lease_lost" if attempt.lease_lost else "cancelled"
+            if attempt.lease_lost:
+                return
             raise
         except ProposalLeaseLost:
+            attempt.termination_reason = "lease_lost"
             return
         except TimeoutError:
+            attempt.termination_reason = "wall_time_exhaustion"
+            if self._store_partial(attempt):
+                return
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -209,6 +247,7 @@ class OrchestrationService:
                 error_message="Music discovery exceeded its time limit.",
             )
         except OpenAINotConfigured:
+            attempt.termination_reason = "provider_failure"
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -217,6 +256,7 @@ class OrchestrationService:
                 error_message="OpenAI API key is not configured.",
             )
         except ModelRefusalError:
+            attempt.termination_reason = "refused"
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -225,6 +265,9 @@ class OrchestrationService:
                 error_message="The model declined this request.",
             )
         except ModelIncompleteError as error:
+            attempt.termination_reason = attempt.termination_reason or "malformed_response"
+            if self._store_partial(attempt):
+                return
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -233,6 +276,9 @@ class OrchestrationService:
                 error_message=f"The model response was incomplete ({error}).",
             )
         except InvalidProposalError:
+            attempt.termination_reason = attempt.termination_reason or "malformed_response"
+            if self._store_partial(attempt):
+                return
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -241,6 +287,9 @@ class OrchestrationService:
                 error_message="The model did not return a valid music proposal.",
             )
         except ProviderRequestError as error:
+            attempt.termination_reason = "provider_failure"
+            if self._store_partial(attempt):
+                return
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -249,6 +298,9 @@ class OrchestrationService:
                 error_message=_user_provider_error(error.code),
             )
         except OrchestrationError as error:
+            attempt.termination_reason = "model_round_exhaustion"
+            if self._store_partial(attempt):
+                return
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -257,6 +309,9 @@ class OrchestrationService:
                 error_message=str(error)[:500],
             )
         except Exception as error:
+            attempt.termination_reason = "provider_failure"
+            if self._store_partial(attempt):
+                return
             self._mark_terminal(
                 request_id,
                 lease_token,
@@ -265,9 +320,67 @@ class OrchestrationService:
                 error_message=_safe_failure(error),
             )
         finally:
-            heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat
+            try:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+                self._finish_attempt(attempt)
+            finally:
+                current_attempt.reset(context_token)
+
+    def _store_partial(self, attempt: DiscoveryAttempt) -> bool:
+        if attempt.partial is None or not attempt.partial.tracks or attempt.lease_lost:
+            return False
+        try:
+            self._assert_request_lease(attempt)
+            self._proposals.store(
+                attempt.request_id,
+                attempt.partial,
+                status_override="degraded",
+                expected_lease_token=attempt.lease_token,
+                warning_code=attempt.termination_reason or "model_round_exhaustion",
+                verified_metadata=attempt.verified,
+            )
+        except ProposalLeaseLost:
+            attempt.termination_reason = "lease_lost"
+            return False
+        return True
+
+    def _finish_attempt(self, attempt: DiscoveryAttempt) -> None:
+        with self._session_factory.begin() as session:
+            request = session.get(Request, attempt.request_id)
+            if (
+                request is not None
+                and request.orchestration_attempt_id == attempt.attempt_id
+                and (
+                    request.lease_token == attempt.lease_token
+                    or (request.lease_token is None and request.status != "orchestrating")
+                )
+            ):
+                request.model_rounds_used = attempt.rounds_used
+                request.termination_reason = attempt.termination_reason
+                if request.status == "degraded" and attempt.partial is not None:
+                    request.error_message = (
+                        f"Discovery retained {request.discovered_count} validated candidates; "
+                        "the full request could not be completed within its discovery limits."
+                    )
+            session.execute(
+                update(OpenAICall)
+                .where(OpenAICall.orchestration_attempt_id == attempt.attempt_id)
+                .values(termination_reason=attempt.termination_reason)
+            )
+
+    def _assert_request_lease(self, attempt: DiscoveryAttempt) -> None:
+        with self._session_factory() as session:
+            request = session.get(Request, attempt.request_id)
+            if (
+                attempt.lease_lost
+                or request is None
+                or request.lease_token != attempt.lease_token
+                or request.status != "orchestrating"
+            ):
+                attempt.lease_lost = True
+                raise ProposalLeaseLost(attempt.request_id)
 
     async def select_source(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Choose only a supplied finite ID; schema v1 remains wire-compatible."""
@@ -277,7 +390,7 @@ class OrchestrationService:
         if payload.get("schema_version") == 2:
             return await self._select_source_v2(payload)
         sanitized, identifiers = _source_selection_input(payload, self._settings)
-        request_id = self._existing_request_id(payload.get("request_id"))
+        request_id = self._validated_match_request(payload)
         safety_seed = str(
             payload.get("job_id") or payload.get("request_id") or _stable_json_hash(sanitized)
         )
@@ -352,7 +465,7 @@ class OrchestrationService:
 
     async def _select_source_v2(self, payload: Mapping[str, object]) -> dict[str, object]:
         sanitized, identifiers = _source_match_input(payload, self._settings)
-        request_id = self._existing_request_id(payload.get("request_id"))
+        request_id = self._validated_match_request(payload)
         safety_seed = str(
             payload.get("job_id") or payload.get("request_id") or _stable_json_hash(sanitized)
         )
@@ -409,7 +522,7 @@ class OrchestrationService:
         if not getattr(self._openai, "configured", True):
             raise OpenAINotConfigured("OpenAI API key is not configured")
         sanitized, recording_ids, release_ids = _canonical_match_input(payload, self._settings)
-        request_id = self._existing_request_id(payload.get("request_id"))
+        request_id = self._validated_match_request(payload)
         safety_seed = str(
             payload.get("job_id") or payload.get("request_id") or _stable_json_hash(sanitized)
         )
@@ -504,14 +617,27 @@ class OrchestrationService:
         collected: dict[str, ProposalTrack] = {}
         verified_metadata: dict[str, VerifiedMetadata] = {}
         canonical_candidates: dict[str, VerifiedMetadata] = {}
+        attempt = current_attempt.get()
+        if attempt is not None:
+            attempt.verified = verified_metadata
+        no_progress = NoProgressDetector()
+        force_synthesis: str | None = None
+        web_recovery = False
         safety_identifier = _safety_identifier("request", context.user_id, context.request_id)
         prompt_cache_key = _prompt_cache_key(
             self._openai.model, context.prompt_version, self._instructions
         )
 
-        for _step in range(self._settings.max_agent_steps):
-            requested_web = enable_web_search_next
-            recovery_without_web = False
+        for step in range(self._settings.max_model_rounds):
+            if step == self._settings.max_model_rounds - 1:
+                force_synthesis = force_synthesis or "forced_final_synthesis"
+            if attempt is not None and attempt.remaining_seconds <= min(
+                15.0, self._settings.max_agent_seconds / 5
+            ):
+                force_synthesis = force_synthesis or "forced_final_synthesis"
+            synthesis_only = force_synthesis is not None
+            requested_web = enable_web_search_next and not synthesis_only
+            recovery_without_web = web_recovery
             try:
                 response, call_id = await self._call_model(
                     request_id=context.request_id,
@@ -520,6 +646,8 @@ class OrchestrationService:
                     enable_web_search=requested_web,
                     safety_identifier=safety_identifier,
                     prompt_cache_key=prompt_cache_key,
+                    tools_enabled=not synthesis_only,
+                    synthesis_reason=force_synthesis,
                 )
             except ProviderRequestError as error:
                 if not requested_web or not error.web_search_unsupported:
@@ -528,7 +656,8 @@ class OrchestrationService:
                 # non-web, no-function response. It cannot create a retry loop.
                 web_fallback_used = True
                 degraded_reason = "web_search_unsupported"
-                recovery_without_web = True
+                web_recovery = True
+                force_synthesis = "forced_final_synthesis"
                 input_items.append(
                     {
                         "role": "user",
@@ -543,15 +672,9 @@ class OrchestrationService:
                         ],
                     }
                 )
-                response, call_id = await self._call_model(
-                    request_id=context.request_id,
-                    prompt_version=context.prompt_version,
-                    input_items=input_items,
-                    enable_web_search=False,
-                    safety_identifier=safety_identifier,
-                    prompt_cache_key=prompt_cache_key,
-                    tools_enabled=False,
-                )
+                # Recovery consumes the next real round; it never escapes the
+                # configured budget through a nested Responses request.
+                continue
             enable_web_search_next = False
             if requested_web:
                 web_fallback_used = True
@@ -566,12 +689,14 @@ class OrchestrationService:
             input_items.extend(output_items)
             calls = response_function_calls(response)
             if calls:
-                if recovery_without_web:
+                if synthesis_only:
                     if fallback_base is not None:
                         return fallback_base, degraded_reason, verified_metadata
                     unexpected_tool_error = InvalidProposalError(
-                        "web recovery attempted a tool call"
+                        "final synthesis attempted a tool call"
                     )
+                    if attempt is not None:
+                        attempt.termination_reason = "model_round_exhaustion"
                     self._fail_completed_call(
                         call_id,
                         error=unexpected_tool_error,
@@ -581,6 +706,8 @@ class OrchestrationService:
                     )
                     raise unexpected_tool_error
                 for call in calls:
+                    if attempt is not None:
+                        self._assert_request_lease(attempt)
                     execution = await self._tools.execute(call.name, call.arguments)
                     self._record_tool_call(call_id, call.call_id, execution)
                     _collect_verified_metadata(
@@ -588,6 +715,7 @@ class OrchestrationService:
                         verified_metadata,
                         canonical_candidates,
                     )
+                    no_progress.observe(execution, round_number=step + 1)
                     input_items.append(
                         {
                             "type": "function_call_output",
@@ -595,6 +723,10 @@ class OrchestrationService:
                             "output": execution.output,
                         }
                     )
+                # Evaluate the whole turn: a later result in this response may
+                # enrich the evidence and reset an earlier repeated result.
+                if no_progress.consecutive_repeats >= no_progress.threshold:
+                    force_synthesis = "no_progress_synthesis"
                 continue
 
             try:
@@ -631,12 +763,21 @@ class OrchestrationService:
                 continue
 
             if proposal.clarification:
+                if attempt is not None:
+                    attempt.termination_reason = force_synthesis or "normal_synthesis"
+                    if attempt.partial is not None and attempt.partial.tracks:
+                        return attempt.partial, "partial_discovery", verified_metadata
                 return proposal, degraded_reason, verified_metadata
             for track in proposal.tracks:
                 if len(collected) >= self._settings.max_candidates_per_request:
                     break
-                collected.setdefault(_proposal_identity(track, verified_metadata), track)
+                identity = _proposal_identity(track, verified_metadata)
+                previous = collected.get(identity)
+                if previous is None or track.confidence > previous.confidence:
+                    collected[identity] = track
             merged = proposal.model_copy(update={"tracks": list(collected.values())})
+            if attempt is not None:
+                attempt.partial = merged
             await self._resolve_borderline_exact_match(
                 context,
                 merged,
@@ -648,6 +789,8 @@ class OrchestrationService:
             )
 
             if recovery_without_web:
+                if attempt is not None:
+                    attempt.termination_reason = force_synthesis or "forced_final_synthesis"
                 return merged, degraded_reason, verified_metadata
             if (
                 oversample_target is not None
@@ -660,6 +803,7 @@ class OrchestrationService:
                 )
                 and not proposal.exhausted
                 and replenishment_rounds < 3
+                and not synthesis_only
             ):
                 replenishment_rounds += 1
                 additional_needed = max(
@@ -688,6 +832,7 @@ class OrchestrationService:
                 not merged.tracks
                 and self._settings.openai_web_search_enabled
                 and not web_fallback_used
+                and not synthesis_only
             ):
                 fallback_base = merged
                 input_items.append(
@@ -709,6 +854,12 @@ class OrchestrationService:
                 continue
             if web_fallback_used and not merged.tracks:
                 degraded_reason = degraded_reason or "web_search_exhausted"
+            if context.requested_count is not None and available_count < context.requested_count:
+                degraded_reason = degraded_reason or (
+                    "partial_discovery" if merged.tracks else None
+                )
+            if attempt is not None:
+                attempt.termination_reason = force_synthesis or "normal_synthesis"
             return merged, degraded_reason, verified_metadata
         raise OrchestrationError("Music discovery reached its configured step limit.")
 
@@ -881,17 +1032,39 @@ class OrchestrationService:
         safety_identifier: str,
         prompt_cache_key: str,
         tools_enabled: bool = True,
+        synthesis_reason: str | None = None,
     ) -> tuple[Any, str]:
+        attempt = current_attempt.get()
+        if attempt is not None:
+            self._assert_request_lease(attempt)
+            if request_id != attempt.request_id:
+                raise ValueError("OpenAI call cannot change the active request owner")
+            if attempt.rounds_used >= self._settings.max_model_rounds:
+                raise OrchestrationError(
+                    "Music discovery reached its configured model-round limit."
+                )
+            attempt.rounds_used += 1
+            if synthesis_reason is not None:
+                attempt.termination_reason = synthesis_reason
+        instructions = self._instructions
+        if synthesis_reason is not None:
+            instructions += (
+                "\n\nFINAL SYNTHESIS: Tools are unavailable. Return the required strict proposal "
+                "using only evidence already gathered. Preserve strong candidates even when fewer "
+                "than requested; explain the shortfall briefly. Never invent missing tracks, IDs, "
+                "or evidence. This is the final available discovery phase."
+            )
         return await self._accounted_response(
             request_id=request_id,
             prompt_version=prompt_version,
-            instructions=self._instructions,
+            instructions=instructions,
             input_items=input_items,
             tools=self._tools.openai_tools() if tools_enabled else [],
             enable_web_search=enable_web_search,
             safety_identifier=safety_identifier,
             prompt_cache_key=prompt_cache_key,
             text_format=None,
+            phase="final_synthesis" if synthesis_reason else "discovery",
         )
 
     async def _accounted_response(
@@ -906,8 +1079,14 @@ class OrchestrationService:
         safety_identifier: str,
         prompt_cache_key: str,
         text_format: Mapping[str, Any] | None,
+        phase: str | None = None,
     ) -> tuple[Any, str]:
-        call_id = self._start_call(request_id, prompt_version, instructions)
+        attempt = current_attempt.get()
+        if attempt is not None:
+            self._assert_request_lease(attempt)
+            if request_id != attempt.request_id:
+                raise ValueError("OpenAI call cannot change the active request owner")
+        call_id = self._start_call(request_id, prompt_version, instructions, phase=phase)
         started = time.monotonic()
         try:
             response = await self._openai.create_response(
@@ -919,8 +1098,18 @@ class OrchestrationService:
                 safety_identifier=safety_identifier,
                 prompt_cache_key=prompt_cache_key,
                 text_format=text_format,
-                max_tool_calls=self._settings.max_agent_steps,
+                max_tool_calls=self._settings.openai_max_tool_calls,
             )
+        except asyncio.CancelledError as error:
+            timed_out = attempt is not None and attempt.remaining_seconds <= 1.1
+            self._fail_call(
+                call_id,
+                latency_ms=_elapsed_ms(started),
+                error_code="openai_timeout" if timed_out else "openai_cancelled",
+                error=error,
+                failure_phase="responses_create",
+            )
+            raise
         except Exception as error:
             error_code = _provider_error_code(error)
             unsupported = enable_web_search and _web_search_unsupported(error)
@@ -952,7 +1141,10 @@ class OrchestrationService:
             )
         return response, call_id
 
-    def _start_call(self, request_id: str | None, prompt_version: str, instructions: str) -> str:
+    def _start_call(
+        self, request_id: str | None, prompt_version: str, instructions: str, *, phase: str | None
+    ) -> str:
+        attempt = current_attempt.get()
         with self._session_factory.begin() as session:
             row = OpenAIUsageRepository(session).start_call(
                 request_id=request_id,
@@ -960,7 +1152,26 @@ class OrchestrationService:
                 prompt_version=prompt_version,
                 prompt_hash=hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
                 pricing_snapshot=self._pricing.as_dict(),
+                orchestration_attempt_id=attempt.attempt_id if attempt is not None else None,
+                model_round=(
+                    attempt.rounds_used if attempt is not None and phase is not None else None
+                ),
+                phase=phase
+                or (
+                    "canonical_match"
+                    if prompt_version == CANONICAL_MATCH_PROMPT_VERSION
+                    else "source_match"
+                ),
+                configured_model_rounds=self._settings.max_model_rounds,
+                configured_tool_calls=self._settings.openai_max_tool_calls,
+                configured_agent_seconds=self._settings.max_agent_seconds,
             )
+            if attempt is not None:
+                session.execute(
+                    update(Request)
+                    .where(Request.id == request_id, Request.lease_token == attempt.lease_token)
+                    .values(model_rounds_used=attempt.rounds_used)
+                )
             return row.id
 
     def _fail_call(
@@ -969,7 +1180,7 @@ class OrchestrationService:
         *,
         latency_ms: int,
         error_code: str,
-        error: Exception,
+        error: BaseException,
         failure_phase: str,
     ) -> None:
         details = _provider_failure_details(error)
@@ -1083,7 +1294,8 @@ class OrchestrationService:
                     raise LookupError(request_id)
                 return None
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type="request.orchestrating",
@@ -1092,21 +1304,39 @@ class OrchestrationService:
             )
             return token
 
-    async def _renew_request_lease(self, request_id: str, lease_token: str) -> None:
+    async def _renew_request_lease(
+        self,
+        request_id: str,
+        lease_token: str,
+        owner: asyncio.Task[Any] | None,
+        attempt: DiscoveryAttempt,
+    ) -> None:
         interval = max(5.0, min(30.0, self._settings.lease_seconds / 3))
         while True:
             await asyncio.sleep(interval)
-            with self._session_factory.begin() as session:
-                request = session.get(Request, request_id)
-                if (
-                    request is None
-                    or request.status != "orchestrating"
-                    or request.lease_token != lease_token
-                ):
-                    return
-                request.lease_expires_at = datetime.now(UTC) + timedelta(
-                    seconds=self._settings.lease_seconds
-                )
+            try:
+                with self._session_factory.begin() as session:
+                    result = session.execute(
+                        update(Request)
+                        .where(
+                            Request.id == request_id,
+                            Request.status == "orchestrating",
+                            Request.lease_token == lease_token,
+                        )
+                        .values(
+                            lease_expires_at=datetime.now(UTC)
+                            + timedelta(seconds=self._settings.lease_seconds)
+                        )
+                    )
+                    owned = result.rowcount == 1
+            except Exception:
+                # Do not continue paid work if renewal cannot be proven.
+                owned = False
+            if not owned:
+                attempt.lease_lost = True
+                if owner is not None:
+                    owner.cancel()
+                return
 
     def _mark_terminal(
         self,
@@ -1129,7 +1359,8 @@ class OrchestrationService:
             request.lease_token = None
             request.lease_expires_at = None
             session.add(
-                Event(
+                make_event(
+                    session,
                     entity_type="request",
                     entity_id=request_id,
                     event_type=f"request.{status}",
@@ -1138,12 +1369,23 @@ class OrchestrationService:
                 )
             )
 
-    def _existing_request_id(self, value: object) -> str | None:
-        candidate = str(value or "")
-        if not candidate:
-            return None
+    def _validated_match_request(self, payload: Mapping[str, object]) -> str | None:
+        candidate = str(payload.get("request_id") or "")
+        job_id = str(payload.get("job_id") or "")
         with self._session_factory() as session:
-            return candidate if session.get(Request, candidate) is not None else None
+            if candidate and session.get(Request, candidate) is None:
+                raise ValueError("AI matching request does not exist")
+            if job_id:
+                job = session.get(DownloadJob, job_id)
+                track = session.get(RequestTrack, job.request_track_id) if job is not None else None
+                if track is None or (candidate and track.request_id != candidate):
+                    raise ValueError("AI matching job and request do not agree")
+                candidate = track.request_id
+            if candidate and payload.get("user_id") is not None:
+                request = session.get(Request, candidate)
+                if request is None or request.user_id != payload["user_id"]:
+                    raise ValueError("AI matching owner and request do not agree")
+            return candidate or None
 
 
 def _load_prompt(filename: str) -> str:
@@ -1733,7 +1975,7 @@ def _provider_error_code(error: Exception) -> str:
     return "openai_error"
 
 
-def _provider_failure_details(error: Exception) -> dict[str, Any]:
+def _provider_failure_details(error: BaseException) -> dict[str, Any]:
     response = getattr(error, "response", None)
     status = getattr(error, "status_code", None)
     if not isinstance(status, int) and response is not None:

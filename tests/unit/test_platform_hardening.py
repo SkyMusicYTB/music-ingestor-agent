@@ -88,7 +88,7 @@ def test_ai_thresholds_are_independent_confidence_dimensions() -> None:
 
 def test_review_javascript_targets_the_dedicated_correction_panel() -> None:
     javascript = (REPO_ROOT / "app/static/app.js").read_text(encoding="utf-8")
-    template = (REPO_ROOT / "app/templates/downloads.html").read_text(encoding="utf-8")
+    template = (REPO_ROOT / "app/templates/downloads_content.html").read_text(encoding="utf-8")
 
     assert 'querySelector("details.review-correction")' in javascript
     assert 'querySelector("details:last-of-type")' not in javascript

@@ -17,7 +17,7 @@ Usage: sudo scripts/validate.sh [--release PATH] [--pre-activate]
 
 --pre-activate validates an inactive candidate release without querying the production DB.
 --require-config-check rejects a candidate whose CLI predates the database-free preflight.
---services additionally requires the enabled web and worker units to be active.
+--services additionally waits for healthy HTTP readiness with both units active.
 EOF
 }
 
@@ -78,7 +78,7 @@ runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
     "PATH=$MUSIC_AGENT_PATH" \
     "HOME=$MUSIC_AGENT_STATE_DIR" \
     "PYTHONDONTWRITEBYTECODE=1" \
-    "$release/venv/bin/python" "$RELEASE_ACCESS_PROBE" "$release"
+    "$release/venv/bin/python" -I -B - "$release" < "$RELEASE_ACCESS_PROBE"
 cli_help="$(runuser -u "$MUSIC_AGENT_SERVICE_USER" -- env -i \
     "PATH=$MUSIC_AGENT_PATH" \
     "HOME=$MUSIC_AGENT_STATE_DIR" \
@@ -128,6 +128,7 @@ elif [[ "$require_config_check" -eq 1 ]]; then
 else
     music_agent_warn "release predates config-check; continuing compatibility validation"
 fi
+music_agent_check_readiness "$release" check
 
 for executable in yt-dlp deno; do
     link="$MUSIC_AGENT_TOOL_BIN/$executable"
@@ -203,7 +204,6 @@ if [[ "$pre_activate" -eq 0 ]]; then
 fi
 
 if [[ "$require_services" -eq 1 ]]; then
-    music_agent_systemctl is-active --quiet music-agent-web.service
-    music_agent_systemctl is-active --quiet music-agent-worker.service
+    music_agent_wait_ready "$release"
 fi
 music_agent_log "validation passed for $release (yt-dlp $yt_version, Deno $deno_version)"

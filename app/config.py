@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BeforeValidator, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BeforeValidator,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.sources.identities import ProviderIdentity
@@ -210,7 +217,18 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-5.4-mini"
     openai_reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = "low"
     openai_web_search_enabled: bool = False
-    max_agent_steps: int = Field(default=10, ge=1, le=20)
+    max_model_rounds: int = Field(default=10, ge=1, le=50)
+    legacy_max_agent_steps: int | None = Field(
+        default=None,
+        ge=1,
+        le=50,
+        validation_alias=AliasChoices("MUSIC_AGENT_MAX_AGENT_STEPS", "max_agent_steps"),
+        exclude=True,
+        repr=False,
+    )
+    # Application safety bounds, not an asserted limit of the Responses API.
+    # This controls built-in tools per response, never local tools or model rounds.
+    openai_max_tool_calls: int = Field(default=10, ge=1, le=50)
     max_agent_seconds: int = Field(default=120, ge=10, le=600)
     openai_max_output_tokens: int = Field(default=12_000, ge=1_000, le=32_000)
     max_candidates_per_request: int = Field(default=250, ge=10, le=500)
@@ -260,6 +278,30 @@ class Settings(BaseSettings):
     min_free_bytes: int = Field(default=2_147_483_648, ge=104_857_600)
     initial_scan_required: bool = True
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def resolve_model_round_budget(self) -> Settings:
+        legacy = self.legacy_max_agent_steps
+        if legacy is not None:
+            if "max_model_rounds" in self.model_fields_set and self.max_model_rounds != legacy:
+                raise ValueError(
+                    "MUSIC_AGENT_MAX_MODEL_ROUNDS and MUSIC_AGENT_MAX_AGENT_STEPS must agree"
+                )
+            # Do not mark the canonical field as explicitly configured when only
+            # the legacy input was supplied; diagnostics must retain its origin.
+            object.__setattr__(self, "max_model_rounds", legacy)
+        return self
+
+    @property
+    def max_agent_steps(self) -> int:
+        """Compatibility accessor; new Python code uses max_model_rounds."""
+        return self.max_model_rounds
+
+    @property
+    def model_rounds_configuration_source(self) -> str:
+        if self.legacy_max_agent_steps is not None:
+            return "both_agree" if "max_model_rounds" in self.model_fields_set else "legacy"
+        return "canonical" if "max_model_rounds" in self.model_fields_set else "default"
 
     @field_validator("database_path", "artwork_path", "downloads_path", "music_path", "backup_path")
     @classmethod

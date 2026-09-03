@@ -10,6 +10,7 @@ from typing import cast
 from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -18,7 +19,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 
 from app import __version__
-from app.api import auth, events, health, jobs, library, pages, requests, usage
+from app.api import accounts, auth, events, health, jobs, library, pages, requests, usage
 from app.config import Settings, get_settings
 from app.db.engine import (
     assert_database_pragmas,
@@ -174,6 +175,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     for router in (
         auth.router,
+        accounts.router,
         health.router,
         requests.router,
         jobs.router,
@@ -186,12 +188,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, error: HTTPException) -> Response:
+        if (
+            error.status_code == 403
+            and isinstance(error.detail, dict)
+            and error.detail.get("code") == "password_change_required"
+            and "text/html" in request.headers.get("accept", "")
+        ):
+            return RedirectResponse("/account/change-password", status_code=303)
         if error.status_code == status.HTTP_401_UNAUTHORIZED and "text/html" in request.headers.get(
             "accept", ""
         ):
             return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
         return JSONResponse(
             {"detail": error.detail}, status_code=error.status_code, headers=error.headers
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, error: RequestValidationError) -> Response:
+        # Pydantic's default includes the original input, including passwords.
+        return JSONResponse(
+            {
+                "detail": [
+                    {"loc": list(item["loc"]), "type": item["type"], "msg": "Invalid request value"}
+                    for item in error.errors()
+                ]
+            },
+            status_code=422,
+            headers={"Cache-Control": "no-store"},
         )
 
     return app

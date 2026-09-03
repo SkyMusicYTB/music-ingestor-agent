@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import uvicorn
 from alembic import command
 from alembic.config import Config as AlembicConfig
+from sqlalchemy import func, select
 
 from app.config import Settings
 from app.db.engine import (
@@ -17,11 +19,29 @@ from app.db.engine import (
     create_database_engine,
     make_session_factory,
 )
+from app.db.models import User
 from app.main import create_app
 from app.openai_schema import compile_openai_schema
 from app.repositories.auth import AuthRepository
 from app.schemas import MusicProposal
 from app.services.library_scan import LibraryScanner
+
+
+def assert_active_admin(settings: Settings) -> None:
+    engine = create_database_engine(settings)
+    try:
+        with make_session_factory(engine)() as session:
+            count = session.scalar(select(func.count()).select_from(User)) or 0
+            active = session.scalar(
+                select(User.id).where(User.role == "admin", User.is_active.is_(True)).limit(1)
+            )
+            if count and active is None:
+                raise RuntimeError(
+                    "No active administrator. Run music-agent admin-reset --username NAME "
+                    "--recover using local recovery before activation."
+                )
+    finally:
+        engine.dispose()
 
 
 def _alembic(settings: Settings) -> AlembicConfig:
@@ -39,6 +59,7 @@ def migrate(settings: Settings) -> None:
         assert_database_pragmas(engine)
     finally:
         engine.dispose()
+    assert_active_admin(settings)
 
 
 def validate(settings: Settings) -> None:
@@ -59,6 +80,7 @@ def validate(settings: Settings) -> None:
                 raise RuntimeError(f"required path is not readable: {path}")
     finally:
         engine.dispose()
+    assert_active_admin(settings)
     print("configuration, schema, SQLite pragmas, and paths are valid")
 
 
@@ -150,12 +172,16 @@ def config_check(
             raise RuntimeError("generic extraction is prohibited in production")
     roles = ", ".join(dict.fromkeys(candidate.service_role for candidate in validated))
     print(f"configuration and strict OpenAI schemas are valid for: {roles}")
+    print(
+        f"model={settings.openai_model}; rounds={settings.max_model_rounds}; "
+        f"built-in calls={settings.openai_max_tool_calls}; deadline={settings.max_agent_seconds}s; "
+        f"configuration={settings.model_rounds_configuration_source}"
+    )
 
 
-def admin_reset(settings: Settings) -> None:
+def admin_reset(settings: Settings, username: str | None = None, *, recover: bool = False) -> None:
     if not sys.stdin.isatty():
         raise RuntimeError("admin-reset must run from an interactive terminal")
-    username = input("Admin username: ").strip()
     password = getpass.getpass("New password (12+ characters): ")
     confirmation = getpass.getpass("Confirm password: ")
     if password != confirmation:
@@ -164,10 +190,10 @@ def admin_reset(settings: Settings) -> None:
     factory = make_session_factory(engine)
     try:
         assert_schema_current(engine)
-        AuthRepository(engine, factory, settings).reset_admin(username, password)
+        AuthRepository(engine, factory, settings).reset_admin(username, password, recover=recover)
     finally:
         engine.dispose()
-    print("admin credentials reset and all sessions revoked")
+    print("Target account credentials reset; only that account's sessions were revoked")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,7 +210,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan = commands.add_parser("scan", help="index the music library")
     scan.add_argument("--full", action="store_true")
-    commands.add_parser("admin-reset", help="reset the initial admin from a TTY")
+    reset = commands.add_parser("admin-reset", help="reset a specific administrator from a TTY")
+    reset.add_argument("--username")
+    reset.add_argument(
+        "--recover",
+        action="store_true",
+        help="explicitly recover a disabled or standard account as administrator",
+    )
+    users = commands.add_parser(
+        "user-list", help="list local account identities and roles; never password hashes"
+    )
+    users.add_argument("--json", action="store_true")
+    audit = commands.add_parser(
+        "library-audit", help="read-only comparison of media and indexed tracks"
+    )
+    audit.add_argument("--json", action="store_true")
+    audit.add_argument("--verbose", action="store_true")
+    audit.add_argument("--limit", type=int, choices=range(1, 1001), default=100, metavar="1..1000")
     commands.add_parser("web", help="run the web service")
     return parser
 
@@ -203,7 +245,39 @@ def main(argv: list[str] | None = None) -> None:
             without_runtime_credentials=args.without_runtime_credentials,
         )
     elif args.command == "admin-reset":
-        admin_reset(settings)
+        admin_reset(settings, args.username, recover=args.recover)
+    elif args.command in {"library-audit", "user-list"}:
+        engine = create_database_engine(settings, read_only=True)
+        factory = make_session_factory(engine)
+        try:
+            assert_schema_current(engine)
+            if args.command == "library-audit":
+                from app.services.library_audit import audit_library
+
+                report = audit_library(
+                    factory, settings.music_path, verbose=args.verbose, limit=args.limit
+                )
+            else:
+                with factory() as session:
+                    report = {
+                        "users": [
+                            {
+                                "id": user.id,
+                                "username": user.username,
+                                "role": user.role,
+                                "active": user.is_active,
+                                "must_change_password": user.must_change_password,
+                            }
+                            for user in session.scalars(
+                                select(User).order_by(User.username_normalized)
+                            )
+                        ]
+                    }
+            print(
+                json.dumps(report, ensure_ascii=False, indent=None if args.json else 2, default=str)
+            )
+        finally:
+            engine.dispose()
     elif args.command == "scan":
         engine = create_database_engine(settings)
         factory = make_session_factory(engine)

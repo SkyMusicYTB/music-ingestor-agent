@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 from rapidfuzz.fuzz import ratio
-from sqlalchemy import or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.db.models import Track
+from app.services.library_presence import library_presence
 
 _SAFE_SUFFIX = re.compile(
     r"\s*[\[(]\s*(?:official\s+(?:music\s+)?video|official\s+audio|lyrics?|hd|4k)\s*[\])]\s*$",
@@ -96,13 +98,14 @@ class DuplicateDetector:
         possible: Track | None = None
         for track in rows:
             if not self._still_exists(session, track):
+                if library_presence(self.music_root, track.filepath) == "unreadable":
+                    possible = possible or track
                 continue
             compatible = versions_compatible(track.version_signature, candidate.version_signature)
             if (
                 candidate.source_extractor
                 and candidate.source_id
-                and track.source_extractor == candidate.source_extractor
-                and track.source_id == candidate.source_id
+                and source_identity(track) == (candidate.source_extractor, candidate.source_id)
             ):
                 return DuplicateDecision("owned", track.id, "same validated source")
             if candidate.recording_mbid and track.recording_mbid == candidate.recording_mbid:
@@ -137,6 +140,16 @@ class DuplicateDetector:
                 (Track.source_extractor == candidate.source_extractor)
                 & (Track.source_id == candidate.source_id)
             )
+            valid_json = case(
+                (func.json_valid(Track.provenance_json) == 1, Track.provenance_json), else_="{}"
+            )
+            predicates.append(
+                (
+                    func.json_extract(valid_json, "$.source_alias.extractor")
+                    == candidate.source_extractor
+                )
+                & (func.json_extract(valid_json, "$.source_alias.id") == candidate.source_id)
+            )
         direct = list(session.scalars(select(Track).where(Track.is_present, or_(*predicates))))
         if direct:
             return direct
@@ -151,25 +164,33 @@ class DuplicateDetector:
         )
 
     def _still_exists(self, session: Session, track: Track) -> bool:
-        relative = Path(track.filepath)
-        if relative.is_absolute() or ".." in relative.parts:
+        presence = library_presence(self.music_root, track.filepath)
+        if presence in {"missing", "unsafe"}:
             track.is_present = False
-            return False
-        path = self.music_root.joinpath(relative)
-        try:
-            exists = (
-                path.is_file()
-                and not path.is_symlink()
-                and path.resolve().is_relative_to(self.music_root)
-            )
-        except OSError:
-            exists = False
-        if not exists:
-            track.is_present = False
-        return exists
+        return presence == "present"
 
     @staticmethod
     def _duration_agrees(left: float | None, right: float | None) -> bool:
         if left is None or right is None:
             return False
         return abs(left - right) <= max(4.0, max(left, right) * 0.02)
+
+
+def source_identity(track: Track) -> tuple[str | None, str | None]:
+    if track.source_extractor and track.source_id:
+        return track.source_extractor, track.source_id
+    try:
+        value = json.loads(track.provenance_json or "{}")
+    except ValueError:
+        return None, None
+    alias = value.get("source_alias") if isinstance(value, dict) else None
+    if isinstance(alias, dict):
+        extractor, source_id = alias.get("extractor"), alias.get("id")
+        if (
+            isinstance(extractor, str)
+            and isinstance(source_id, str)
+            and len(extractor) <= 40
+            and len(source_id) <= 100
+        ):
+            return extractor, source_id
+    return None, None

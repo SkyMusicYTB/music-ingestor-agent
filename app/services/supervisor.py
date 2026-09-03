@@ -16,9 +16,10 @@ from sqlalchemy import DateTime, Engine, bindparam, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
-from app.db.models import Request, RequestTrack, ScanRun, ServiceHeartbeat, ServiceTask
+from app.db.models import Request, RequestTrack, ServiceHeartbeat, ServiceTask
 from app.repositories.events import EventRepository
 from app.repositories.jobs import JobRepository
+from app.repositories.library import LibraryRepository
 from app.services.confirmation import confirmation_decision
 
 logger = logging.getLogger(__name__)
@@ -91,13 +92,24 @@ class WebTaskSupervisor:
                     pass
                 continue
             self._heartbeat(1)
+            execution = asyncio.create_task(self._execute(claimed), name=f"web-task-{claimed.id}")
+            lease_lost = asyncio.Event()
             lease_renewal = asyncio.create_task(
-                self._renew_task_lease(claimed), name=f"web-task-lease-{claimed.id}"
+                self._renew_task_lease(claimed, execution, lease_lost),
+                name=f"web-task-lease-{claimed.id}",
             )
             try:
-                async with asyncio.timeout(self.settings.max_agent_seconds):
-                    result = await self._execute(claimed)
+                if claimed.kind == "orchestrate_request":
+                    # Discovery owns its deadline and final partial-result commit.
+                    # An earlier competing timeout here could erase useful work.
+                    result = await execution
+                else:
+                    async with asyncio.timeout(self.settings.max_agent_seconds):
+                        result = await execution
             except asyncio.CancelledError:
+                if lease_lost.is_set():
+                    logger.warning("web task stopped after losing its lease")
+                    continue
                 raise
             except Exception as error:
                 logger.exception("web service task failed", extra={"request_id": claimed.id})
@@ -105,6 +117,10 @@ class WebTaskSupervisor:
             else:
                 self._complete(claimed, result)
             finally:
+                if not execution.done():
+                    execution.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await execution
                 lease_renewal.cancel()
                 with suppress(asyncio.CancelledError):
                     await lease_renewal
@@ -280,11 +296,24 @@ class WebTaskSupervisor:
                     request.error_message = str(error)[:500]
             self.events.emit("request", "request.failed", "Request processing failed", request_id)
 
-    async def _renew_task_lease(self, task: ClaimedTask) -> None:
+    async def _renew_task_lease(
+        self,
+        task: ClaimedTask,
+        execution: asyncio.Task[dict[str, object] | None],
+        lease_lost: asyncio.Event,
+    ) -> None:
         interval = max(5.0, min(30.0, self.settings.lease_seconds / 3))
         while True:
             await asyncio.sleep(interval)
-            if not self._extend_task_lease(task):
+            try:
+                owned = self._extend_task_lease(task)
+                if owned:
+                    self._heartbeat(1)
+            except Exception:
+                owned = False
+            if not owned:
+                lease_lost.set()
+                execution.cancel()
                 return
 
     def _extend_task_lease(self, task: ClaimedTask, *, now: datetime | None = None) -> bool:
@@ -318,18 +347,12 @@ class WebTaskSupervisor:
             )
             decision = confirmation_decision(request, tracks, self.settings)
             user_id = request.user_id
-            scan_ready = (
-                not self.settings.initial_scan_required
-                or session.scalar(
-                    select(ScanRun.id)
-                    .where(ScanRun.kind == "initial", ScanRun.status == "completed")
-                    .limit(1)
-                )
-                is not None
-            )
         if not decision.auto_queue:
             return
-        if not scan_ready:
+        if (
+            self.settings.initial_scan_required
+            and not LibraryRepository(self.factory).initial_scan_complete()
+        ):
             raise ConfirmationGatePending(
                 "exact Add request is waiting for the initial library scan"
             )

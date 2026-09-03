@@ -34,6 +34,14 @@ def _request_payload(item: DbRequest, tracks: list[RequestTrack]) -> dict[str, o
         "requested_count": item.requested_count,
         "discovered_count": item.discovered_count,
         "selected_count": item.selected_count,
+        "execution": {
+            "attempt_id": item.orchestration_attempt_id,
+            "rounds_used": item.model_rounds_used,
+            "configured_model_rounds": item.configured_model_rounds,
+            "configured_tool_calls": item.configured_tool_calls,
+            "configured_agent_seconds": item.configured_agent_seconds,
+            "termination_reason": item.termination_reason,
+        },
         "error": (
             {"code": item.error_code, "message": item.error_message} if item.error_code else None
         ),

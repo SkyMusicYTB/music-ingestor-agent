@@ -36,6 +36,8 @@ jobs:
           python -m pip install --disable-pip-version-check --no-build-isolation --no-deps -e .
           python -m pip check
       - name: Test
+        env:
+          MUSIC_AGENT_REQUIRE_MEDIA_FIXTURES: "1"
         run: pytest
 
   static:
@@ -57,6 +59,8 @@ jobs:
           ruff check app migrations tests scripts/*.py scripts/lib/*.py
           ruff format --check app migrations tests scripts/*.py scripts/lib/*.py
           mypy app
+          python -m compileall -q app migrations scripts
+          python -m pip check
           python -m pip_audit --require-hashes -r requirements/production.lock
       - name: Shell checks
         run: |
@@ -73,7 +77,15 @@ jobs:
           curl --fail --silent --show-error --location "$DENO_URL" --output "$deno_test_dir/deno.zip"
           printf '%s  %s\n' "$DENO_SHA256" "$deno_test_dir/deno.zip" | sha256sum --check --status
           unzip -q "$deno_test_dir/deno.zip" -d "$deno_test_dir"
-          "$deno_test_dir/deno" test tests/unit/idempotency_test.js
+          "$deno_test_dir/deno" test tests/unit/*_test.js
+      - name: Verify native service definitions
+        run: |
+          sudo mkdir -p /opt/music-agent/current/venv/bin /opt/music-agent/current/scripts
+          sudo ln -s /usr/bin/true /opt/music-agent/current/venv/bin/music-agent
+          sudo ln -s /usr/bin/true /opt/music-agent/current/venv/bin/music-agent-worker
+          sudo ln -s /usr/bin/true /opt/music-agent/current/scripts/backup.sh
+          sudo ln -s /usr/bin/true /opt/music-agent/current/scripts/validate-runtime-environment.sh
+          systemd-analyze verify systemd/*.service systemd/*.timer
       - name: Verify CPython 3.14 wheel closure
         run: |
           destination="$(mktemp -d)"

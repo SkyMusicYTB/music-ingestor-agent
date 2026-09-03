@@ -25,9 +25,7 @@ from app.services.security import (
 router = APIRouter()
 
 
-def _set_session_cookies(
-    response: RedirectResponse, request: Request, token: str, csrf: str
-) -> None:
+def _set_session_cookies(response: Response, request: Request, token: str, csrf: str) -> None:
     settings = request.app.state.settings
     secure = request.url.scheme == "https"
     response.set_cookie(
@@ -109,7 +107,7 @@ def setup_submit(
         )
     try:
         request.app.state.auth.consume_setup_attempt(client_ip(request))
-        user_id = request.app.state.auth.create_initial_admin(username, password)
+        request.app.state.auth.create_initial_admin(username, password)
         request.app.state.auth.clear_setup_attempts(client_ip(request))
     except AuthenticationBlocked as error:
         response = _preauth_response(request, "setup.html", "setup", str(error))
@@ -119,7 +117,14 @@ def setup_submit(
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
     except ValueError as error:
         return _preauth_response(request, "setup.html", "setup", str(error))
-    session = request.app.state.auth.create_session(user_id)
+    # Finalize verification and session creation atomically, including first login.
+    try:
+        login = request.app.state.auth.authenticate_and_create_session(
+            username, password, client_ip(request)
+        )
+    except AuthenticationError:
+        return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
+    session = login.session
     response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     _set_session_cookies(response, request, session.token, session.csrf_token)
     return response
@@ -129,8 +134,12 @@ def setup_submit(
 def login_page(request: Request) -> Response:
     if not request.app.state.auth.has_users():
         return RedirectResponse("/setup", status_code=status.HTTP_303_SEE_OTHER)
-    if optional_session(request, request.app.state.auth) is not None:
-        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    authenticated = optional_session(request, request.app.state.auth)
+    if authenticated is not None:
+        return RedirectResponse(
+            "/account/change-password" if authenticated.must_change_password else "/",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
     return _preauth_response(request, "login.html", "login")
 
 
@@ -152,15 +161,20 @@ def login_submit(
     ):
         return _preauth_response(request, "login.html", "login", "The form expired. Try again.")
     try:
-        user = request.app.state.auth.authenticate(username, password, client_ip(request))
+        login = request.app.state.auth.authenticate_and_create_session(
+            username, password, client_ip(request)
+        )
     except AuthenticationBlocked as error:
         response = _preauth_response(request, "login.html", "login", str(error))
         response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
         return response
     except AuthenticationError:
         return _preauth_response(request, "login.html", "login", "Invalid username or password.")
-    session = request.app.state.auth.create_session(user.id)
-    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    session = login.session
+    response = RedirectResponse(
+        "/account/change-password" if login.must_change_password else "/",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
     _set_session_cookies(response, request, session.token, session.csrf_token)
     return response
 

@@ -1,0 +1,21 @@
+<dialog id="account-confirmation" class="auth-card" aria-labelledby="account-confirm-title">
+  <h2 id="account-confirm-title">Confirm account change</h2>
+  <p data-confirm-message></p>
+  <div class="action-row"><button type="button" class="secondary" data-cancel>Cancel</button><button type="button" data-confirm>Continue</button></div>
+</dialog>
+<dialog id="account-reauthentication" class="auth-card" aria-labelledby="account-reauth-title">
+  <h2 id="account-reauth-title">Confirm it is you</h2>
+  <p>Your current password unlocks sensitive account actions for five minutes in this browser session.</p>
+  <form class="stack" data-reauth-form>
+    <label>Current password <input type="password" name="current_password" autocomplete="current-password" maxlength="1024" required></label>
+    <p class="form-error" role="alert" aria-live="polite"></p>
+    <div class="action-row"><button type="button" class="secondary" data-cancel>Cancel</button><button type="submit">Confirm password</button></div>
+  </form>
+</dialog>
+<dialog id="account-generated-password" class="auth-card" aria-labelledby="account-password-title">
+  <h2 id="account-password-title">Save the temporary password</h2>
+  <p>Shown once only. Share it privately with the intended person. You cannot view it again after leaving or refreshing this page.</p>
+  <label>Temporary password <input type="text" data-generated-password readonly autocomplete="off" spellcheck="false"></label>
+  <p data-password-status role="status" aria-live="polite"></p>
+  <div class="action-row"><button type="button" class="secondary" data-copy-password>Copy</button><button type="button" data-password-saved>I have saved it</button></div>
+</dialog>

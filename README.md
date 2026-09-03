@@ -1,5 +1,8 @@
 # Music Agent
 
+For the accounts, model-budget, download-history and mixed-format update, see the
+[production update and safe rollout guide](docs/production-update.md).
+
 Music Agent is a private, self-hosted music discovery and library-ingestion service. It accepts natural-language requests, lets an OpenAI model select only explicitly exposed research tools, resolves permitted media with yt-dlp, prepares tags and artwork, and atomically places completed files in an existing Navidrome library. It does not stream media or replace Navidrome.
 
 The production target is **Ubuntu Server 26.04.1 LTS amd64**, installed natively with Python 3.14 and systemd. Docker is neither required nor supported.

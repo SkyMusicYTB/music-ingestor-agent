@@ -496,12 +496,13 @@ fi
 
 # No credential material is copied into a service-UID-readable runtime directory
 # after this point. The web unit performs its own credential-backed ExecStartPre;
-# once both units are active, the remaining deployment check is service state only.
+# once both units are active, readiness polling is also credential-free.
 if [[ "$start_services" -eq 1 ]]; then
-    if ! music_agent_start_services ||
-            ! music_agent_systemctl is-active --quiet music-agent-web.service ||
-            ! music_agent_systemctl is-active --quiet music-agent-worker.service; then
+    if ! music_agent_start_services; then
         recover_activation "service start failed"
+    fi
+    if ! music_agent_wait_ready "$release"; then
+        recover_activation "service readiness failed"
     fi
 fi
 

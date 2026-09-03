@@ -20,7 +20,7 @@ def test_incremental_scan_does_not_reread_unchanged_tags(
         path.write_bytes(b"synthetic")
     calls: list[Path] = []
 
-    def fake_metadata(path: Path) -> dict[str, object]:
+    def fake_metadata(path: Path, *, music_root: Path | None = None) -> dict[str, object]:
         calls.append(path)
         return {
             "artist": "Artist",

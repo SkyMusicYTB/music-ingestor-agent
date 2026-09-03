@@ -117,6 +117,8 @@ def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -
         "migrations/script.py.mako",
         "migrations/versions/0001_initial_schema.py",
         "migrations/versions/0002_source_decisions_and_hardening.py",
+        "migrations/versions/0003_accounts_and_activity_ownership.py",
+        "migrations/versions/0004_history_scanning_and_model_budgets.py",
         "app/templates/base.html",
         "app/static/app.css",
         "app/static/app.js",
@@ -150,7 +152,7 @@ def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -
         migrate(settings)
         engine = create_database_engine(settings)
         try:
-            assert current_revision(engine) == "0002"
+            assert current_revision(engine) == "0004"
         finally:
             engine.dispose()
         """

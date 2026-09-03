@@ -357,9 +357,9 @@ def test_page_captures_event_cursor_before_reading_rendered_state(client, monkey
         captured.append(result[1] or 0)
         return result
 
-    def search(query: str, page: int, page_size: int) -> object:
+    def search(query: str, page: int, page_size: int, **filters) -> object:
         order.append("state")
-        return original_search(query, page, page_size)
+        return original_search(query, page, page_size, **filters)
 
     monkeypatch.setattr(client.app.state.events, "bounds", bounds)
     monkeypatch.setattr(client.app.state.library, "search", search)

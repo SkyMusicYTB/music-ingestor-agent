@@ -41,6 +41,8 @@ class CostCalculator:
         return cls(PricingSnapshot.from_settings(settings))
 
     def estimate_microusd(self, usage: UsageValues) -> int | None:
+        if not usage.reported:
+            return None
         regular_input = max(
             0,
             usage.input_tokens - usage.cached_input_tokens - usage.cache_write_tokens,

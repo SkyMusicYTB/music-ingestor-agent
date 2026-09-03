@@ -5,32 +5,62 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy import URL, Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 
-EXPECTED_SCHEMA_REVISION = "0002"
+EXPECTED_SCHEMA_REVISION = "0004"
 
 
-def create_database_engine(settings: Settings) -> Engine:
-    settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+def create_database_engine(settings: Settings, *, read_only: bool = False) -> Engine:
+    if not read_only:
+        settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+    # The native SQLite URI is independently escaped from SQLAlchemy's URL.
+    # mode=ro refuses missing files even when the containing directory is writable.
+    database_path = settings.database_path.absolute()
+    url: str | URL = (
+        URL.create(
+            "sqlite+pysqlite",
+            database=database_path.as_uri(),
+            query={"mode": "ro", "uri": "true"},
+        )
+        if read_only
+        else settings.sqlite_url
+    )
     engine = create_engine(
-        settings.sqlite_url,
+        url,
         connect_args={"timeout": 10.0, "check_same_thread": False},
         poolclass=NullPool,
         future=True,
     )
 
+    if read_only:
+
+        @event.listens_for(engine, "do_connect")
+        def guard_read_only_database(
+            _dialect: object, _connection_record: object, _args: object, _kwargs: object
+        ) -> None:
+            # SQLite can create WAL sidecars even for mode=ro. Production uses
+            # rollback journals, so fail closed before opening a WAL database;
+            # immutable=1 would incorrectly ignore changes to a live database.
+            with database_path.open("rb") as database:
+                header = database.read(20)
+            if header[:16] == b"SQLite format 3\x00" and header[18:20] != b"\x01\x01":
+                raise RuntimeError("read-only inspection requires rollback-journal SQLite")
+
     @event.listens_for(engine, "connect")
     def configure_sqlite(dbapi_connection: object, _connection_record: object) -> None:
         assert isinstance(dbapi_connection, sqlite3.Connection)
         cursor = dbapi_connection.cursor()
+        if read_only:
+            cursor.execute("PRAGMA query_only=ON")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA busy_timeout=10000")
-        cursor.execute("PRAGMA journal_mode=DELETE")
-        cursor.execute("PRAGMA synchronous=FULL")
+        if not read_only:
+            cursor.execute("PRAGMA journal_mode=DELETE")
+            cursor.execute("PRAGMA synchronous=FULL")
         cursor.execute("PRAGMA temp_store=MEMORY")
         cursor.close()
 
@@ -39,6 +69,19 @@ def create_database_engine(settings: Settings) -> Engine:
 
 def make_session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+
+@contextmanager
+def immediate_session(factory: sessionmaker[Session]) -> Generator[Session, None, None]:
+    """Serialize read/check/write invariants without holding a lock over external work."""
+    with factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        try:
+            yield session
+            session.commit()
+        except BaseException:
+            session.rollback()
+            raise
 
 
 @contextmanager
