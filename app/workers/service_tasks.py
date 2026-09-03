@@ -29,6 +29,7 @@ from app.db.models import (
     SourceCandidate,
 )
 from app.repositories.events import make_event
+from app.services.artist_credits import structured_artists
 from app.services.duplicates import normalize_text, strip_provider_suffixes
 from app.services.library_scan import LibraryScanner, ScanAlreadyRunning
 from app.services.request_constraints import ExplicitRequestConstraints
@@ -257,6 +258,7 @@ class WorkerServiceTaskHandler:
                             "automatic_association": False,
                             "album_constraint_explicit": False,
                             "source": "validated_direct_provider_metadata",
+                            "artists": list(recording.artists),
                             "request_constraints": ExplicitRequestConstraints(
                                 provider=provider.value
                             ).as_provenance(),
@@ -279,6 +281,7 @@ class WorkerServiceTaskHandler:
                         {
                             "title": raw_title,
                             "artist": artist,
+                            "artists": list(recording.artists),
                             "uploader": uploader,
                             "duration_seconds": duration,
                         },
@@ -313,6 +316,7 @@ class WorkerServiceTaskHandler:
                             {
                                 "direct_user_url": True,
                                 "track": title,
+                                "artists": list(recording.artists),
                                 "artist_source": recording.artist_source,
                             },
                             separators=(",", ":"),
@@ -349,7 +353,10 @@ class WorkerServiceTaskHandler:
             raise SourceValidationError("collection did not contain selectable tracks")
         if len(entries) > self.max_direct_playlist_items:
             raise SourceValidationError("collection exceeds the configured item limit")
-        collection_artist = _first_metadata_string(metadata, "artist", "album_artist")
+        collection_artists = structured_artists(metadata.get("artists"))
+        collection_artist = _first_metadata_string(metadata, "artist", "album_artist") or (
+            ", ".join(collection_artists) if collection_artists else None
+        )
         collection_title = _optional_bounded_string(metadata.get("title"), 300)
         prepared: list[dict[str, object]] = []
         seen: set[tuple[str, str]] = set()
@@ -365,6 +372,7 @@ class WorkerServiceTaskHandler:
             seen.add(identity)
             raw_title = _bounded_string(parsed.get("title"), 500, "collection item title")
             artist = _optional_bounded_string(parsed.get("provider_artist"), 300)
+            artists = structured_artists(parsed.get("artists"))
             title = strip_provider_suffixes(raw_title)
             parsed_artist, parsed_title = _split_provider_title(title)
             if artist is None:
@@ -375,6 +383,7 @@ class WorkerServiceTaskHandler:
                 title = parsed_title
             if artist is None:
                 artist = collection_artist
+                artists = collection_artists
             if artist is None or not title:
                 continue
             duration = _positive_float(parsed.get("duration_seconds"))
@@ -385,6 +394,7 @@ class WorkerServiceTaskHandler:
             prepared.append(
                 {
                     "artist": artist[:300],
+                    "artists": list(artists),
                     "title": title[:300],
                     "raw_title": raw_title,
                     "album": collection_title,
@@ -445,6 +455,7 @@ class WorkerServiceTaskHandler:
                             "automatic_association": False,
                             "album_constraint_explicit": False,
                             "source": "validated_direct_collection_metadata",
+                            "artists": item["artists"],
                             "request_constraints": ExplicitRequestConstraints(
                                 provider=provider.value
                             ).as_provenance(),
@@ -467,6 +478,7 @@ class WorkerServiceTaskHandler:
                         {
                             "title": item["raw_title"],
                             "artist": artist,
+                            "artists": item["artists"],
                             "uploader": item["uploader"],
                             "duration_seconds": item["duration"],
                         },
@@ -708,6 +720,7 @@ class WorkerServiceTaskHandler:
             "url": validated_url,
             "title": title[:500],
             "provider_artist": recording.artist,
+            "artists": list(recording.artists),
             "provider_artist_source": recording.artist_source,
             "provider_track": recording.title,
             "uploader": recording.uploader,
@@ -733,6 +746,7 @@ class WorkerServiceTaskHandler:
                 url = _bounded_string(value.get("url"), 2048, "provider URL")
                 uploader = _optional_bounded_string(value.get("uploader"), 300)
                 provider_artist = _optional_bounded_string(value.get("provider_artist"), 300)
+                provider_artists = structured_artists(value.get("artists"))
                 provider_artist_source = _artist_source(value.get("provider_artist_source"))
                 provider_track = _optional_bounded_string(value.get("provider_track"), 300)
                 duration = _positive_float(value.get("duration_seconds"))
@@ -754,6 +768,7 @@ class WorkerServiceTaskHandler:
                 sanitized = {
                     "title": title,
                     "provider_artist": provider_artist,
+                    "artists": list(provider_artists),
                     "artist_source": provider_artist_source,
                     "track": provider_track,
                     "uploader": uploader,
@@ -927,6 +942,7 @@ class WorkerServiceTaskHandler:
             sanitized = {
                 "title": title,
                 "provider_artist": provider_artist,
+                "artists": list(recording.artists),
                 "artist_source": recording.artist_source,
                 "track": recording.title,
                 "uploader": uploader,

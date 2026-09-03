@@ -4,6 +4,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from app.services.artist_credits import structured_artists
 from app.sources.versions import normalize_match_text
 
 _TITLE_SEPARATOR_RE = re.compile(r"\s+(?:-|\u2013|\u2014)\s+", re.UNICODE)
@@ -23,6 +24,7 @@ class ProviderRecordingMetadata:
     uploader: str | None
     artist_source: str | None
     title_source: str | None
+    artists: tuple[str, ...] = ()
 
 
 def resolve_provider_recording_metadata(
@@ -44,14 +46,17 @@ def resolve_provider_recording_metadata(
     """
 
     uploader = _first_text(metadata, "uploader", "channel", "channel_name")
-    explicit_artist = _first_text(metadata, "artist", "album_artist")
+    artists = structured_artists(metadata.get("artists"))
+    explicit_artist = _text(metadata.get("artist")) or (
+        ", ".join(artists) if artists else _text(metadata.get("album_artist"))
+    )
     creator = _text(metadata.get("creator"))
     track = _first_text(metadata, "track", "alt_title")
     display_title = _text(metadata.get("title")) or _text(fallback_title)
 
     pair_artist, pair_title = _strong_artist_title_pair(display_title or track)
     artist = explicit_artist
-    artist_source = "artist" if _text(metadata.get("artist")) is not None else None
+    artist_source = "artist" if _text(metadata.get("artist")) is not None or artists else None
     if artist is not None and artist_source is None:
         artist_source = "album_artist"
 
@@ -65,6 +70,7 @@ def resolve_provider_recording_metadata(
     if demote_explicit:
         artist = None
         artist_source = None
+        artists = ()
 
     if (
         artist is None
@@ -77,7 +83,11 @@ def resolve_provider_recording_metadata(
     ):
         artist = pair_artist
         artist_source = "parsed_title"
-    elif artist is None and creator is not None and not _looks_like_provenance_name(creator):
+    elif (
+        artist is None
+        and creator is not None
+        and not _identity_looks_like_provenance(creator, uploader)
+    ):
         # A distinct, human-looking creator remains useful on providers that use
         # creator as their actual artist field. It never replaces explicit artist
         # metadata and never overrides a stronger parsed pair when it is account
@@ -114,6 +124,7 @@ def resolve_provider_recording_metadata(
         uploader=uploader,
         artist_source=artist_source,
         title_source=title_source,
+        artists=artists,
     )
 
 

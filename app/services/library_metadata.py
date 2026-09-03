@@ -19,6 +19,7 @@ from app.clients.ytdlp import minimal_subprocess_env
 from app.services.duplicates import version_signature
 from app.services.library_formats import FORMATS, LibraryFormat, extension_for
 from app.services.library_presence import open_library_file
+from app.tags.provenance import PROVENANCE_TAG_FIELDS, provenance_snapshot
 from app.workers.process import BoundedProcessError, run_bounded_process
 
 
@@ -26,6 +27,16 @@ class LibraryReadError(ValueError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+SCANNED_PROVENANCE_FIELDS = (
+    "source_provider",
+    "source_uploader",
+    "canonical_identity_verified",
+    "metadata_authority",
+    "metadata_provenance",
+    "artists",
+)
 
 
 def _tag_text(value: object) -> str | None:
@@ -52,11 +63,35 @@ def _first(tags: Any, *keys: str) -> str | None:
     if tags is None:
         return None
     for key in keys:
-        value = tags.get(key)
+        try:
+            value = tags.get(key)
+        except (KeyError, ValueError):
+            # Vorbis rejects non-ASCII ID3/MP4 key aliases; that is not a
+            # malformed file and must not discard already decoded tags.
+            continue
         result = _tag_text(value)
         if result:
             return result
     return None
+
+
+def _artist_values(tags: Any, *keys: str) -> tuple[str, ...]:
+    if tags is None:
+        return ()
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except (KeyError, ValueError):
+            continue
+        if hasattr(value, "text"):
+            value = value.text
+        items = value if isinstance(value, list | tuple) else (value,)
+        result = tuple(
+            dict.fromkeys(text[:300] for item in items[:16] if (text := _tag_text(item)))
+        )
+        if result:
+            return result
+    return ()
 
 
 def _raw_tag(tags: Any, key: str, *aliases: str) -> str | None:
@@ -145,6 +180,10 @@ def _read_tags(raw: Any, easy: Any) -> dict[str, object]:
     for field, keys in fields.items():
         value = _first(easy, *keys) or _first(raw, *keys)
         result[field] = value[: 200 if field == "genre" else 300] if value else None
+    artists = _artist_values(easy, *fields["artist"]) or _artist_values(raw, *fields["artist"])
+    if artists:
+        result["artists"] = list(artists)
+        result["artist"] = ", ".join(artists)[:300]
     result["year"] = _year(
         _first(easy, "date", "year")
         or _first(raw, "TDRC", "TYER", "\xa9day", "WM/Year", "date", "year")
@@ -175,6 +214,16 @@ def _read_tags(raw: Any, easy: Any) -> dict[str, object]:
     ):
         value = _raw_tag(raw, f"MUSIC_AGENT_{field.upper()}")
         result[field] = value[:cap] if value else None
+    result.update(
+        provenance_snapshot(
+            {attribute: _raw_tag(raw, key) for key, attribute in PROVENANCE_TAG_FIELDS.items()}
+        )
+    )
+    if result.get("canonical_identity_verified") is False:
+        # Provider identity is not MusicBrainz identity, even if a copied source
+        # carried stale MBID tags. Reading never promotes an unverified fallback.
+        for field in ("recording_mbid", "release_mbid", "release_group_mbid"):
+            result[field] = None
     return result
 
 
@@ -338,9 +387,9 @@ def read_audio_metadata(path: Path, *, music_root: Path | None = None) -> dict[s
             file.seek(0)
             technical = probe_metadata(_probe(file, path, policy), policy)
             for key, value in technical.items():
-                if key in {"codec", "container", "duration_seconds", "bitrate"} or not values.get(
+                if key in {"codec", "container", "duration_seconds", "bitrate"} or values.get(
                     key
-                ):
+                ) in (None, "", (), [], {}):
                     values[key] = value
         after = os.fstat(file.fileno())
         signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)

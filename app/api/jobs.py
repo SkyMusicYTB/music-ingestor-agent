@@ -34,6 +34,7 @@ class ReviewCorrection(BaseModel):
     artist: str | None = Field(default=None, max_length=300)
     title: str | None = Field(default=None, max_length=300)
     album: str | None = Field(default=None, max_length=300)
+    year: int | None = Field(default=None, ge=1000, le=2999, strict=True)
 
 
 class ReviewSelectionBody(BaseModel):

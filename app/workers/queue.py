@@ -11,7 +11,7 @@ from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.enums import JobStage, JobStatus, TaskState, TaskTarget
-from app.db.models import DownloadJob, JobDecision, Request, ServiceTask, Track
+from app.db.models import DownloadJob, JobArtifact, JobDecision, Request, ServiceTask, Track
 from app.repositories.decisions import candidate_set_fingerprint, create_pending_decision
 from app.repositories.events import make_event
 from app.services.filesystem import sha256_file, validate_relative_path
@@ -339,17 +339,15 @@ class DownloadJobQueue:
         *,
         reason: str,
         options: list[dict[str, Any]] | None = None,
+        category: str | None = None,
         max_rounds_per_category: int = 3,
         max_rounds_per_job: int = 8,
         now: datetime | None = None,
     ) -> bool:
         timestamp = now or utc_now()
-        serialized_warnings = json.dumps(
-            [{"code": "needs_review", "message": reason[:500]}],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        review_category = _decision_category(category) if category else None
         with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
             job = session.scalar(
                 select(DownloadJob).where(
                     DownloadJob.id == lease.job_id,
@@ -362,10 +360,38 @@ class DownloadJobQueue:
                 raise LeaseLostError("job lease was lost while requesting review")
             grouped: dict[str, list[dict[str, Any]]] = {}
             for option in (options or [])[:24]:
-                category = _decision_category(str(option.get("kind") or "source"))
-                grouped.setdefault(category, []).append(option)
+                option_category = _decision_category(
+                    str(option.get("kind") or review_category or "source")
+                )
+                grouped.setdefault(option_category, []).append(option)
             if not grouped:
-                grouped["acquisition_source"] = []
+                # Empty choices cannot be answered. Do not persist an empty
+                # fingerprint that will be replayed forever on every Retry.
+                metadata_failure = (
+                    review_category == "canonical_metadata"
+                    or job.stage == JobStage.RESOLVING_METADATA.value
+                )
+                job.status = JobStatus.FAILED.value
+                if metadata_failure:
+                    job.stage = JobStage.RESOLVING_METADATA.value
+                job.error_code = "review_has_no_options"
+                job.error_message = reason[:1000]
+                job.lease_token = None
+                job.lease_expires_at = None
+                job.completed_at = timestamp
+                job.updated_at = timestamp
+                job.warnings_json = _without_job_warning(job.warnings_json, "needs_review")
+                _job_event(
+                    session,
+                    job.id,
+                    "job.failed",
+                    "Metadata could not be confirmed"
+                    if metadata_failure
+                    else "No actionable safe acquisition option was found",
+                    details={"code": "review_has_no_options"},
+                )
+                session.commit()
+                return False
             pending_decisions: list[JobDecision] = []
             for category, category_options in grouped.items():
                 fingerprint = candidate_set_fingerprint(category, category_options)
@@ -432,7 +458,9 @@ class DownloadJobQueue:
             )
             job.lease_token = None
             job.lease_expires_at = None
-            job.warnings_json = serialized_warnings
+            # The review reason is already the error/message. Keep unrelated
+            # warnings, but never duplicate that reason as another warning.
+            job.warnings_json = _without_job_warning(job.warnings_json, "needs_review")
             job.error_code = "exceptional_review_required"
             job.error_message = reason[:1000]
             job.updated_at = timestamp
@@ -836,14 +864,26 @@ class DownloadJobQueue:
             return set(
                 session.scalars(
                     select(DownloadJob.id).where(
-                        DownloadJob.status.in_(
-                            [
-                                JobStatus.QUEUED.value,
-                                JobStatus.ACTIVE.value,
-                                JobStatus.RETRY_WAIT.value,
-                                JobStatus.WAITING_FOR_SPACE.value,
-                                JobStatus.CANCEL_REQUESTED.value,
-                            ]
+                        or_(
+                            DownloadJob.status.in_(
+                                [
+                                    JobStatus.QUEUED.value,
+                                    JobStatus.ACTIVE.value,
+                                    JobStatus.RETRY_WAIT.value,
+                                    JobStatus.WAITING_FOR_SPACE.value,
+                                    JobStatus.CANCEL_REQUESTED.value,
+                                ]
+                            ),
+                            DownloadJob.status.in_(
+                                [JobStatus.NEEDS_REVIEW.value, JobStatus.FAILED.value]
+                            )
+                            & DownloadJob.id.in_(
+                                select(JobArtifact.job_id).where(
+                                    JobArtifact.kind == "completed_media",
+                                    JobArtifact.status == "ready",
+                                    JobArtifact.updated_at >= utc_now() - timedelta(days=7),
+                                )
+                            ),
                         )
                     )
                 )

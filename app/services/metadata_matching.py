@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from rapidfuzz.fuzz import ratio, token_set_ratio
+
+from app.services.artist_credits import artist_credit_similarity, structured_artists
 
 _SPACE_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[^\w\s]+", re.UNICODE)
@@ -16,6 +19,7 @@ _VERSION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("acoustic", re.compile(r"\b(acoustic|unplugged)\b", re.I)),
     ("instrumental", re.compile(r"\binstrumental\b", re.I)),
     ("karaoke", re.compile(r"\bkaraoke\b", re.I)),
+    ("cover", re.compile(r"\bcover(?: version)?\b", re.I)),
     ("demo", re.compile(r"\bdemo\b", re.I)),
     ("radio-edit", re.compile(r"\bradio (edit|version)\b", re.I)),
     ("remaster", re.compile(r"\b(re)?master(?:ed)?\b", re.I)),
@@ -59,6 +63,7 @@ class MetadataCandidate:
     release_group_mbid: str | None = None
     source: str = "unknown"
     raw: Mapping[str, Any] | None = None
+    artists: tuple[str, ...] = ()
 
     @property
     def version(self) -> str:
@@ -93,6 +98,8 @@ class MetadataMatcher:
         requested_year: int | None = None,
         album_is_explicit: bool = False,
         version_is_explicit: bool = False,
+        artists: tuple[str, ...] = (),
+        requested_isrc: str | None = None,
         candidates: Iterable[MetadataCandidate],
         limit: int = 10,
     ) -> list[MatchResult]:
@@ -101,7 +108,11 @@ class MetadataMatcher:
         for candidate in candidates:
             contradiction_codes: list[str] = []
             title_score = _similarity(title, candidate.title)
-            artist_score = _similarity(artist, candidate.artist)
+            artist_score = artist_credit_similarity(
+                artist, candidate.artist, left_artists=artists, right_artists=candidate.artists
+            )
+            if artist_score < 0.90:
+                contradiction_codes.append("artist_credit_mismatch")
             duration_score, duration_reason = _duration_score(
                 duration_seconds, candidate.duration_seconds
             )
@@ -138,6 +149,10 @@ class MetadataMatcher:
                 f"album={album_score * 10:.1f}/10",
                 f"version_date={version_date_score * 5:.1f}/5",
             ]
+            if requested_isrc and candidate.raw:
+                isrcs = candidate.raw.get("isrcs")
+                if isinstance(isrcs, list) and requested_isrc.upper() in isrcs:
+                    reasons.append("matching_isrc")
             penalty, penalty_reasons = _edition_penalty(
                 requested=" ".join(value for value in (requested_version, title, album) if value),
                 candidate=" ".join(value for value in (candidate.title, candidate.album) if value),
@@ -284,6 +299,10 @@ def candidates_from_musicbrainz(payload: Mapping[str, Any]) -> list[MetadataCand
             continue
         credits = value.get("artist-credit", [])
         artist = _artist_credit(credits)
+        recording_id = _valid_mbid(value.get("id"))
+        title = value.get("title")
+        if not recording_id or not artist or not isinstance(title, str) or not title.strip():
+            continue
         releases = value.get("releases", [])
         release = releases[0] if isinstance(releases, list) and releases else {}
         if not isinstance(release, Mapping):
@@ -295,17 +314,16 @@ def candidates_from_musicbrainz(payload: Mapping[str, Any]) -> list[MetadataCand
         candidates.append(
             MetadataCandidate(
                 artist=artist,
-                title=str(value.get("title") or ""),
+                title=title.strip()[:500],
                 album=str(release.get("title")) if release.get("title") else None,
                 year=int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None,
-                duration_seconds=(float(value["length"]) / 1000 if value.get("length") else None),
-                recording_mbid=str(value.get("id")) if value.get("id") else None,
-                release_mbid=str(release.get("id")) if release.get("id") else None,
-                release_group_mbid=(
-                    str(release_group.get("id")) if release_group.get("id") else None
-                ),
+                duration_seconds=_recording_duration(value.get("length")),
+                recording_mbid=recording_id,
+                release_mbid=_valid_mbid(release.get("id")),
+                release_group_mbid=(_valid_mbid(release_group.get("id"))),
                 source="musicbrainz",
                 raw=value,
+                artists=_individual_artist_credit(credits),
             )
         )
     return candidates
@@ -456,6 +474,39 @@ def _artist_credit(value: Any) -> str:
         if join:
             parts.append(str(join))
     return "".join(parts).strip()
+
+
+def _individual_artist_credit(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    names: list[object] = []
+    for credit in value[:8]:
+        if not isinstance(credit, Mapping):
+            continue
+        artist = credit.get("artist")
+        names.append(
+            credit.get("name") or (artist.get("name") if isinstance(artist, Mapping) else None)
+        )
+    return structured_artists(names)
+
+
+def _valid_mbid(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+def _recording_duration(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        milliseconds = float(value)
+    except ValueError:
+        return None
+    return milliseconds / 1000.0 if 0 < milliseconds <= 86_400_000 else None
 
 
 def _apple_year(value: Any) -> int | None:

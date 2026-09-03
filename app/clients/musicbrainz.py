@@ -63,7 +63,16 @@ INCLUDES = frozenset(
 
 
 class MusicBrainzError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "temporary_failure",
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.retryable = retryable
 
 
 class MusicBrainzNotFound(MusicBrainzError):
@@ -198,12 +207,27 @@ class MusicBrainzClient:
     async def search_recordings(
         self,
         *,
-        artist: str,
+        artist: str | None,
         title: str,
         limit: int = 10,
+        artist_terms: Sequence[str] = (),
     ) -> dict[str, Any]:
-        query = f'recording:"{_lucene_phrase(title)}" AND artist:"{_lucene_phrase(artist)}"'
+        terms = [f'recording:"{_lucene_phrase(title)}"']
+        if artist:
+            terms.append(f'artist:"{_lucene_phrase(artist)}"')
+        terms.extend(f'artist:"{_lucene_phrase(term)}"' for term in artist_terms[:4])
+        query = " AND ".join(terms)
         return await self.search("recording", query, limit=limit)
+
+    async def search_releases(
+        self,
+        *,
+        artist: str,
+        title: str,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        query = f'release:"{_lucene_phrase(title)}" AND artist:"{_lucene_phrase(artist)}"'
+        return await self.search("release", query, limit=limit)
 
     async def search_artists(self, name: str, *, limit: int = 10) -> dict[str, Any]:
         return await self.search("artist", f'artist:"{_lucene_phrase(name)}"', limit=limit)
@@ -223,13 +247,13 @@ class MusicBrainzClient:
         for attempt in range(self._max_retries + 1):
             try:
                 response = await self._rate_limited_get(path, params=params)
-            except (httpx.TimeoutException, httpx.NetworkError) as error:
+            except httpx.RequestError as error:
                 if attempt >= self._max_retries:
                     raise MusicBrainzError("MusicBrainz request failed") from error
                 await self._sleep(min(4.0, 0.5 * (2**attempt)))
                 continue
             if response.status_code == 404:
-                raise MusicBrainzNotFound(path)
+                raise MusicBrainzNotFound(path, reason_code="not_found", retryable=False)
             if response.status_code in {429, 503} or response.status_code >= 500:
                 if attempt >= self._max_retries:
                     raise MusicBrainzError(f"MusicBrainz unavailable ({response.status_code})")
@@ -237,11 +261,26 @@ class MusicBrainzClient:
                 continue
             try:
                 response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                raise MusicBrainzError(
+                    "MusicBrainz rejected the request",
+                    reason_code="rejected_request",
+                    retryable=False,
+                ) from error
+            try:
                 payload = response.json()
-            except (httpx.HTTPStatusError, ValueError) as error:
-                raise MusicBrainzError("invalid MusicBrainz response") from error
+            except ValueError as error:
+                raise MusicBrainzError(
+                    "invalid MusicBrainz response",
+                    reason_code="malformed_response",
+                    retryable=False,
+                ) from error
             if not isinstance(payload, dict):
-                raise MusicBrainzError("unexpected MusicBrainz response shape")
+                raise MusicBrainzError(
+                    "unexpected MusicBrainz response shape",
+                    reason_code="malformed_response",
+                    retryable=False,
+                )
             return payload
         raise MusicBrainzError("MusicBrainz request exhausted retries")
 

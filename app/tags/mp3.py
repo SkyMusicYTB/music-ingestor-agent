@@ -22,18 +22,26 @@ from mutagen.mp3 import MP3
 
 from app.tags.common import number_pair
 from app.tags.models import EmbeddedArtwork, MediaTags
+from app.tags.provenance import (
+    MUSICBRAINZ_ID_TAG_NAMES,
+    PROVENANCE_TAG_FIELDS,
+    provenance_snapshot,
+    provenance_tag_text,
+)
 
 _TXXX_FIELDS = {
     "MusicBrainz Track Id": "recording_mbid",
     "MusicBrainz Album Id": "release_mbid",
     "MusicBrainz Release Group Id": "release_group_mbid",
     "MUSICBRAINZ_TRACKID": "recording_mbid",
+    "MUSICBRAINZ_RECORDINGID": "recording_mbid",
     "MUSICBRAINZ_ALBUMID": "release_mbid",
     "MUSICBRAINZ_RELEASEGROUPID": "release_group_mbid",
     "MUSIC_AGENT_SOURCE_EXTRACTOR": "source_extractor",
     "MUSIC_AGENT_SOURCE_ID": "source_id",
     "MUSIC_AGENT_SOURCE_URL": "source_url",
     "MUSIC_AGENT_JOB_ID": "job_id",
+    **PROVENANCE_TAG_FIELDS,
 }
 
 
@@ -67,12 +75,21 @@ class MP3TagAdapter:
                 text += f"/{tags.disc_total}"
             id3.add(TPOS(encoding=3, text=[text]))
 
+        # Clear aliases and UFIDs as well as primary fields: null IDs in the
+        # accepted snapshot must not resurrect stale MusicBrainz identity.
+        for key, frame in list(id3.items()):
+            if (
+                isinstance(frame, TXXX) and frame.desc.casefold() in MUSICBRAINZ_ID_TAG_NAMES
+            ) or getattr(frame, "owner", "") in {
+                "http://musicbrainz.org",
+                "https://musicbrainz.org",
+            }:
+                del id3[key]
         for description, attribute in _TXXX_FIELDS.items():
             id3.delall(f"TXXX:{description}")
-            value = getattr(tags, attribute)
+            value = provenance_tag_text(tags, attribute)
             if value:
                 id3.add(TXXX(encoding=3, desc=description, text=[value]))
-
         if artwork is not None:
             for key, frame in list(id3.items()):
                 if isinstance(frame, APIC) and frame.type == PictureType.COVER_FRONT:
@@ -113,6 +130,12 @@ class MP3TagAdapter:
             "source_id": _txxx_text(id3, "MUSIC_AGENT_SOURCE_ID"),
             "source_url": _txxx_text(id3, "MUSIC_AGENT_SOURCE_URL"),
             "job_id": _txxx_text(id3, "MUSIC_AGENT_JOB_ID"),
+            **provenance_snapshot(
+                {
+                    attribute: _txxx_text(id3, key)
+                    for key, attribute in PROVENANCE_TAG_FIELDS.items()
+                }
+            ),
             "has_artwork": any(isinstance(frame, APIC) for frame in id3.values()),
         }
 

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from uuid import UUID
 
 import uvicorn
 from alembic import command
@@ -227,6 +228,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--json", action="store_true")
     audit.add_argument("--verbose", action="store_true")
     audit.add_argument("--limit", type=int, choices=range(1, 1001), default=100, metavar="1..1000")
+    repair = commands.add_parser(
+        "repair-empty-metadata-reviews",
+        help="inspect or repair the exact obsolete empty MusicBrainz review (default: dry run)",
+    )
+    repair_mode = repair.add_mutually_exclusive_group()
+    repair_mode.add_argument("--dry-run", action="store_true")
+    repair_mode.add_argument("--apply", action="store_true")
+    repair.add_argument("--source-id")
+    repair.add_argument("--job-id", type=UUID)
     commands.add_parser("web", help="run the web service")
     return parser
 
@@ -246,6 +256,27 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "admin-reset":
         admin_reset(settings, args.username, recover=args.recover)
+    elif args.command == "repair-empty-metadata-reviews":
+        from app.services.metadata_review_repair import repair_empty_metadata_reviews
+
+        if args.source_id is not None and (
+            not args.source_id
+            or len(args.source_id) > 200
+            or any(ord(character) < 32 for character in args.source_id)
+        ):
+            raise ValueError("source ID must be a nonempty bounded identifier")
+        engine = create_database_engine(settings, read_only=not args.apply)
+        try:
+            assert_schema_current(engine)
+            report = repair_empty_metadata_reviews(
+                make_session_factory(engine),
+                apply=args.apply,
+                source_id=args.source_id,
+                job_id=str(args.job_id) if args.job_id else None,
+            )
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        finally:
+            engine.dispose()
     elif args.command in {"library-audit", "user-list"}:
         engine = create_database_engine(settings, read_only=True)
         factory = make_session_factory(engine)

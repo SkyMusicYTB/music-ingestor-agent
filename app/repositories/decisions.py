@@ -30,7 +30,7 @@ class DecisionConflict(ValueError):
 class DecisionSelection:
     decision_id: str
     option_id: str
-    correction: Mapping[str, str | None] | None = None
+    correction: Mapping[str, str | int | None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +45,7 @@ class CanonicalDecisionReplay:
     local_confidence: float | None
     model_confidence: float | None
     openai_call_id: str | None
+    decided_by: str = "user"
 
 
 _CANONICAL_SELECTION_FIELDS = frozenset(
@@ -62,8 +63,33 @@ _CANONICAL_SELECTION_FIELDS = frozenset(
         "version_signature",
         "recording_candidate_id",
         "release_candidate_id",
+        "artists",
+        "metadata_authority",
+        "canonical_identity_verified",
+        "source_provider",
+        "source_extractor",
+        "source_id",
+        "source_url",
+        "source_uploader",
+        "thumbnail",
+        "metadata_provenance",
+        "reason_code",
     }
 )
+
+_PROVIDER_METADATA_AUTHORITIES = frozenset(
+    {"validated_provider", "direct_user_source", "user_confirmed_provider_metadata"}
+)
+
+
+def _provider_metadata_selection(payload: dict[str, object], *, user: bool) -> None:
+    if payload.get("metadata_authority") not in _PROVIDER_METADATA_AUTHORITIES:
+        return
+    if user:
+        payload["metadata_authority"] = "user_confirmed_provider_metadata"
+    payload["canonical_identity_verified"] = False
+    for key in ("recording_mbid", "release_mbid", "release_group_mbid"):
+        payload[key] = None
 
 
 def stable_payload(value: object) -> object:
@@ -146,6 +172,8 @@ def create_pending_decision(
     openai_call_id: str | None = None,
     prompt_version: str | None = None,
 ) -> JobDecision:
+    if not options:
+        raise ValueError("a pending review requires at least one actionable option")
     safe_options = [_stable_mapping(option) for option in options]
     fingerprint = candidate_set_fingerprint(category, safe_options)
     existing = session.scalar(
@@ -352,6 +380,8 @@ def apply_review_bundle(
         if option is None:
             raise DecisionConflict("a selected option is not part of this review bundle")
         payload = _load_option(option)
+        if decision.category == "canonical_metadata":
+            _provider_metadata_selection(payload, user=True)
         _apply_option(session, job, decision.category, payload, snapshot)
         correction = normalized_corrections[decision.id]
         authoritative_payload = dict(payload)
@@ -494,6 +524,7 @@ def latest_user_canonical_selection(
     payload = {
         key: server_payload[key] for key in _CANONICAL_SELECTION_FIELDS if key in server_payload
     }
+    _provider_metadata_selection(payload, user=True)
     _apply_correction_values(payload, applied_correction)
     if (
         _nonempty_string(payload.get("artist")) is None
@@ -501,7 +532,7 @@ def latest_user_canonical_selection(
     ):
         return None
     if raw_applied is not _MISSING:
-        for key in ("artist", "title", "album"):
+        for key in ("artist", "title", "album", "year"):
             if stored.get(key) != payload.get(key):
                 return None
     return CanonicalDecisionReplay(
@@ -510,6 +541,61 @@ def latest_user_canonical_selection(
         model_confidence=decision.model_confidence,
         openai_call_id=decision.openai_call_id,
     )
+
+
+def latest_canonical_selection(
+    session: Session,
+    job_id: str,
+    *,
+    source_extractor: str | None = None,
+    source_id: str | None = None,
+) -> CanonicalDecisionReplay | None:
+    """Replay a durable decision, without applying it to a different upload."""
+
+    decision = session.scalar(
+        select(JobDecision)
+        .where(
+            JobDecision.job_id == job_id,
+            JobDecision.category == "canonical_metadata",
+            JobDecision.state == "selected",
+        )
+        .order_by(JobDecision.revision.desc(), JobDecision.id.desc())
+        .limit(1)
+    )
+    if decision is None:
+        return None
+    if decision.decided_by == "user":
+        replay = latest_user_canonical_selection(session, job_id)
+    else:
+        try:
+            stored = json.loads(decision.selected_payload_json or "null")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(stored, dict):
+            return None
+        payload = {key: stored[key] for key in _CANONICAL_SELECTION_FIELDS if key in stored}
+        if not all(_nonempty_string(payload.get(key)) for key in ("artist", "title")):
+            return None
+        _provider_metadata_selection(payload, user=False)
+        replay = CanonicalDecisionReplay(
+            payload,
+            decision.local_confidence,
+            decision.model_confidence,
+            decision.openai_call_id,
+            decision.decided_by or "deterministic",
+        )
+    if replay is None:
+        return None
+    provider_fallback = replay.payload.get("metadata_authority") in _PROVIDER_METADATA_AUTHORITIES
+    for key, expected in (("source_extractor", source_extractor), ("source_id", source_id)):
+        actual = replay.payload.get(key)
+        if (
+            expected is not None
+            and (actual is not None or provider_fallback)
+            and actual != expected
+        ):
+            return None
+    return replay
 
 
 def _apply_option(
@@ -578,12 +664,28 @@ def _apply_option(
         "release_group_mbid",
         "version_signature",
         "duplicate_track_id",
+        "duration_seconds",
+        "artists",
     }
     for key in allowed:
         if key in payload:
             snapshot[key] = payload[key]
     if category == "canonical_metadata":
-        if payload.get("recording_mbid"):
+        provider_metadata = payload.get("metadata_authority") in _PROVIDER_METADATA_AUTHORITIES
+        if provider_metadata:
+            snapshot["metadata_authority"] = "user_confirmed_provider_metadata"
+            _provider_metadata_selection(snapshot, user=True)
+            for key in (
+                "source_provider",
+                "source_extractor",
+                "source_id",
+                "source_url",
+                "source_uploader",
+                "thumbnail",
+            ):
+                if key in payload:
+                    snapshot[key] = payload[key]
+        elif payload.get("recording_mbid"):
             snapshot["canonical_identity_verified"] = True
         raw_provenance = snapshot.get("metadata_provenance")
         provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
@@ -592,7 +694,11 @@ def _apply_option(
         resolution.update(
             {
                 "automatic_association": False,
-                "source": "user_confirmed_server_candidate",
+                "source": (
+                    "user_confirmed_provider_metadata"
+                    if provider_metadata
+                    else "user_confirmed_server_candidate"
+                ),
                 "decided_by": "user",
             }
         )
@@ -600,8 +706,10 @@ def _apply_option(
         snapshot["metadata_provenance"] = provenance
 
 
-def _apply_correction(correction: Mapping[str, str | None], snapshot: dict[str, object]) -> None:
-    unknown = set(correction) - {"artist", "title", "album"}
+def _apply_correction(
+    correction: Mapping[str, str | int | None], snapshot: dict[str, object]
+) -> None:
+    unknown = set(correction) - {"artist", "title", "album", "year"}
     if unknown:
         raise DecisionConflict("metadata correction contains unsupported fields")
     for key, value in correction.items():
@@ -609,42 +717,58 @@ def _apply_correction(correction: Mapping[str, str | None], snapshot: dict[str, 
             if key == "album":
                 snapshot[key] = None
                 _set_album_constraint_explicit(snapshot, False)
+            elif key == "year":
+                snapshot[key] = None
             continue
+        if key == "year":
+            snapshot[key] = _correction_year(value)
+            continue
+        if not isinstance(value, str):
+            raise DecisionConflict("metadata correction is invalid")
         cleaned = value.strip()
         if not cleaned or len(cleaned) > 300:
             raise DecisionConflict("metadata correction is invalid")
         snapshot[key] = cleaned
+        if key == "artist":
+            snapshot["artists"] = [cleaned]
         if key == "album":
             _set_album_constraint_explicit(snapshot, True)
 
 
 def _apply_correction_values(
-    target: dict[str, object], correction: Mapping[str, str | None] | None
+    target: dict[str, object], correction: Mapping[str, str | int | None] | None
 ) -> None:
     if correction is None:
         return
     for key, value in correction.items():
         if value is None:
-            if key == "album":
+            if key in {"album", "year"}:
                 target[key] = None
             continue
         target[key] = value
+        if key == "artist":
+            target["artists"] = [value]
 
 
 def _normalize_correction(
-    correction: Mapping[str, str | None] | None,
-) -> dict[str, str | None] | None:
+    correction: Mapping[str, str | int | None] | None,
+) -> dict[str, str | int | None] | None:
     if correction is None:
         return None
-    unknown = set(correction) - {"artist", "title", "album"}
+    unknown = set(correction) - {"artist", "title", "album", "year"}
     if unknown:
         raise DecisionConflict("metadata correction contains unsupported fields")
-    normalized: dict[str, str | None] = {}
+    normalized: dict[str, str | int | None] = {}
     for key in sorted(correction):
         value = correction[key]
         if value is None:
             normalized[key] = None
             continue
+        if key == "year":
+            normalized[key] = _correction_year(value)
+            continue
+        if not isinstance(value, str):
+            raise DecisionConflict("metadata correction is invalid")
         cleaned = value.strip()
         if not cleaned or len(cleaned) > 300:
             raise DecisionConflict("metadata correction is invalid")
@@ -655,13 +779,19 @@ def _normalize_correction(
 _MISSING = object()
 
 
-def _correction_mapping(value: object) -> Mapping[str, str | None] | None:
+def _correction_year(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1000 <= value <= 2999:
+        raise DecisionConflict("metadata year must be between 1000 and 2999")
+    return value
+
+
+def _correction_mapping(value: object) -> Mapping[str, str | int | None] | None:
     if value is None:
         return None
     if not isinstance(value, Mapping):
         raise DecisionConflict("metadata correction is invalid")
     if not all(
-        isinstance(key, str) and (item is None or isinstance(item, str))
+        isinstance(key, str) and (item is None or isinstance(item, (str, int)))
         for key, item in value.items()
     ):
         raise DecisionConflict("metadata correction is invalid")

@@ -16,6 +16,7 @@ Usage:
   sudo scripts/music-agentctl.sh admin-reset [--username NAME] [--recover]
   sudo scripts/music-agentctl.sh user-list [--json]
   sudo scripts/music-agentctl.sh library-audit [--json] [--verbose] [--limit N]
+  sudo scripts/music-agentctl.sh repair-empty-metadata-reviews [--dry-run|--apply] [--source-id ID] [--job-id UUID]
 
 Runs an allowlisted administrative CLI command as the service account with
 safely parsed production configuration and no web-service credentials.
@@ -54,6 +55,21 @@ case "$subcommand" in
                     [[ $# -ge 2 && "$2" =~ ^[0-9]{1,4}$ ]] || { usage >&2; exit 64; }
                     [[ "$2" -ge 1 && "$2" -le 1000 ]] || { usage >&2; exit 64; }
                     arguments+=(--limit "$2"); shift 2 ;;
+                *) usage >&2; exit 64 ;;
+            esac
+        done
+        ;;
+    repair-empty-metadata-reviews)
+        arguments=(repair-empty-metadata-reviews)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --dry-run|--apply) arguments+=("$1"); shift ;;
+                --source-id)
+                    [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_.:-]{1,200}$ ]] || { usage >&2; exit 64; }
+                    arguments+=(--source-id "$2"); shift 2 ;;
+                --job-id)
+                    [[ $# -ge 2 && "$2" =~ ^[0-9a-fA-F-]{36}$ ]] || { usage >&2; exit 64; }
+                    arguments+=(--job-id "$2"); shift 2 ;;
                 *) usage >&2; exit 64 ;;
             esac
         done

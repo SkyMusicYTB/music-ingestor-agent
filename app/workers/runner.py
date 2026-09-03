@@ -19,6 +19,7 @@ from app.logging import configure_logging
 from app.services.artwork import ArtworkCacheService, ArtworkFetcher
 from app.services.library_scan import LibraryScanner
 from app.tools.youtube import YouTubeTool
+from app.workers.completed_media import expire_review_media
 from app.workers.download_pipeline import DownloadPipeline
 from app.workers.heartbeat import WorkerHeartbeat
 from app.workers.media import MediaProcessor
@@ -120,6 +121,12 @@ class WorkerRunner:
                         )
                 if time.monotonic() >= recovery_at:
                     self.queue.recover_expired()
+                    try:
+                        expire_review_media(
+                            self.queue.session_factory, self.processor.settings.downloads_path
+                        )
+                    except Exception:
+                        logger.exception("completed-media retention cleanup will be retried")
                     if self.service_queue is not None:
                         self.service_queue.recover_expired()
                     recovery_at = time.monotonic() + 30

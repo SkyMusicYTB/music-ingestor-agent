@@ -20,7 +20,9 @@ from app.db.models import (
     SourceCandidate,
 )
 from app.repositories.events import make_event
+from app.services.artist_credits import structured_artists
 from app.services.duplicates import normalize_text
+from app.services.metadata_review_repair import repair_empty_metadata_review
 from app.sources import EXECUTABLE_EVIDENCE_KINDS
 
 _ACQUISITION_PROVIDERS = ("bandcamp", "soundcloud", "youtube")
@@ -80,6 +82,7 @@ def _snapshot(track: RequestTrack) -> dict[str, object]:
     return {
         "request_track_id": track.id,
         "artist": track.artist,
+        "artists": list(structured_artists(metadata_provenance.get("artists"))),
         "title": track.title,
         "album": track.album,
         "album_artist": track.album_artist,
@@ -326,7 +329,9 @@ class JobRepository:
                 else:
                     job.status = "cancel_requested"
             elif operation == "retry":
+                repaired_metadata_review = False
                 if job.status == "needs_review":
+                    repaired_metadata_review = repair_empty_metadata_review(session, job)
                     pending_ids = list(
                         session.scalars(
                             select(JobDecision.id).where(
@@ -353,11 +358,14 @@ class JobRepository:
                             "this job needs its focused review decision before it can resume"
                         )
                     job.warnings_json = _without_review_warning(job.warnings_json)
-                if job.status not in {"failed", "waiting_for_space"}:
+                if (
+                    job.status not in {"failed", "waiting_for_space"}
+                    and not repaired_metadata_review
+                ):
                     if job.status != "needs_review":
                         raise ValueError("job is not retryable")
                 job.status = "queued"
-                job.stage = "queued"
+                job.stage = "resolving_metadata" if repaired_metadata_review else "queued"
                 job.available_at = datetime.now(UTC)
                 job.error_code = None
                 job.error_message = None

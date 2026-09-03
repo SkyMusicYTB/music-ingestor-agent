@@ -398,6 +398,86 @@ def test_direct_collection_creates_bounded_selectable_per_track_candidates(
         assert all(candidate.acquisition_url != collection_url for candidate in candidates)
 
 
+def test_structured_artist_arrays_survive_flat_search_and_evidence_persistence(
+    session_factory,
+) -> None:
+    request_id = _request(session_factory, suffix="structured-search")
+    queue = ServiceTaskQueue(session_factory, target="worker", lease_seconds=30)
+    handler = _handler(session_factory, queue)
+    artists = ["Gabry Ponte", "KEL"]
+    parsed = handler._flat_provider_candidate(
+        ProviderIdentity.YOUTUBE,
+        {
+            "id": "rxw1RCAY3qw",
+            "extractor": "youtube",
+            "artists": artists,
+            "title": "Tarantella",
+            "duration": 146,
+            "uploader": "Unrelated Archive",
+        },
+    )
+    assert parsed is not None
+    assert parsed["artists"] == artists
+    handler._persist_media_evidence(
+        request_id=request_id,
+        request_track_id=None,
+        provider=ProviderIdentity.YOUTUBE,
+        candidates=[parsed],
+        limit=1,
+    )
+    with session_factory() as session:
+        evidence = session.scalar(
+            select(EvidenceReference).where(EvidenceReference.request_id == request_id)
+        )
+        assert evidence is not None
+        candidate = session.scalar(
+            select(DbSourceCandidate).where(DbSourceCandidate.evidence_id == evidence.id)
+        )
+        assert candidate is not None
+        assert json.loads(evidence.sanitized_metadata_json)["artists"] == artists
+        assert json.loads(candidate.sanitized_metadata_json)["artists"] == artists
+
+
+@pytest.mark.parametrize("entry_has_artists", [True, False])
+def test_structured_artist_arrays_survive_direct_collection(
+    session_factory, entry_has_artists: bool
+) -> None:
+    request_id = _request(session_factory, suffix=f"structured-collection-{entry_has_artists}")
+    queue = ServiceTaskQueue(session_factory, target="worker", lease_seconds=30)
+    handler = _handler(session_factory, queue)
+    # A punctuation-bearing band remains one artist, including when a track
+    # inherits a structured album credit instead of providing its own.
+    artists = ["Earth, Wind & Fire", "KEL"]
+    entry = {
+        "id": "song",
+        "extractor": "bandcamp",
+        "title": "Song",
+        "duration": 146,
+        "webpage_url": "https://fixture.bandcamp.com/track/song",
+    }
+    if entry_has_artists:
+        entry["artists"] = artists
+    handler._store_direct_collection(
+        request_id,
+        "https://fixture.bandcamp.com/album/album",
+        {"extractor": "bandcamp:album", "title": "Album", "artists": artists, "entries": [entry]},
+    )
+    with session_factory() as session:
+        track = session.scalar(select(RequestTrack).where(RequestTrack.request_id == request_id))
+        assert track is not None
+        evidence = session.scalar(
+            select(EvidenceReference).where(EvidenceReference.request_track_id == track.id)
+        )
+        assert evidence is not None
+        candidate = session.scalar(
+            select(DbSourceCandidate).where(DbSourceCandidate.evidence_id == evidence.id)
+        )
+        assert candidate is not None
+        assert json.loads(track.metadata_provenance_json)["artists"] == artists
+        assert json.loads(evidence.sanitized_metadata_json)["artists"] == artists
+        assert json.loads(candidate.sanitized_metadata_json)["artists"] == artists
+
+
 def test_youtube_search_task_is_bounded_and_serialized(session_factory) -> None:
     with session_factory.begin() as session:
         task = ServiceTask(

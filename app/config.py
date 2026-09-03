@@ -259,6 +259,8 @@ class Settings(BaseSettings):
     blocked_media_extractors: StringList = Field(default_factory=lambda: ["generic"])
     allow_generic_extractor: bool = False
     review_policy: Literal["exception_only"] = "exception_only"
+    canonical_metadata_policy: Literal["prefer", "require"] = "prefer"
+    provider_metadata_fallback_min_score: float = Field(default=0.90, ge=0.88, le=1)
     ai_match_resolution_enabled: bool = True
     ai_match_auto_accept_threshold: float = Field(default=0.90, ge=0, le=1)
     ai_match_min_local_score: float = Field(default=0.75, ge=0, le=1)

@@ -10,19 +10,20 @@
   <div class="job-list">
     {% for job in jobs %}
     <article class="job-row" data-job-id="{{ job.id }}">
-      <div class="section-heading"><strong>{{ friendly_stage(job.stage) }}</strong><span class="status status-{{ job.status }}">{{ job.status|replace('_', ' ') }}</span></div>
+      <div class="section-heading"><strong>{% if job.status == 'needs_review' and job.stage == 'resolving_metadata' %}Metadata needs review{% else %}{{ friendly_stage(job.stage) }}{% endif %}</strong><span class="status status-{{ job.status }}">{{ job.status|replace('_', ' ') }}</span></div>
       {% set snapshot = snapshots.get(job.id, {}) %}
       {% set bundle = review_bundles.get(job.id) %}
       {% if snapshot.get('title') %}<p><strong>{{ snapshot.get('title') }}</strong>{% if snapshot.get('artist') %} · {{ snapshot.get('artist') }}{% endif %}{% if snapshot.get('album') %} · {{ snapshot.get('album') }}{% endif %}</p>{% endif %}
       <progress max="1" value="{{ job.progress }}">{{ (job.progress * 100)|round }}%</progress>
       {% if job.final_relative_path %}<p><code>{{ job.final_relative_path }}</code></p>{% endif %}
       {% if job.error_message %}<div class="alert error">{{ job.error_message }}</div>{% endif %}
-      {% for warning in warnings.get(job.id, []) %}<div class="alert warning">{{ warning.message }}</div>{% endfor %}
+      {% for warning in warnings.get(job.id, []) %}{% if warning.message != job.error_message and warning.code != 'needs_review' %}<div class="alert warning">{{ warning.message }}</div>{% endif %}{% endfor %}
+      {% if selected_sources.get(job.id) %}{% set selected_source = selected_sources[job.id] %}<p class="source-summary">Source selected · {{ selected_source.provider|title }}{% if selected_source.uploader %} · uploaded by {{ selected_source.uploader }}{% endif %}</p>{% endif %}
       {% if match_details.get(job.id) %}
       <details>
         <summary>How this was matched</summary>
         {% for decision in match_details.get(job.id, []) %}
-        <p><strong>{{ decision.category|replace('_', ' ')|title }}</strong>
+        <p><strong>{{ decision.label }}</strong>
           {% if decision.artist %} · {{ decision.artist }} — {{ decision.title }}{% endif %}
           {% if decision.album %} · {{ decision.album }}{% endif %}
           {% if decision.provider %} · {{ decision.provider|title }}{% endif %}
@@ -46,7 +47,7 @@
         {% for decision in bundle.decisions %}
         <fieldset data-decision-id="{{ decision.id }}">
           <legend>{{ decision.category|replace('_', ' ')|title }}</legend>
-          {% if decision.reason_codes %}<p>{{ decision.reason_codes[0] }}</p>{% endif %}
+          {% if decision.reason_codes and decision.reason_codes[0] != job.error_message and decision.reason_codes[0] != (job.error_message or '')[:160] %}<p>{{ decision.reason_codes[0] }}</p>{% endif %}
           {% set decision_options = reviews.get(job.id, [])|selectattr('decision_id', 'equalto', decision.id)|list %}
           {% for option in decision_options[:3] %}
           <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}" {% if option.recommended %}checked{% endif %}> <span><strong>{% if option.recommended %}Recommended{% else %}Alternative {{ option.rank }}{% endif %}</strong> · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider|title }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
@@ -65,12 +66,13 @@
           <label>Artist <input name="artist" maxlength="300" value="{{ snapshot.get('artist') or '' }}"></label>
           <label>Title <input name="title" maxlength="300" value="{{ snapshot.get('title') or '' }}"></label>
           <label>Album <input name="album" maxlength="300" value="{{ snapshot.get('album') or '' }}"></label>
+          <label>Year <input name="year" type="number" min="1000" max="2999" value="{{ snapshot.get('year') or '' }}"></label>
         </details>
         <button type="submit" class="small">Accept and continue</button>
         <p class="form-error" role="alert"></p>
       </form>
       {% else %}
-      <div class="alert warning">No safe permitted source is currently available. You can retry after changing provider availability, or cancel this item.</div>
+      <p>This earlier review has no selectable options. Retry to resume resolution, or cancel this item; any accepted source is retained.</p>
       {% endif %}
       {% endif %}
     </article>

@@ -627,8 +627,9 @@ def test_possible_duplicate_decision_is_fingerprint_scoped_and_actionable(
         processor._check_duplicate(job_id, values, probe)
 
 
-def test_musicbrainz_review_match_stops_before_tagging() -> None:
+def test_musicbrainz_review_match_stops_before_tagging(settings) -> None:
     processor = DownloadJobProcessor.__new__(DownloadJobProcessor)
+    processor.settings = settings
     candidate = MetadataCandidate(artist="Possible Artist", title="Possible Song")
     option = {
         "kind": "metadata",

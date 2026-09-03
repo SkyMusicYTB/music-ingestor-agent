@@ -61,6 +61,29 @@ Before interruption, deployment builds a complete inactive release, allows only 
 
 Do not edit an installed release or its venv. Commit a fix and deploy a new one.
 
+### Canonical-enrichment update
+
+This update adds `MUSIC_AGENT_CANONICAL_METADATA_POLICY=prefer` and
+`MUSIC_AGENT_PROVIDER_METADATA_FALLBACK_MIN_SCORE=0.90`. They take effect by default
+when absent, so no production environment edit is needed; deployment never
+overwrites `/etc/music-agent/music-agent.env`. `prefer` attempts MusicBrainz and
+permits only independently validated source metadata when a safe canonical match
+is unavailable. `require` keeps automatic enrichment mandatory, with actionable
+metadata review or bounded provider retry. Neither setting weakens source identity,
+network, extraction, version, duplicate or publication checks. Settings shows the
+effective policy. See [operations](operations.md#canonical-metadata-and-validated-source-fallback)
+for null MBIDs, warnings, review and the narrowly scoped legacy-job repair.
+
+The database stays at schema **0004**; no migration or account reset is required.
+The library parser revision increases to **2** so subsequent scans retain explicit
+provider authority and structured artist provenance. This rereads changed parser
+records only; it does not alter or retag media. Run normal clean deployment and
+service validation, then preview/apply the repair only for the affected source ID.
+The existing paired-backup activation and rollback procedure remains in force.
+If rolling back after jobs have advanced, retain the newer state backup and use
+the release-matched backup when instructed by the rollback validator; its recovery
+point determines which later job/account changes will be absent.
+
 ## Rollback
 
 ```bash

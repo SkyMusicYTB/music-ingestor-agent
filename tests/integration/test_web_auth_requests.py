@@ -17,6 +17,7 @@ from app.db.models import (
     JobReviewOption,
     Request,
     RequestTrack,
+    SourceCandidate,
     User,
 )
 from app.main import create_app
@@ -527,7 +528,7 @@ def test_review_without_safe_options_offers_a_retry_recovery_path(client) -> Non
     _setup(client)
     job_id, lease = _active_review_job(client, "no-options")
     queue = DownloadJobQueue(client.app.state.session_factory)
-    assert queue.require_review(
+    assert not queue.require_review(
         lease,
         reason="No safe permitted source is currently available",
         options=[],
@@ -561,26 +562,111 @@ def test_review_without_safe_options_offers_a_retry_recovery_path(client) -> Non
         )
         assert job is not None and job.error_code is None
         assert json.loads(job.warnings_json) == []
-        assert len(pending) == 1
-        assert (
-            session.scalar(
-                select(JobReviewOption.id).where(JobReviewOption.decision_id == pending[0].id)
-            )
-            is None
-        )
+        assert pending == []
 
     cancelled_job_id, cancelled_lease = _active_review_job(client, "no-options-cancel")
-    assert queue.require_review(
+    assert not queue.require_review(
         cancelled_lease,
         reason="No safe source remains after probing",
         options=[],
     )
-    cancelled = client.post(
-        f"/api/v1/jobs/{cancelled_job_id}/cancel",
+    dismissed = client.post(
+        f"/api/v1/jobs/{cancelled_job_id}/dismiss",
         headers={
             "Origin": "http://testserver",
             "X-CSRF-Token": client.cookies["music_agent_csrf"],
         },
     )
-    assert cancelled.status_code == 200
-    assert cancelled.json()["status"] == "cancelled"
+    assert dismissed.status_code == 200
+    assert dismissed.json()["status"] == "failed"
+    assert dismissed.json()["dismissed_at"] is not None
+
+
+def test_provider_metadata_review_retains_source_and_displays_one_clear_message(client) -> None:
+    _setup(client)
+    job_id, lease = _active_review_job(client, "provider-metadata")
+    factory = client.app.state.session_factory
+    reason = (
+        "No confident MusicBrainz match was found. Use validated source metadata or correct it."
+    )
+    with factory.begin() as session:
+        job = session.get(DownloadJob, job_id)
+        source = SourceCandidate(
+            job_id=job.id,
+            request_track_id=job.request_track_id,
+            provider="youtube",
+            extractor="youtube",
+            source_id="rxw1RCAY3qw",
+            acquisition_url="https://www.youtube.com/watch?v=rxw1RCAY3qw",
+            provider_title="Tarantella",
+            provider_artist="Gabry Ponte, KEL",
+            uploader="Gabry Ponte",
+            duration_seconds=146,
+            group_key="tarantella",
+            policy_status="allowed",
+            probe_status="valid",
+        )
+        session.add(source)
+        session.flush()
+        job.active_source_candidate_id = source.id
+        job.warnings_json = json.dumps([{"code": "needs_review", "message": reason}])
+    queue = DownloadJobQueue(factory)
+    assert queue.require_review(
+        lease,
+        reason=reason,
+        category="canonical_metadata",
+        options=[
+            {
+                "kind": "canonical_metadata",
+                "artist": "Gabry Ponte, KEL",
+                "title": "Tarantella",
+                "album": None,
+                "year": 2024,
+                "source_provider": "youtube",
+                "source_uploader": "Gabry Ponte",
+                "source_extractor": "youtube",
+                "source_id": "rxw1RCAY3qw",
+                "duration_seconds": 146,
+                "metadata_authority": "validated_provider",
+                "canonical_identity_verified": False,
+                "recording_mbid": None,
+                "release_mbid": None,
+                "release_group_mbid": None,
+            }
+        ],
+    )
+    page = client.get("/downloads")
+    assert page.status_code == 200
+    article = page.text.split(f'data-job-id="{job_id}"', 1)[1].split("</article>", 1)[0]
+    assert "Metadata needs review" in article
+    assert "Source selected · Youtube · uploaded by Gabry Ponte" in article
+    assert "No safe permitted source" not in article
+    assert article.count(reason) == 1
+    assert 'name="year"' in article
+    with factory() as session:
+        job = session.get(DownloadJob, job_id)
+        decision = session.scalar(select(JobDecision).where(JobDecision.job_id == job_id))
+        option = session.scalar(select(JobReviewOption).where(JobReviewOption.job_id == job_id))
+        payload = {
+            "bundle_fingerprint": review_bundle_fingerprint([decision]),
+            "revision": job.decision_revision,
+            "selections": [
+                {
+                    "decision_id": decision.id,
+                    "option_id": option.id,
+                    "correction": {"year": 2024, "artist": "Gabry Ponte & KEL"},
+                }
+            ],
+        }
+    reviewed = client.post(
+        f"/api/v1/jobs/{job_id}/review",
+        json=payload,
+        headers={
+            "Origin": "http://testserver",
+            "X-CSRF-Token": client.cookies["music_agent_csrf"],
+        },
+    )
+    assert reviewed.status_code == 200
+    rendered = client.get("/downloads").text
+    assert "Validated source metadata" in rendered
+    assert "MusicBrainz metadata" not in rendered

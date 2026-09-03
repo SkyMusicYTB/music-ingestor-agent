@@ -26,6 +26,7 @@ from app.services.library_formats import (
     extension_for,
 )
 from app.services.library_metadata import (
+    SCANNED_PROVENANCE_FIELDS,
     LibraryReadError,
     _first,
     _number,
@@ -499,7 +500,7 @@ class LibraryScanner:
         metadata = {
             key: value
             for key, value in entry.metadata.items()
-            if not key.startswith("_") and key != "job_id"
+            if not key.startswith("_") and key != "job_id" and key not in SCANNED_PROVENANCE_FIELDS
         }
         try:
             provenance = json.loads(track.provenance_json) if track else {}
@@ -507,6 +508,14 @@ class LibraryScanner:
             provenance = {}
         if not isinstance(provenance, dict):
             provenance = {}
+        for provenance_field in SCANNED_PROVENANCE_FIELDS:
+            # Rereads reconstruct tag-backed identity from the current file;
+            # missing tags must not retain a previous recording's authority.
+            value = entry.metadata.get(provenance_field)
+            if value is not None and value != {}:
+                provenance[provenance_field] = value
+            else:
+                provenance.pop(provenance_field, None)
         # A changed file must not retain a previous source's deduplication alias.
         # Reconstruct it only from provenance actually read from the current file.
         provenance.pop("source_alias", None)

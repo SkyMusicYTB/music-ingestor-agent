@@ -92,8 +92,10 @@ def _review_option_view(option: JobReviewOption) -> dict[str, object]:
         "label": " · ".join(label_parts)[:800] or f"{option.kind.title()} option {option.rank}",
         "recommended": option.rank == 1,
         "materially_different": option.materially_different,
-        "provider": _bounded_display(payload.get("provider")),
-        "uploader": _bounded_display(payload.get("uploader") or payload.get("channel")),
+        "provider": _bounded_display(payload.get("provider") or payload.get("source_provider")),
+        "uploader": _bounded_display(
+            payload.get("uploader") or payload.get("channel") or payload.get("source_uploader")
+        ),
         "uploader_relationship": _bounded_display(payload.get("uploader_relationship")),
         "duration_seconds": duration_seconds,
         "version": _bounded_display(payload.get("version") or payload.get("version_signature")),
@@ -125,7 +127,7 @@ def _friendly_stage(value: str) -> str:
         "resolving_source": "Finding the best safe source",
         "waiting_ai": "Confirming the match",
         "downloading": "Downloading audio",
-        "resolving_metadata": "Confirming canonical metadata",
+        "resolving_metadata": "Confirming metadata",
         "fetching_artwork": "Finding artwork",
         "tagging": "Writing music tags",
         "verifying": "Checking the finished audio",
@@ -235,6 +237,11 @@ def downloads_page(
             else []
         )
     source_by_id = {candidate.id: candidate for candidate in source_candidates}
+    selected_sources = {
+        job.id: source_by_id[job.active_source_candidate_id]
+        for job in jobs
+        if job.active_source_candidate_id in source_by_id
+    }
     pending_decision_ids = {decision.id for decision in decisions if decision.state == "pending"}
     for job in jobs:
         try:
@@ -296,6 +303,7 @@ def downloads_page(
             payload = _json_object(decision.selected_payload_json)
             detail: dict[str, object] = {
                 "category": decision.category,
+                "label": decision.category.replace("_", " ").title(),
                 "decided_by": decision.decided_by or "deterministic",
                 "confidence": (
                     decision.model_confidence
@@ -319,6 +327,16 @@ def downloads_page(
                 detail.update(
                     {key: payload.get(key) for key in ("artist", "title", "album", "year")}
                 )
+                detail["label"] = (
+                    "Validated source metadata"
+                    if payload.get("metadata_authority")
+                    in {
+                        "validated_provider",
+                        "direct_user_source",
+                        "user_confirmed_provider_metadata",
+                    }
+                    else "MusicBrainz metadata"
+                )
             match_details[job_id].append(detail)
     return _render(
         request,
@@ -334,6 +352,7 @@ def downloads_page(
             snapshots=snapshots,
             warnings=warnings,
             match_details=match_details,
+            selected_sources=selected_sources,
             friendly_stage=_friendly_stage,
         ),
     )
@@ -422,6 +441,10 @@ def settings_page(request: Request, authenticated: CurrentAdmin) -> Response:
         "Media source policy": settings.media_source_policy,
         "Enabled media providers": ", ".join(settings.enabled_media_providers),
         "Review policy": settings.review_policy,
+        "Canonical metadata policy": settings.canonical_metadata_policy,
+        "Automatic provider metadata identity floor": (
+            f"{settings.provider_metadata_fallback_min_score:.0%}"
+        ),
         "SQLite journal": "DELETE / synchronous FULL",
     }
     execution = latest_execution_summary(request.app.state.session_factory)

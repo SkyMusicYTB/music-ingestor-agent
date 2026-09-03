@@ -4,6 +4,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
+from app.tags.provenance import (
+    PROVIDER_AUTHORITIES,
+    bounded_text,
+    canonical_verified,
+    metadata_authority,
+    sanitized_provenance,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EmbeddedArtwork:
@@ -38,6 +46,11 @@ class MediaTags:
     source_id: str | None = None
     source_url: str | None = None
     job_id: str | None = None
+    source_provider: str | None = None
+    source_uploader: str | None = None
+    canonical_identity_verified: bool | None = None
+    metadata_authority: str | None = None
+    metadata_provenance: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -49,6 +62,19 @@ class MediaTags:
         for number in (self.track_number, self.track_total, self.disc_number, self.disc_total):
             if number is not None and number <= 0:
                 raise ValueError("track and disc numbers must be positive")
+        object.__setattr__(self, "source_provider", bounded_text(self.source_provider, 40))
+        object.__setattr__(self, "source_uploader", bounded_text(self.source_uploader, 300))
+        object.__setattr__(self, "metadata_authority", metadata_authority(self.metadata_authority))
+        object.__setattr__(
+            self, "metadata_provenance", sanitized_provenance(self.metadata_provenance)
+        )
+        verified = canonical_verified(self.canonical_identity_verified)
+        if self.metadata_authority in PROVIDER_AUTHORITIES:
+            verified = False
+        object.__setattr__(self, "canonical_identity_verified", verified)
+        if verified is False:
+            for field in ("recording_mbid", "release_mbid", "release_group_mbid"):
+                object.__setattr__(self, field, None)
 
 
 TrackTags = MediaTags
@@ -90,6 +116,11 @@ def coerce_media_tags(value: MediaTags | Mapping[str, Any]) -> MediaTags:
         source_id=_optional_string(value.get("source_id")),
         source_url=_optional_string(value.get("source_url")),
         job_id=_optional_string(value.get("job_id")),
+        source_provider=_optional_string(value.get("source_provider")),
+        source_uploader=_optional_string(value.get("source_uploader")),
+        canonical_identity_verified=canonical_verified(value.get("canonical_identity_verified")),
+        metadata_authority=metadata_authority(value.get("metadata_authority")),
+        metadata_provenance=sanitized_provenance(value.get("metadata_provenance")),
     )
 
 

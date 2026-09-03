@@ -62,6 +62,9 @@ class SourceCandidate(SourceModel):
     url: str = Field(min_length=1, max_length=2_048)
     title: str = Field(min_length=1, max_length=500)
     artist: str | None = Field(default=None, min_length=1, max_length=300)
+    artists: tuple[Annotated[str, Field(min_length=1, max_length=300)], ...] = Field(
+        default=(), max_length=12
+    )
     artist_source: Literal["artist", "album_artist", "creator", "parsed_title"] | None = None
     track: str | None = Field(default=None, min_length=1, max_length=300)
     version: str | None = Field(default=None, min_length=1, max_length=100)

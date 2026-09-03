@@ -98,5 +98,17 @@ def verify_tag_snapshot(
         raise TaggingError("tag readback did not preserve the disc number")
     if expected.job_id is not None and actual.get("job_id") != expected.job_id:
         raise TaggingError("tag readback did not preserve the job provenance")
+    for attribute in (
+        "recording_mbid",
+        "release_mbid",
+        "release_group_mbid",
+        "source_provider",
+        "source_uploader",
+        "canonical_identity_verified",
+        "metadata_authority",
+        "metadata_provenance",
+    ):
+        if actual.get(attribute) != getattr(expected, attribute):
+            raise TaggingError(f"tag readback did not preserve {attribute}")
     if artwork is not None and not actual.get("has_artwork"):
         raise TaggingError("tag readback did not find embedded artwork")

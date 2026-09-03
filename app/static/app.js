@@ -181,7 +181,8 @@ document.addEventListener("submit", async (event) => {
     const correction = manual ? {
       artist: form.elements.artist.value.trim() || null,
       title: form.elements.title.value.trim() || null,
-      album: form.elements.album.value.trim() || null
+      album: form.elements.album.value.trim() || null,
+      year: form.elements.year.value.trim() ? Number(form.elements.year.value) : null
     } : null;
     const selections = [...form.querySelectorAll("fieldset[data-decision-id]")].map((fieldset, index) => {
       const selected = fieldset.querySelector("input[type=radio]:checked");

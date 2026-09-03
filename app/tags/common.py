@@ -4,6 +4,12 @@ from collections.abc import MutableMapping, Sequence
 from typing import Any
 
 from app.tags.models import MediaTags
+from app.tags.provenance import (
+    MUSICBRAINZ_ID_TAG_NAMES,
+    PROVENANCE_TAG_FIELDS,
+    provenance_snapshot,
+    provenance_tag_text,
+)
 
 VORBIS_FIELDS = (
     "title",
@@ -17,16 +23,21 @@ VORBIS_FIELDS = (
     "discnumber",
     "disctotal",
     "musicbrainz_trackid",
+    "musicbrainz_recordingid",
     "musicbrainz_albumid",
     "musicbrainz_releasegroupid",
     "music_agent_source_extractor",
     "music_agent_source_id",
     "music_agent_source_url",
     "music_agent_job_id",
+    *(key.lower() for key in PROVENANCE_TAG_FIELDS),
 )
 
 
 def write_vorbis_fields(container: MutableMapping[str, Any], tags: MediaTags) -> None:
+    for key in list(container.keys()):
+        if key.casefold() in MUSICBRAINZ_ID_TAG_NAMES:
+            del container[key]
     values: dict[str, tuple[str, ...]] = {
         "title": (tags.title,),
         "artist": tags.artists,
@@ -39,6 +50,7 @@ def write_vorbis_fields(container: MutableMapping[str, Any], tags: MediaTags) ->
         "discnumber": (str(tags.disc_number),) if tags.disc_number else (),
         "disctotal": (str(tags.disc_total),) if tags.disc_total else (),
         "musicbrainz_trackid": (tags.recording_mbid,) if tags.recording_mbid else (),
+        "musicbrainz_recordingid": (),
         "musicbrainz_albumid": (tags.release_mbid,) if tags.release_mbid else (),
         "musicbrainz_releasegroupid": (
             (tags.release_group_mbid,) if tags.release_group_mbid else ()
@@ -48,6 +60,9 @@ def write_vorbis_fields(container: MutableMapping[str, Any], tags: MediaTags) ->
         "music_agent_source_url": (tags.source_url,) if tags.source_url else (),
         "music_agent_job_id": (tags.job_id,) if tags.job_id else (),
     }
+    for key, attribute in PROVENANCE_TAG_FIELDS.items():
+        value = provenance_tag_text(tags, attribute)
+        values[key.lower()] = (value,) if value is not None else ()
     for key in VORBIS_FIELDS:
         current = values[key]
         if current:
@@ -77,6 +92,12 @@ def read_vorbis_snapshot(
         "source_id": first_text(container.get("music_agent_source_id")),
         "source_url": first_text(container.get("music_agent_source_url")),
         "job_id": first_text(container.get("music_agent_job_id")),
+        **provenance_snapshot(
+            {
+                attribute: first_text(container.get(key.lower()))
+                for key, attribute in PROVENANCE_TAG_FIELDS.items()
+            }
+        ),
         "has_artwork": has_artwork,
     }
 

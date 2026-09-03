@@ -9,18 +9,29 @@ from mutagen.mp4 import MP4, MP4Cover
 
 from app.tags.common import first_text, texts
 from app.tags.models import EmbeddedArtwork, MediaTags
+from app.tags.provenance import (
+    MUSICBRAINZ_ID_TAG_NAMES,
+    PROVENANCE_TAG_FIELDS,
+    provenance_snapshot,
+    provenance_tag_text,
+)
 
 _FREEFORM_FIELDS = {
     "----:com.apple.iTunes:MusicBrainz Track Id": "recording_mbid",
     "----:com.apple.iTunes:MusicBrainz Album Id": "release_mbid",
     "----:com.apple.iTunes:MusicBrainz Release Group Id": "release_group_mbid",
     "----:com.apple.iTunes:MUSICBRAINZ_TRACKID": "recording_mbid",
+    "----:com.apple.iTunes:MUSICBRAINZ_RECORDINGID": "recording_mbid",
     "----:com.apple.iTunes:MUSICBRAINZ_ALBUMID": "release_mbid",
     "----:com.apple.iTunes:MUSICBRAINZ_RELEASEGROUPID": "release_group_mbid",
     "----:com.apple.iTunes:MUSIC_AGENT_SOURCE_EXTRACTOR": "source_extractor",
     "----:com.apple.iTunes:MUSIC_AGENT_SOURCE_ID": "source_id",
     "----:com.apple.iTunes:MUSIC_AGENT_SOURCE_URL": "source_url",
     "----:com.apple.iTunes:MUSIC_AGENT_JOB_ID": "job_id",
+    **{
+        f"----:com.apple.iTunes:{key}": attribute
+        for key, attribute in PROVENANCE_TAG_FIELDS.items()
+    },
 }
 
 
@@ -47,8 +58,11 @@ class MP4TagAdapter:
             "disk",
             [(tags.disc_number, tags.disc_total or 0)] if tags.disc_number else None,
         )
+        for key in list(values):
+            if key.casefold().removeprefix("----:com.apple.itunes:") in MUSICBRAINZ_ID_TAG_NAMES:
+                del values[key]
         for key, attribute in _FREEFORM_FIELDS.items():
-            value = getattr(tags, attribute)
+            value = provenance_tag_text(tags, attribute)
             _set(values, key, [value.encode("utf-8")] if value else None)
         if artwork is not None:
             image_format = (
@@ -84,6 +98,12 @@ class MP4TagAdapter:
             "source_id": _freeform_text(values, "----:com.apple.iTunes:MUSIC_AGENT_SOURCE_ID"),
             "source_url": _freeform_text(values, "----:com.apple.iTunes:MUSIC_AGENT_SOURCE_URL"),
             "job_id": _freeform_text(values, "----:com.apple.iTunes:MUSIC_AGENT_JOB_ID"),
+            **provenance_snapshot(
+                {
+                    attribute: _freeform_text(values, f"----:com.apple.iTunes:{key}")
+                    for key, attribute in PROVENANCE_TAG_FIELDS.items()
+                }
+            ),
             "has_artwork": bool(values.get("covr")),
         }
 

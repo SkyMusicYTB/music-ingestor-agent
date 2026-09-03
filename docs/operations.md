@@ -68,10 +68,85 @@ Keep `MUSIC_AGENT_REVIEW_POLICY=exception_only`, generic extraction disabled, an
 
 `MUSIC_AGENT_MUSICBRAINZ_USER_AGENT` must identify the application and contain a real monitored email address or HTTPS contact URL. The deployment validator and web unit reject the shipped `example.invalid` placeholder and common example/test domains.
 
+## Canonical metadata and validated source fallback
+
+`MUSIC_AGENT_CANONICAL_METADATA_POLICY=prefer` is the default. MusicBrainz is
+preferred canonical enrichment, not an unavoidable acquisition dependency. An
+explicitly approved direct URL still has to pass curated-provider, network,
+extractor, single-item, artist/title, version and duration checks. When those checks
+succeed but no confident MusicBrainz match exists, the job can use the validated
+provider metadata and complete. An automatically discovered source additionally
+has to meet `MUSIC_AGENT_PROVIDER_METADATA_FALLBACK_MIN_SCORE` (default `0.90`,
+permitted range `0.88`–`1.0`) and the independent identity/version/duration checks.
+Changing this setting never permits a cover, karaoke, wrong performer, unrequested
+remix/live version, unsafe URL or blocked extractor.
+
+Set `MUSIC_AGENT_CANONICAL_METADATA_POLICY=require` to block automatic provider
+fallback. Missing or uncertain canonical metadata then produces an actionable
+**metadata** review; it does not discard an already accepted acquisition source.
+An explicit user decision can accept or correct the offered validated provider
+metadata, or the user can cancel. Temporary MusicBrainz failures use the normal
+bounded retry budget under `require`, rather than pretending the source is wrong.
+Under `prefer`, a safely approved direct source may continue after a bounded
+MusicBrainz outage. Settings displays the effective policy and automatic identity
+floor. Existing environment files remain valid and are never replaced on update.
+
+`canonical_identity_verified=true` means the canonical MusicBrainz identity was
+resolved from a validated local candidate, not merely suggested by a model.
+Provider metadata uses `canonical_identity_verified=false` and null recording,
+release and release-group MBIDs. Null means **not associated**, not an invented
+identity or a damaged audio file. The metadata authority records
+`validated_provider`, `direct_user_source`, or `user_confirmed_provider_metadata`.
+The resulting file retains that authority, source provider/extractor/ID/URL,
+uploader and bounded decision provenance. Uploader remains provenance, never an
+automatic replacement for the recording artist. Library rescans retain these
+distinctions; null IDs are not promoted to MusicBrainz matches.
+
+Fallback completion displays one bounded warning:
+
+> No confident MusicBrainz match was found. Validated source metadata was used instead.
+
+Source-ID and conservative artist/title/version/duration duplicate checks still
+apply. When no release cover is available, validated source-thumbnail artwork is
+attempted; artwork failure remains nonfatal. Existing music is never reorganized
+or retagged by this update. No downloaded audio is sent to OpenAI or MusicBrainz.
+
+### Repair an obsolete empty metadata review
+
+Older releases could label a MusicBrainz miss as an empty acquisition-source
+review. The repair command only targets `needs_review` jobs with the exact legacy
+error, an empty pending source decision and an already selected valid source.
+It ignores active jobs, meaningful source choices and unrelated failures. Preview
+the Tarantella source-ID scope before applying:
+
+```bash
+sudo /opt/music-agent/current/scripts/music-agentctl.sh \
+  repair-empty-metadata-reviews --dry-run --source-id rxw1RCAY3qw
+sudo /opt/music-agent/current/scripts/music-agentctl.sh \
+  repair-empty-metadata-reviews --apply --source-id rxw1RCAY3qw
+```
+
+The default is dry-run. Applying the exact repair supersedes the obsolete empty
+decision and queues the existing job with its accepted source; no request needs
+to be deleted or recreated. Review the printed job IDs and then watch Downloads.
+Ordinary Retry also reconciles this exact legacy shape. Accepted source and
+metadata decisions are durable and reused, so an identical decision is not asked
+again. The pipeline resolves metadata from the probe before downloading where
+possible. A retained completed artifact is reused only after source identity,
+regular-file containment, recorded size, SHA-256 and media verification; a stale
+or unsafe artifact is never trusted just because its filename matches. Completed
+staging audio can survive metadata review, failed-job Retry and service restart
+for seven days. Periodic cleanup removes expired inactive staging audio, never
+published music; a later retry downloads again after that retention window.
+Changing source, a hash mismatch or an invalid artifact also forces a fresh safe
+download. Embedded JPEG/PNG artwork is allowed only when re-verifying a retained
+file; an ordinary video stream remains prohibited.
+
 ## Troubleshooting
 
 - **Web unit fails before start:** run `journalctl -u music-agent-web.service -n 100`; `ExecStartPre` normally identifies config, credential, database, or schema failure.
 - **Worker repeatedly retries:** inspect the durable job error and journal. Confirm `ffmpeg`, `ffprobe`, `yt-dlp`, and `deno` resolve from `/opt/music-agent/tools/current/bin`/the system path. Do not disable URL policy or validation to work around a source failure.
+- **Source selected, metadata needs review:** the source is not missing. Review the focused metadata option or correction form; under `prefer`, strongly validated source metadata normally completes automatically. For the exact obsolete empty review, use the dry-run repair above instead of recreating the request.
 - **Ordinary track asks for source/release input:** inspect the selected decision fingerprint, local/model confidence, contradiction codes, and provider probe status. Confirm AI matching is enabled and the web credential is readable; do not manually patch the job or insert a URL.
 - **Third-party upload does not match:** verify provider track/artist metadata, title and duration. The uploader field must remain provenance only; a cover, karaoke, remix, live, or other-performer contradiction is correctly rejected unless requested.
 - **Database busy:** confirm only one web service and the configured worker count exist. Long network/media operations must not hold DB transactions. Do not enable WAL. Run the validation script and inspect leases.

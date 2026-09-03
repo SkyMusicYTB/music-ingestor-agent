@@ -57,11 +57,13 @@ class MediaProcessor:
         max_duration_seconds: int,
         allow_lossy_transcode: bool,
         cancel_signal: CancellationSignal | None = None,
+        allow_attached_art: bool = False,
     ) -> MediaProbe:
         probe = self.inspect(
             path,
             max_duration_seconds=max_duration_seconds,
             cancel_signal=cancel_signal,
+            allow_attached_art=allow_attached_art,
         )
         extension: str | None = None
         codec_args = ["-c:a", "copy"]
@@ -116,6 +118,7 @@ class MediaProcessor:
                 normalized,
                 max_duration_seconds=max_duration_seconds,
                 cancel_signal=cancel_signal,
+                allow_attached_art=allow_attached_art,
             )
         except Exception:
             normalized.unlink(missing_ok=True)
@@ -132,6 +135,7 @@ class MediaProcessor:
         *,
         max_duration_seconds: int,
         cancel_signal: CancellationSignal | None = None,
+        allow_attached_art: bool = False,
     ) -> MediaProbe:
         file_stat = path.lstat()
         if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
@@ -141,7 +145,7 @@ class MediaProcessor:
             "-v",
             "error",
             "-show_entries",
-            "format=format_name,duration,bit_rate:stream=codec_type,codec_name,duration",
+            "format=format_name,duration,bit_rate:stream=codec_type,codec_name,duration:stream_disposition=attached_pic",
             "-of",
             "json",
             str(path),
@@ -151,7 +155,12 @@ class MediaProcessor:
             payload = json.loads(output)
         except json.JSONDecodeError as exc:
             raise MediaValidationError("ffprobe returned malformed JSON") from exc
-        return parse_probe_payload(path, payload, max_duration_seconds=max_duration_seconds)
+        return parse_probe_payload(
+            path,
+            payload,
+            max_duration_seconds=max_duration_seconds,
+            allow_attached_art=allow_attached_art,
+        )
 
     def _run(
         self,
@@ -181,7 +190,13 @@ class MediaProcessor:
         return stdout
 
 
-def parse_probe_payload(path: Path, payload: object, *, max_duration_seconds: int) -> MediaProbe:
+def parse_probe_payload(
+    path: Path,
+    payload: object,
+    *,
+    max_duration_seconds: int,
+    allow_attached_art: bool = False,
+) -> MediaProbe:
     if not isinstance(payload, dict):
         raise MediaValidationError("ffprobe payload is not an object")
     streams = payload.get("streams")
@@ -194,7 +209,17 @@ def parse_probe_payload(path: Path, payload: object, *, max_duration_seconds: in
     ]
     if len(audio_streams) != 1:
         raise MediaValidationError("media must contain exactly one audio stream")
-    if any(isinstance(stream, dict) and stream.get("codec_type") == "video" for stream in streams):
+    if any(
+        isinstance(stream, dict)
+        and stream.get("codec_type") == "video"
+        and not (
+            allow_attached_art
+            and stream.get("codec_name") in {"mjpeg", "png"}
+            and isinstance(stream.get("disposition"), dict)
+            and stream["disposition"].get("attached_pic") == 1
+        )
+        for stream in streams
+    ):
         raise MediaValidationError("media must not contain a video stream")
     codec = audio_streams[0].get("codec_name")
     if not isinstance(codec, str) or not codec:

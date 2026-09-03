@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -23,19 +24,22 @@ from app.clients.ytdlp import (
     SourceValidationError,
     YtDlpClient,
     YtDlpError,
+    validate_public_media_metadata,
 )
 from app.config import Settings
 from app.db.enums import JobStage
-from app.db.models import DownloadJob, RequestTrack, ServiceTask, Track
+from app.db.models import DownloadJob, EvidenceReference, RequestTrack, ServiceTask, Track
+from app.db.models import SourceCandidate as DbSourceCandidate
 from app.logging import redact
 from app.repositories.decisions import (
     candidate_set_fingerprint,
-    latest_user_canonical_selection,
+    latest_canonical_selection,
     record_selected_decision,
     selected_decision,
     selected_payload,
 )
 from app.repositories.library import LibraryRepository
+from app.services.artist_credits import structured_artists
 from app.services.artwork import (
     Artwork,
     ArtworkCacheService,
@@ -75,6 +79,8 @@ from app.sources import (
     DEFAULT_VERSION_CLASSIFIER,
     CanonicalMatchDecision,
     MatchDecision,
+    provider_for_extractor,
+    provider_for_url,
     resolve_provider_recording_metadata,
     validate_canonical_match_decision,
 )
@@ -82,9 +88,16 @@ from app.tags import TaggingError, UnsupportedMediaFormat, write_tags
 from app.tools.youtube import YouTubeTool
 from app.workers.ai_task_reuse import reuse_or_create_decision_task
 from app.workers.cleanup import cleanup_staging_directory
+from app.workers.completed_media import CompletedMediaStore
 from app.workers.lease import LeaseMonitor
 from app.workers.media import MediaProbe, MediaProcessor, MediaValidationError
 from app.workers.metadata import MusicBrainzWorkerResolver, WorkerMetadataError
+from app.workers.provider_fallback import (
+    FALLBACK_AUTHORITIES,
+    FALLBACK_WARNING,
+    SourceAuthority,
+    provider_fallback,
+)
 from app.workers.queue import (
     DownloadJobQueue,
     JobCancellationRequested,
@@ -122,10 +135,17 @@ class SourceNeedsReview(RuntimeError):
 
 
 class JobNeedsReview(RuntimeError):
-    def __init__(self, reason: str, options: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        options: list[dict[str, Any]] | None = None,
+        *,
+        category: str | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.options = options or []
+        self.category = category
 
 
 class SourceCandidateRejected(JobNeedsReview):
@@ -194,6 +214,11 @@ class DownloadJobProcessor:
             if session_factory is not None
             else None
         )
+        self.completed_media = (
+            CompletedMediaStore(session_factory, settings.max_media_bytes)
+            if session_factory is not None
+            else None
+        )
 
     def process(self, lease: JobLease) -> ProcessOutcome:
         staging: Path | None = None
@@ -236,18 +261,11 @@ class DownloadJobProcessor:
                     staging,
                     download_reservation,
                 )
-                self.queue.set_progress(lease, stage=JobStage.RESOLVING_METADATA, progress=0.62)
-                tag_values = self._resolve_canonical_metadata(
-                    tag_values,
-                    media_probe,
-                    lease=lease,
-                    monitor=monitor,
-                    cancellation=cancellation,
-                )
                 self._check_duplicate(lease.job_id, tag_values, media_probe)
                 artwork = self._fetch_artwork(lease, monitor, result.metadata, tag_values)
                 self.queue.set_progress(lease, stage=JobStage.TAGGING, progress=0.76)
                 write_tags(media_probe.path, tag_values, artwork, verify=True)
+                self._save_completed_media(lease, media_probe.path, staging, tag_values)
                 monitor.raise_if_unusable()
                 self.queue.set_progress(lease, stage=JobStage.VERIFYING, progress=0.86)
                 relative_path = build_track_relative_path(
@@ -356,11 +374,24 @@ class DownloadJobProcessor:
                 options=options,
                 max_rounds_per_category=self.settings.max_review_rounds_per_category,
                 max_rounds_per_job=self.settings.max_review_rounds_per_job,
+                category=exc.category if isinstance(exc, JobNeedsReview) else None,
             )
-            cleanup_staging_directory(staging)
+            if not self.completed_media or not self.completed_media.has_ready(lease.job_id):
+                cleanup_staging_directory(staging)
+            status = "needs_review" if review_created else "queued"
+            if not review_created and self.session_factory is not None:
+                with self.session_factory() as session:
+                    status = (
+                        session.scalar(
+                            select(DownloadJob.status).where(DownloadJob.id == lease.job_id)
+                        )
+                        or status
+                    )
+                if status == "failed":
+                    cleanup_staging_directory(staging)
             return ProcessOutcome(
                 job_id=lease.job_id,
-                status="needs_review" if review_created else "queued",
+                status=status,
             )
         except DuplicateOwned as exc:
             monitor.stop()
@@ -429,7 +460,13 @@ class DownloadJobProcessor:
                 error_message=redact(str(exc) or type(exc).__name__),
                 retryable=retryable,
             )
-            if status == "failed":
+            if status == "failed" and (
+                not self.completed_media
+                or not self.completed_media.has_ready(lease.job_id)
+                or isinstance(
+                    exc, (MediaBudgetExceeded, SourceValidationError, MediaValidationError)
+                )
+            ):
                 cleanup_staging_directory(staging)
             logger.warning(
                 "download job failed (%s): %s",
@@ -500,29 +537,99 @@ class DownloadJobProcessor:
         while True:
             source_url = self._resolve_source(lease, monitor, cancellation)
             monitor.raise_if_unusable()
-            self.queue.set_progress(lease, stage=JobStage.DOWNLOADING, progress=0.08)
             try:
-                result = self.ytdlp.download_audio(
-                    source_url,
-                    staging,
-                    max_duration_seconds=self.settings.max_direct_media_seconds,
-                    max_media_bytes=self.settings.max_media_bytes,
-                    progress_callback=self._progress_callback(lease, monitor),
-                    cancel_signal=cancellation,
+                source_metadata = self.ytdlp.probe(source_url, cancel_signal=cancellation)
+                self._validate_source_probe(lease, source_url, source_metadata)
+                source_values = self._tag_values(
+                    lease.approved_snapshot, source_metadata, source_url, job_id=lease.job_id
                 )
+                duration = _float_or_none(source_metadata.get("duration"))
+                tag_values = None
+                if duration is not None:
+                    if not 0 < duration <= self.settings.max_direct_media_seconds:
+                        raise SourceValidationError("source exceeds the configured duration limit")
+                    preview_probe = MediaProbe(staging, "", (), duration, None)
+                    self._validate_canonical_metadata(source_values, source_metadata, preview_probe)
+                    self.queue.set_progress(lease, stage=JobStage.RESOLVING_METADATA, progress=0.06)
+                    tag_values = self._resolve_canonical_metadata(
+                        source_values,
+                        preview_probe,
+                        lease=lease,
+                        monitor=monitor,
+                        cancellation=cancellation,
+                        source_metadata=source_metadata,
+                    )
+                    self._check_duplicate(lease.job_id, tag_values, preview_probe)
+                monitor.raise_if_unusable()
+                self.queue.set_progress(lease, stage=JobStage.DOWNLOADING, progress=0.08)
+                reused = (
+                    self.completed_media.find(
+                        lease,
+                        staging,
+                        extractor=_required_string(source_values, "source_extractor"),
+                        source_id=_required_string(source_values, "source_id"),
+                    )
+                    if self.completed_media is not None
+                    else None
+                )
+                if reused is None:
+                    if self.completed_media is not None and self.completed_media.has_ready(
+                        lease.job_id, include_expired=True
+                    ):
+                        # A changed, expired, or different-source artifact must not
+                        # be mistaken by yt-dlp --no-overwrites for a valid download.
+                        self.completed_media.invalidate(lease)
+                        if not cleanup_staging_directory(staging):
+                            raise RuntimeError("invalid completed media could not be cleaned")
+                        create_staging_directory(self.settings.downloads_path, lease.job_id)
+                    result = self.ytdlp.download_audio(
+                        source_url,
+                        staging,
+                        max_duration_seconds=self.settings.max_direct_media_seconds,
+                        max_media_bytes=self.settings.max_media_bytes,
+                        progress_callback=self._progress_callback(lease, monitor),
+                        cancel_signal=cancellation,
+                    )
+                else:
+                    result = DownloadResult(
+                        path=reused,
+                        extractor=_required_string(source_values, "source_extractor"),
+                        source_id=_required_string(source_values, "source_id"),
+                        metadata=source_metadata,
+                    )
+                if result.source_id != source_values.get("source_id") or (
+                    result.extractor or ""
+                ).casefold() != source_values.get("source_extractor"):
+                    raise SourceValidationError(
+                        "download identity changed after metadata acceptance"
+                    )
                 if result.path.stat().st_size > self.settings.max_media_bytes:
                     raise MediaBudgetExceeded("downloaded source exceeded the media byte limit")
                 monitor.raise_if_unusable()
-                media_probe = self._normalize_media(result.path, cancellation)
+                media_probe = self._normalize_media(
+                    result.path, cancellation, allow_attached_art=reused is not None
+                )
                 if self.reservations is not None and reservation is not None:
                     self.reservations.update_download(reservation, staging)
-                tag_values = self._tag_values(
-                    lease.approved_snapshot,
-                    result.metadata,
-                    source_url,
-                    job_id=lease.job_id,
-                )
-                self._validate_canonical_metadata(tag_values, result.metadata, media_probe)
+                self._validate_canonical_metadata(source_values, result.metadata, media_probe)
+                if duration is not None and abs(duration - media_probe.duration_seconds) > max(
+                    10.0, duration * 0.05
+                ):
+                    raise SourceCandidateRejected(
+                        "audio duration contradicts the accepted source probe"
+                    )
+                self._save_completed_media(lease, media_probe.path, staging, source_values)
+                if tag_values is None:
+                    self.queue.set_progress(lease, stage=JobStage.RESOLVING_METADATA, progress=0.62)
+                    tag_values = self._resolve_canonical_metadata(
+                        source_values,
+                        media_probe,
+                        lease=lease,
+                        monitor=monitor,
+                        cancellation=cancellation,
+                        source_metadata=result.metadata,
+                    )
+                tag_values["duration_seconds"] = media_probe.duration_seconds
                 return result, source_url, media_probe, tag_values
             except DownloadCancelled:
                 raise
@@ -557,6 +664,47 @@ class DownloadJobProcessor:
                 if not cleanup_staging_directory(staging):
                     raise RuntimeError("failed to clean the rejected source staging area") from exc
                 create_staging_directory(self.settings.downloads_path, lease.job_id)
+
+    def _save_completed_media(
+        self, lease: JobLease, path: Path, staging: Path, values: Mapping[str, Any]
+    ) -> None:
+        if self.completed_media is not None:
+            self.completed_media.save(
+                lease,
+                path,
+                staging,
+                extractor=_required_string(dict(values), "source_extractor"),
+                source_id=_required_string(dict(values), "source_id"),
+            )
+
+    def _validate_source_probe(
+        self, lease: JobLease, source_url: str, metadata: Mapping[str, Any]
+    ) -> None:
+        validate_public_media_metadata(metadata)
+        extractor = _first_source_string(metadata, "extractor", "extractor_key")
+        source_id = _first_source_string(metadata, "id")
+        if (
+            metadata.get("entries") is not None
+            or metadata.get("_type") in {"playlist", "multi_video"}
+            or not source_id
+            or not extractor
+            or provider_for_extractor(extractor.casefold()) is not provider_for_url(source_url)
+        ):
+            raise SourceValidationError("source probe did not identify one permitted media item")
+        if self.session_factory is not None:
+            with self.session_factory() as session:
+                job = _leased_job(session, lease, action="validating source probe identity")
+                row = (
+                    session.get(DbSourceCandidate, job.active_source_candidate_id)
+                    if job.active_source_candidate_id
+                    else None
+                )
+                if row is not None and (
+                    row.source_id != source_id or row.extractor != extractor.casefold()
+                ):
+                    raise SourceValidationError(
+                        "source probe identity differs from the selected source"
+                    )
 
     def _resolve_ambiguous_source(
         self,
@@ -668,6 +816,8 @@ class DownloadJobProcessor:
         self,
         path: Path,
         cancellation: CancellationSignal,
+        *,
+        allow_attached_art: bool = False,
     ) -> MediaProbe:
         if self.media is None:
             raise MediaValidationError("ffmpeg/ffprobe media verification is not configured")
@@ -676,6 +826,7 @@ class DownloadJobProcessor:
             max_duration_seconds=self.settings.max_direct_media_seconds,
             allow_lossy_transcode=self.settings.allow_lossy_transcode,
             cancel_signal=cancellation,
+            allow_attached_art=allow_attached_art,
         )
 
     def _validate_canonical_metadata(
@@ -721,6 +872,7 @@ class DownloadJobProcessor:
                 break
         candidate = MetadataCandidate(
             artist=provider_artist,
+            artists=recording.artists,
             title=provider_title,
             album=_first_source_string(source, "album"),
             duration_seconds=probe.duration_seconds,
@@ -729,6 +881,7 @@ class DownloadJobProcessor:
         )
         ranked = self.metadata_matcher.rank(
             artist=expected_artist,
+            artists=structured_artists(expected.get("artists")),
             title=expected_title,
             album=_explicit_album_constraint(expected),
             duration_seconds=_float_or_none(expected.get("duration_seconds")),
@@ -811,28 +964,52 @@ class DownloadJobProcessor:
         lease: JobLease | None = None,
         monitor: LeaseMonitor | None = None,
         cancellation: CancellationSignal | None = None,
+        source_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         durable_replay = None
         if lease is not None and self.session_factory is not None:
             with self.session_factory() as session:
-                durable_replay = latest_user_canonical_selection(session, lease.job_id)
+                durable_replay = latest_canonical_selection(
+                    session,
+                    lease.job_id,
+                    source_extractor=_string_or_none(values.get("source_extractor")),
+                    source_id=_string_or_none(values.get("source_id")),
+                )
         if durable_replay is not None:
+            if durable_replay.payload.get("metadata_authority") in FALLBACK_AUTHORITIES:
+                return self._apply_provider_metadata(values, durable_replay.payload, lease)
             candidate = _metadata_candidate_from_payload(durable_replay.payload)
-            authority = "user"
+            authority = durable_replay.decided_by
             model_confidence = durable_replay.model_confidence
             openai_call_id = durable_replay.openai_call_id
             options: list[dict[str, Any]] = []
         else:
             if self.metadata_resolver is None:
                 raise RuntimeError("MusicBrainz canonical metadata resolution is not configured")
-            resolution = self.metadata_resolver.resolve(
-                artist=_required_string(values, "artist"),
-                title=_required_string(values, "title"),
-                album=_explicit_album_constraint(values),
-                duration_seconds=probe.duration_seconds,
-                version_signature=_explicit_version_constraint(values),
-                album_is_explicit=_album_constraint_explicit(values),
-            )
+            try:
+                resolution = self.metadata_resolver.resolve(
+                    artist=_required_string(values, "artist"),
+                    artists=structured_artists(values.get("artists")),
+                    title=_required_string(values, "title"),
+                    album=_explicit_album_constraint(values),
+                    duration_seconds=probe.duration_seconds,
+                    version_signature=_explicit_version_constraint(values),
+                    album_is_explicit=_album_constraint_explicit(values),
+                    year=_int_or_none(values.get("year")),
+                )
+            except WorkerMetadataError as exc:
+                if self.settings.canonical_metadata_policy == "require" and exc.retryable:
+                    raise
+                return self._fallback_or_review(
+                    values,
+                    probe,
+                    source_metadata,
+                    lease,
+                    options=[],
+                    reason_code=exc.reason_code,
+                )
+            if monitor is not None:
+                monitor.raise_if_unusable()
             options = list(resolution.options)
             fingerprint = candidate_set_fingerprint("canonical_metadata", options)
             replayed: dict[str, object] | None = None
@@ -881,15 +1058,26 @@ class DownloadJobProcessor:
                     values, probe, options, model_result
                 )
                 if selected is None or decision is None:
-                    raise JobNeedsReview(resolution.reason, options)
+                    return self._fallback_or_review(
+                        values,
+                        probe,
+                        source_metadata,
+                        lease,
+                        options=options,
+                        reason_code="low_confidence",
+                    )
                 candidate = _metadata_candidate_from_payload(selected)
                 authority = "openai"
                 model_confidence = decision.confidence
                 openai_call_id = _string_or_none(model_result.get("openai_call_id"))
             else:
-                raise JobNeedsReview(
-                    resolution.reason,
-                    options if resolution.decision == "review" else [],
+                return self._fallback_or_review(
+                    values,
+                    probe,
+                    source_metadata,
+                    lease,
+                    options=options if resolution.decision == "review" else [],
+                    reason_code=resolution.reason_code,
                 )
         if durable_replay is None and lease is not None and self.session_factory is not None:
             selected_option = next(
@@ -911,6 +1099,10 @@ class DownloadJobProcessor:
                     candidates=options,
                     selected_payload={
                         **_metadata_payload(candidate),
+                        "source_extractor": values.get("source_extractor"),
+                        "source_id": values.get("source_id"),
+                        "metadata_authority": "musicbrainz",
+                        "canonical_identity_verified": candidate.recording_mbid is not None,
                         "recording_candidate_id": selected_option.get("recording_candidate_id"),
                         "release_candidate_id": selected_option.get("release_candidate_id"),
                     },
@@ -923,7 +1115,7 @@ class DownloadJobProcessor:
                 )
         enriched = dict(values)
         enriched["artist"] = candidate.artist
-        enriched["artists"] = [candidate.artist]
+        enriched["artists"] = list(candidate.artists or (candidate.artist,))
         enriched["title"] = candidate.title
         if candidate.album:
             enriched["album"] = candidate.album
@@ -936,6 +1128,9 @@ class DownloadJobProcessor:
             # never survive a later local MusicBrainz resolution by omission.
             enriched[key] = getattr(candidate, key)
         enriched["canonical_identity_verified"] = candidate.recording_mbid is not None
+        enriched["metadata_authority"] = (
+            "musicbrainz" if candidate.recording_mbid else "user_confirmed_provider_metadata"
+        )
         raw_provenance = values.get("metadata_provenance")
         provenance = dict(raw_provenance) if isinstance(raw_provenance, Mapping) else {}
         raw_resolution = provenance.get("canonical_metadata_resolution")
@@ -953,6 +1148,132 @@ class DownloadJobProcessor:
         )
         provenance["canonical_metadata_resolution"] = canonical_resolution
         enriched["metadata_provenance"] = provenance
+        return enriched
+
+    def _source_authority(
+        self, lease: JobLease | None, values: Mapping[str, Any]
+    ) -> SourceAuthority:
+        if lease is None or self.session_factory is None:
+            return SourceAuthority()
+        with self.session_factory() as session:
+            job = _leased_job(session, lease, action="checking source metadata authority")
+            row = (
+                session.get(DbSourceCandidate, job.active_source_candidate_id)
+                if job.active_source_candidate_id
+                else None
+            )
+            if (
+                row is None
+                or row.job_id != lease.job_id
+                or row.policy_status != "allowed"
+                or row.probe_status != "valid"
+                or row.failure_code is not None
+                or row.source_id != values.get("source_id")
+                or row.extractor != values.get("source_extractor")
+            ):
+                return SourceAuthority()
+            evidence = session.get(EvidenceReference, row.evidence_id) if row.evidence_id else None
+            track = session.get(RequestTrack, job.request_track_id)
+            contradictions = json.loads(row.contradictions_json or "[]")
+            return SourceAuthority(
+                validated=True,
+                direct_approved=bool(
+                    evidence is not None
+                    and evidence.evidence_kind == "direct_user_url"
+                    and evidence.request_track_id == job.request_track_id
+                    and track is not None
+                    and track.approved_at is not None
+                ),
+                local_score=row.local_score,
+                contradictions=tuple(str(item) for item in contradictions),
+            )
+
+    def _fallback_or_review(
+        self,
+        values: dict[str, Any],
+        probe: MediaProbe,
+        source_metadata: Mapping[str, Any] | None,
+        lease: JobLease | None,
+        *,
+        options: list[dict[str, Any]],
+        reason_code: str,
+    ) -> dict[str, Any]:
+        fallback = provider_fallback(
+            values,
+            source_metadata or {},
+            authority=self._source_authority(lease, values),
+            duration=probe.duration_seconds,
+            minimum_score=getattr(self.settings, "provider_metadata_fallback_min_score", 0.90),
+        )
+        if fallback is not None:
+            payload = {**fallback.payload, "reason_code": reason_code}
+            if self.settings.canonical_metadata_policy == "prefer" and fallback.automatic:
+                assert lease is not None and self.session_factory is not None
+                with self.session_factory.begin() as session:
+                    job = _leased_job(
+                        session, lease, action="accepting validated provider metadata"
+                    )
+                    record_selected_decision(
+                        session,
+                        job,
+                        category="canonical_metadata",
+                        candidates=[payload],
+                        selected_payload=payload,
+                        decided_by="deterministic",
+                        reason_codes=["provider_metadata_fallback", reason_code],
+                        local_confidence=_float_or_none(fallback.payload["local_score"]),
+                    )
+                return self._apply_provider_metadata(values, payload, lease)
+            options = [payload, *options[:7]]
+        reason = (
+            "No confident MusicBrainz match was found. You may use the validated source "
+            "metadata or correct it manually."
+            if fallback is not None
+            else "MusicBrainz metadata could not be confirmed. Review the recording metadata."
+        )
+        if reason_code == "malformed_response":
+            reason = "MusicBrainz returned invalid metadata. Review the recording metadata."
+        raise JobNeedsReview(reason, options, category="canonical_metadata")
+
+    def _apply_provider_metadata(
+        self,
+        values: dict[str, Any],
+        payload: Mapping[str, Any],
+        lease: JobLease | None,
+    ) -> dict[str, Any]:
+        enriched = dict(values)
+        for key in (
+            "artist",
+            "artists",
+            "title",
+            "album",
+            "album_artist",
+            "year",
+            "duration_seconds",
+            "metadata_authority",
+        ):
+            if key in payload:
+                enriched[key] = payload[key]
+        enriched["album_artists"] = [enriched.get("album_artist") or enriched["artist"]]
+        for key in ("recording_mbid", "release_mbid", "release_group_mbid"):
+            enriched[key] = None
+            enriched.pop(f"suggested_{key}", None)
+        enriched["canonical_identity_verified"] = False
+        authority = str(payload["metadata_authority"])
+        provenance = dict(values.get("metadata_provenance") or {})
+        provenance["canonical_metadata_resolution"] = {
+            "source": authority,
+            "automatic_association": authority != "user_confirmed_provider_metadata",
+            "decided_by": "user"
+            if authority == "user_confirmed_provider_metadata"
+            else "deterministic",
+            "reason_code": payload.get("reason_code") or "user_selected_provider_metadata",
+        }
+        enriched["metadata_provenance"] = provenance
+        if lease is not None:
+            self.queue.add_warning(
+                lease, code="provider_metadata_fallback", message=FALLBACK_WARNING
+            )
         return enriched
 
     def _ask_openai_canonical(
@@ -1204,7 +1525,18 @@ class DownloadJobProcessor:
             or _string_or_none(source_metadata.get("extractor_key"))
             or _string_or_none(snapshot.get("source_extractor"))
         )
+        if isinstance(values["source_extractor"], str):
+            values["source_extractor"] = values["source_extractor"].casefold()
         values["source_id"] = _string_or_none(source_metadata.get("id"))
+        provider = provider_for_url(source_url)
+        values["source_provider"] = provider.value if provider is not None else None
+        recording = resolve_provider_recording_metadata(source_metadata)
+        values["source_uploader"] = recording.uploader
+        provenance = snapshot.get("metadata_provenance")
+        approved_artists = structured_artists(snapshot.get("artists"))
+        if not approved_artists and isinstance(provenance, Mapping):
+            approved_artists = structured_artists(provenance.get("artists"))
+        values["artists"] = list(approved_artists or (values["artist"],))
         values["job_id"] = job_id
         return values
 
@@ -1344,6 +1676,7 @@ def _first_source_string(value: Mapping[str, Any], *keys: str) -> str | None:
 def _metadata_payload(candidate: MetadataCandidate) -> dict[str, object]:
     return {
         "artist": candidate.artist,
+        "artists": list(candidate.artists or (candidate.artist,)),
         "title": candidate.title,
         "album": candidate.album,
         "year": candidate.year,
@@ -1362,6 +1695,7 @@ def _metadata_candidate_from_payload(value: Mapping[str, object]) -> MetadataCan
         raise JobNeedsReview("the persisted canonical metadata decision is incomplete")
     return MetadataCandidate(
         artist=artist,
+        artists=structured_artists(value.get("artists")),
         title=title,
         album=_string_or_none(value.get("album")),
         year=_int_or_none(value.get("year")),
@@ -1415,10 +1749,13 @@ def _int_or_none(value: object) -> int | None:
 def _float_or_none(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _is_retryable_job_error(exc: Exception) -> bool:
+    if isinstance(exc, WorkerMetadataError):
+        return exc.retryable
     if isinstance(exc, (YtDlpError, SourceValidationError)):
         return _is_transient_source_error(exc)
     return isinstance(exc, (WorkerMetadataError, OSError, ArtworkError)) and not isinstance(
@@ -1505,6 +1842,14 @@ def _leased_job(session: Session, lease: JobLease, *, action: str) -> DownloadJo
 
 
 def _error_code(exc: Exception) -> str:
+    if isinstance(exc, WorkerMetadataError):
+        reason = (
+            exc.reason_code
+            if exc.reason_code
+            in {"temporary_failure", "malformed_response", "rejected_request", "not_found"}
+            else "temporary_failure"
+        )
+        return f"musicbrainz_{reason}"
     name = type(exc).__name__
     result: list[str] = []
     for character in name:

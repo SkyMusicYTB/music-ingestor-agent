@@ -30,6 +30,7 @@ from app.db.models import (
     SourceCandidate as DbSourceCandidate,
 )
 from app.repositories.decisions import candidate_set_fingerprint, record_selected_decision
+from app.services.artist_credits import structured_artists
 from app.sources import (
     EXECUTABLE_EVIDENCE_KINDS,
     FiniteSourceResolver,
@@ -907,6 +908,7 @@ def _candidate_from_metadata(
             url=url,
             title=title[:500],
             artist=provider_artist[:300] if provider_artist else None,
+            artists=recording.artists or (fallback.artists if fallback else ()),
             artist_source=recording.artist_source or (fallback.artist_source if fallback else None),
             track=track[:300] if track else None,
             version=_first_string(value, "version"),
@@ -987,6 +989,7 @@ def _db_candidate_values(candidate: SourceCandidate) -> dict[str, object]:
         "sanitized_metadata_json": json.dumps(
             {
                 "track": candidate.track,
+                "artists": list(candidate.artists),
                 "artist_source": candidate.artist_source,
                 "version": candidate.version,
                 "uploader_id": candidate.uploader_id,
@@ -1012,6 +1015,7 @@ def _domain_from_row(row: DbSourceCandidate) -> SourceCandidate:
         url=_required_db_string(row.acquisition_url, "acquisition_url"),
         title=row.provider_title,
         artist=row.provider_artist,
+        artists=structured_artists(metadata.get("artists")),
         artist_source=_optional_artist_source(metadata.get("artist_source")),
         track=_optional_string(metadata.get("track")),
         version=_optional_string(metadata.get("version")) or row.version_signature,

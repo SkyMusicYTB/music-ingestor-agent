@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
+from app.services.artist_credits import artist_credit_similarity
 from app.sources.identities import UploaderRelationship
 from app.sources.models import SourceCandidate, SourceIntent, SourcePolicy
 from app.sources.provider_metadata import resolve_provider_recording_metadata
@@ -117,13 +118,13 @@ def _rank_one(
     expected_artist = normalize_match_text(intent.artist)
     expected_title = _clean_title(intent.title)
     candidate_artist, candidate_title = candidate_track_fields(candidate)
-    artist_score = _similarity(expected_artist, candidate_artist)
+    artist_score = artist_credit_similarity(expected_artist, candidate_artist)
     title_score = _similarity(expected_title, candidate_title)
     canonical_score = (artist_score + title_score) / 2.0
     canonical_exact = bool(
         expected_artist
         and expected_title
-        and candidate_artist == expected_artist
+        and artist_score == 1.0
         and candidate_title == expected_title
     )
 
@@ -140,7 +141,12 @@ def _rank_one(
     contradictions = list(
         DEFAULT_VERSION_CLASSIFIER.contradictions(requested_version, candidate_version)
     )
-    if candidate_artist and expected_artist and _other_artist(candidate_artist, expected_artist):
+    if (
+        candidate_artist
+        and expected_artist
+        and artist_score < 0.6
+        and _other_artist(candidate_artist, expected_artist)
+    ):
         contradictions.append("other_artist")
 
     duration_score, duration_compatible = _duration_component(intent, candidate, policy)
@@ -182,6 +188,7 @@ def candidate_track_fields(candidate: SourceCandidate) -> tuple[str, str]:
     fields = resolve_provider_recording_metadata(
         {
             "artist": candidate.artist,
+            "artists": candidate.artists,
             "track": candidate.track,
             "title": candidate.title,
             "uploader": candidate.uploader_name,

@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import re
 import threading
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -16,21 +18,44 @@ from app.clients.musicbrainz import (
     MusicBrainzError,
 )
 from app.config import Settings
+from app.services.artist_credits import (
+    artist_credit_similarity,
+    artist_credit_variant,
+    structured_artists,
+)
 from app.services.metadata_matching import (
+    MatchResult,
     MetadataCandidate,
     MetadataMatcher,
     candidates_from_musicbrainz,
     normalize_text,
+)
+from app.services.metadata_matching import (
+    version_signature as classify_version,
 )
 
 _NONSTANDARD_EDITION = re.compile(
     r"\b(compilation|greatest hits|best of|deluxe|expanded|anniversary|remaster|reissue)\b",
     re.IGNORECASE,
 )
+MAX_METADATA_SEARCH_REQUESTS = 12
+MAX_RECORDING_SEARCHES = 7
+MAX_RECORDING_CANDIDATES = 100
 
 
 class WorkerMetadataError(RuntimeError):
-    """A retryable failure of the public canonical-metadata provider."""
+    """A bounded, classified failure of the canonical-metadata provider."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "temporary_failure",
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.retryable = retryable
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +64,7 @@ class CanonicalMetadataResolution:
     candidate: MetadataCandidate | None
     options: tuple[dict[str, Any], ...]
     reason: str
+    reason_code: str = "matched"
 
 
 class MusicBrainzWorkerResolver:
@@ -81,6 +107,9 @@ class MusicBrainzWorkerResolver:
         duration_seconds: float | None,
         version_signature: str | None,
         album_is_explicit: bool = False,
+        artists: tuple[str, ...] = (),
+        year: int | None = None,
+        isrc: str | None = None,
     ) -> CanonicalMetadataResolution:
         if self._closed:
             raise WorkerMetadataError("MusicBrainz resolver is closed")
@@ -92,6 +121,9 @@ class MusicBrainzWorkerResolver:
                 duration_seconds=duration_seconds,
                 version_signature=version_signature,
                 album_is_explicit=album_is_explicit,
+                artists=artists,
+                year=year,
+                isrc=isrc,
             ),
             self._loop,
         )
@@ -101,7 +133,11 @@ class MusicBrainzWorkerResolver:
             future.cancel()
             raise WorkerMetadataError("MusicBrainz resolution timed out") from exc
         except MusicBrainzError as exc:
-            raise WorkerMetadataError("MusicBrainz resolution failed") from exc
+            raise WorkerMetadataError(
+                "MusicBrainz resolution failed",
+                reason_code=exc.reason_code,
+                retryable=exc.retryable,
+            ) from exc
 
     async def _resolve_async(
         self,
@@ -112,32 +148,145 @@ class MusicBrainzWorkerResolver:
         duration_seconds: float | None,
         version_signature: str | None,
         album_is_explicit: bool = False,
+        artists: tuple[str, ...] = (),
+        year: int | None = None,
+        isrc: str | None = None,
     ) -> CanonicalMetadataResolution:
-        payload = await self._client.search_recordings(artist=artist, title=title, limit=10)
-        candidates = [
-            _with_sensible_release(
-                candidate,
-                requested_album=album if album_is_explicit else None,
+        artists = structured_artists(artists)
+        budget = _RequestBudget()
+        candidates: dict[str, MetadataCandidate] = {}
+        saw_candidates = False
+
+        def rank() -> list[MatchResult]:
+            return self._matcher.rank(
+                artist=artist,
+                artists=artists,
+                title=title,
+                album=album,
+                duration_seconds=duration_seconds,
+                requested_version=version_signature,
+                requested_year=year,
+                requested_isrc=isrc,
+                album_is_explicit=album_is_explicit,
+                version_is_explicit=version_signature is not None,
+                candidates=candidates.values(),
+                limit=8,
             )
-            for candidate in candidates_from_musicbrainz(payload)
-        ]
-        ranked = self._matcher.rank(
-            artist=artist,
-            title=title,
-            album=album,
-            duration_seconds=duration_seconds,
-            requested_version=version_signature,
-            album_is_explicit=album_is_explicit,
-            version_is_explicit=version_signature is not None,
-            candidates=candidates,
-            limit=8,
-        )
+
+        def collect(payload: dict[str, Any], *, broad_search: bool) -> None:
+            nonlocal saw_candidates
+            values = payload.get("recordings")
+            if not isinstance(values, list):
+                raise MusicBrainzError(
+                    "unexpected MusicBrainz recordings shape",
+                    reason_code="malformed_response",
+                    retryable=False,
+                )
+            parsed = candidates_from_musicbrainz({"recordings": values[:MAX_RECORDING_CANDIDATES]})
+            saw_candidates = saw_candidates or bool(parsed)
+            if values and not parsed:
+                raise MusicBrainzError(
+                    "MusicBrainz recording candidates were malformed",
+                    reason_code="malformed_response",
+                    retryable=False,
+                )
+            for candidate in parsed:
+                candidate = _with_sensible_release(
+                    candidate, requested_album=album if album_is_explicit else None
+                )
+                if broad_search and not _safe_broad_candidate(
+                    candidate,
+                    artist=artist,
+                    artists=artists,
+                    title=title,
+                    duration_seconds=duration_seconds,
+                    version_signature=version_signature,
+                ):
+                    continue
+                if candidate.recording_mbid and (
+                    candidate.recording_mbid in candidates
+                    or len(candidates) < MAX_RECORDING_CANDIDATES
+                ):
+                    existing = candidates.get(candidate.recording_mbid)
+                    candidates[candidate.recording_mbid] = _merge_candidate(
+                        existing,
+                        candidate,
+                        requested_album=album if album_is_explicit else None,
+                    )
+
+        ranked: list[MatchResult] = []
+        for search_artist, artist_terms in _recording_queries(artist, artists):
+            payload = await budget.call(
+                self._client.search_recordings,
+                artist=search_artist,
+                title=title,
+                artist_terms=artist_terms,
+                limit=25 if search_artist is None and not artist_terms else 10,
+            )
+            if payload is None:
+                break
+            collect(payload, broad_search=search_artist is None and not artist_terms)
+            ranked = rank()
+            if ranked and ranked[0].decision == "auto":
+                break
+
+        if not ranked or ranked[0].decision != "auto":
+            # Some recordings are only discoverable from a release's tracklist.
+            # Search a bounded release/group set and inspect only returned IDs.
+            release_title = album if album_is_explicit and album else title
+            release_artist = artist_credit_variant(artist)
+            release_ids: list[str] = []
+            releases = await budget.call(
+                self._client.search_releases,
+                artist=release_artist,
+                title=release_title,
+                limit=2,
+            )
+            release_ids.extend(_result_ids(releases, "releases", limit=2))
+            if not release_ids:
+                groups = await budget.call(
+                    self._client.search_release_groups,
+                    artist=release_artist,
+                    title=release_title,
+                    limit=1,
+                )
+                for group_id in _result_ids(groups, "release-groups", limit=1):
+                    releases = await budget.call(
+                        self._client.browse,
+                        "release",
+                        "release-group",
+                        group_id,
+                        limit=2,
+                        includes=("artist-credits",),
+                    )
+                    release_ids.extend(_result_ids(releases, "releases", limit=2))
+            for release_id in dict.fromkeys(release_ids):
+                release = await budget.call(
+                    self._client.lookup,
+                    "release",
+                    release_id,
+                    includes=("recordings", "artist-credits", "release-groups"),
+                )
+                if release is not None:
+                    records = _release_recordings(release)
+                    if records:
+                        collect({"recordings": records}, broad_search=True)
+                ranked = rank()
+                if ranked and ranked[0].decision == "auto":
+                    break
+
+        ranked = rank()
         if not ranked:
             return CanonicalMetadataResolution(
                 decision="reject",
                 candidate=None,
                 options=(),
-                reason="MusicBrainz returned no recording candidates",
+                reason=(
+                    "No MusicBrainz recording candidate satisfied identity checks"
+                    if saw_candidates
+                    else "MusicBrainz returned no recording candidates"
+                ),
+                reason_code="low_confidence" if saw_candidates else "no_candidates",
             )
         options = tuple(
             {
@@ -160,6 +309,7 @@ class MusicBrainzWorkerResolver:
                     else None
                 ),
                 "artist": item.candidate.artist,
+                "artists": list(item.candidate.artists),
                 "title": item.candidate.title,
                 "album": item.candidate.album,
                 "year": item.candidate.year,
@@ -187,6 +337,7 @@ class MusicBrainzWorkerResolver:
                 f"MusicBrainz canonical match scored {top.score:.1f}/100"
                 + (f" with a {top.lead:.1f}-point lead" if top.lead is not None else "")
             ),
+            reason_code="matched" if top.decision == "auto" else "low_confidence",
         )
 
     def close(self) -> None:
@@ -205,6 +356,153 @@ class MusicBrainzWorkerResolver:
 def _candidate_id(prefix: str, *values: str | None) -> str:
     material = "\x1f".join(value or "" for value in values)
     return f"{prefix}_{hashlib.sha256(material.encode()).hexdigest()[:20]}"
+
+
+class _RequestBudget:
+    def __init__(self) -> None:
+        self.used = 0
+
+    async def call(
+        self,
+        operation: Callable[..., Awaitable[dict[str, Any] | None]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        if self.used >= MAX_METADATA_SEARCH_REQUESTS:
+            return None
+        self.used += 1
+        return await operation(*args, **kwargs)
+
+
+def _recording_queries(
+    artist: str, artists: tuple[str, ...]
+) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
+    queries: list[tuple[str | None, tuple[str, ...]]] = [(artist, ())]
+    variant = artist_credit_variant(artist)
+    if variant != artist:
+        queries.append((variant, ()))
+    # Only provider-supplied structured artists are individual search terms.
+    # Do not turn punctuation-bearing band names into invented collaborators.
+    for collaborator in artists[:3]:
+        entry = (collaborator, ())
+        if entry not in queries:
+            queries.append(entry)
+    if len(artists) > 1:
+        queries.append((None, artists[:4]))
+    queries = queries[: MAX_RECORDING_SEARCHES - 1]
+    queries.append((None, ()))
+    return tuple(queries)
+
+
+def _safe_broad_candidate(
+    candidate: MetadataCandidate,
+    *,
+    artist: str,
+    artists: tuple[str, ...],
+    title: str,
+    duration_seconds: float | None,
+    version_signature: str | None,
+) -> bool:
+    """A title-only/release search is discovery, never identity authority."""
+    return bool(
+        normalize_text(title) == normalize_text(candidate.title)
+        and artist_credit_similarity(
+            artist, candidate.artist, left_artists=artists, right_artists=candidate.artists
+        )
+        >= 0.95
+        and duration_seconds is not None
+        and candidate.duration_seconds is not None
+        and abs(duration_seconds - candidate.duration_seconds) <= max(10, duration_seconds * 0.05)
+        and classify_version(version_signature, title) == candidate.version
+    )
+
+
+def _merge_candidate(
+    existing: MetadataCandidate | None,
+    candidate: MetadataCandidate,
+    *,
+    requested_album: str | None,
+) -> MetadataCandidate:
+    if existing is None:
+        return candidate
+    # The same recording returned by multiple searches must not compete with
+    # itself and erase its eight-point lead. Preserve already enriched fields.
+    releases: dict[str, dict[str, Any]] = {}
+    for raw in (existing.raw, candidate.raw):
+        values = raw.get("releases") if raw else None
+        if isinstance(values, list):
+            for value in values[:100]:
+                if isinstance(value, dict) and isinstance(value.get("id"), str):
+                    releases.setdefault(value["id"], value)
+    raw = {**(candidate.raw or {}), **(existing.raw or {}), "releases": list(releases.values())}
+    merged = replace(
+        existing,
+        album=existing.album or candidate.album,
+        year=existing.year or candidate.year,
+        duration_seconds=existing.duration_seconds or candidate.duration_seconds,
+        release_mbid=existing.release_mbid or candidate.release_mbid,
+        release_group_mbid=existing.release_group_mbid or candidate.release_group_mbid,
+        artists=existing.artists or candidate.artists,
+        raw=raw,
+    )
+    return _with_sensible_release(merged, requested_album=requested_album)
+
+
+def _result_ids(payload: dict[str, Any] | None, key: str, *, limit: int) -> list[str]:
+    if payload is None:
+        return []
+    values = payload.get(key)
+    if not isinstance(values, list):
+        raise MusicBrainzError(
+            "unexpected MusicBrainz search shape",
+            reason_code="malformed_response",
+            retryable=False,
+        )
+    result: list[str] = []
+    for value in values[:limit]:
+        if isinstance(value, Mapping) and isinstance(value.get("id"), str):
+            try:
+                result.append(str(uuid.UUID(value["id"])))
+            except ValueError:
+                continue
+    return result
+
+
+def _provider_mbid(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+def _release_recordings(release: dict[str, Any]) -> list[dict[str, Any]]:
+    media = release.get("media")
+    if not isinstance(media, list):
+        return []
+    result: list[dict[str, Any]] = []
+    # Bound traversal independently of the provider's declared counts.
+    for medium in media[:20]:
+        if not isinstance(medium, dict) or not isinstance(medium.get("tracks"), list):
+            continue
+        for track in medium["tracks"][:100]:
+            if len(result) >= 100:
+                return result
+            if not isinstance(track, dict) or not isinstance(track.get("recording"), dict):
+                continue
+            recording = dict(track["recording"])
+            recording.setdefault("title", track.get("title"))
+            recording.setdefault("length", track.get("length"))
+            recording.setdefault(
+                "artist-credit", track.get("artist-credit") or release.get("artist-credit")
+            )
+            recording.setdefault("first-release-date", release.get("date"))
+            recording["releases"] = [
+                {key: value for key, value in release.items() if key != "media"}
+            ]
+            result.append(recording)
+    return result
 
 
 def _with_sensible_release(
@@ -253,11 +551,9 @@ def _with_sensible_release(
         candidate,
         album=str(selected.get("title")) if selected.get("title") else candidate.album,
         year=year,
-        release_mbid=(str(selected.get("id")) if selected.get("id") else candidate.release_mbid),
+        release_mbid=_provider_mbid(selected.get("id")) or candidate.release_mbid,
         release_group_mbid=(
-            str(release_group.get("id"))
-            if release_group.get("id")
-            else candidate.release_group_mbid
+            _provider_mbid(release_group.get("id")) or candidate.release_group_mbid
         ),
     )
 
