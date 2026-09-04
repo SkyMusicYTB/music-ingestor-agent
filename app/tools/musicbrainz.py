@@ -15,7 +15,9 @@ from app.services.metadata_matching import (
     ReleaseMetadataMatcher,
     candidates_from_apple,
     candidates_from_musicbrainz,
+    select_sensible_release,
 )
+from app.tools.media_sources import current_tool_authorization
 from app.tools.registry import ToolDefinition, ToolRegistry
 
 
@@ -42,6 +44,9 @@ def register_musicbrainz_tools(
 ) -> None:
     async def recordings(arguments: dict[str, Any]) -> dict[str, Any]:
         values = RecordingSearchArguments.model_validate(arguments)
+        authorization = current_tool_authorization()
+        explicit_album = authorization.requested_album if authorization is not None else None
+        explicit_version = authorization.requested_version if authorization is not None else None
         payload = await client.search_recordings(
             artist=values.artist, title=values.title, limit=values.limit
         )
@@ -53,12 +58,18 @@ def register_musicbrainz_tools(
             )
             candidates = candidates_from_apple(apple_payload)
             fallback_used = True
+        candidates = [
+            select_sensible_release(candidate, requested_album=explicit_album)
+            for candidate in candidates
+        ]
         ranked = MetadataMatcher().rank(
             artist=values.artist,
             title=values.title,
-            album=values.album,
+            album=explicit_album or values.album,
             duration_seconds=values.duration_seconds,
-            requested_version=values.version,
+            requested_version=explicit_version or values.version,
+            album_is_explicit=explicit_album is not None,
+            version_is_explicit=explicit_version is not None,
             candidates=candidates,
             limit=values.limit,
         )
@@ -68,6 +79,7 @@ def register_musicbrainz_tools(
             "matches": [
                 {
                     "artist": match.candidate.artist,
+                    "artists": list(match.candidate.artists),
                     "title": match.candidate.title,
                     "album": match.candidate.album,
                     "year": match.candidate.year,
@@ -86,6 +98,7 @@ def register_musicbrainz_tools(
                     ),
                     "lead": round(match.lead, 2) if match.lead is not None else None,
                     "reasons": list(match.reasons),
+                    "contradiction_codes": list(match.contradiction_codes),
                 }
                 for match in ranked
             ],
@@ -163,6 +176,7 @@ def register_musicbrainz_tools(
             handler=recordings,
             max_result_bytes=64_000,
             cache_ttl_seconds=86_400,
+            cache_vary=_recording_constraint_cache_vary,
         )
     )
     registry.register(
@@ -175,6 +189,18 @@ def register_musicbrainz_tools(
             cache_ttl_seconds=86_400,
         )
     )
+
+
+def _recording_constraint_cache_vary() -> dict[str, str | None]:
+    """Partition cached rankings by trusted request constraints, not model claims."""
+
+    authorization = current_tool_authorization()
+    return {
+        "requested_album": authorization.requested_album if authorization is not None else None,
+        "requested_version": (
+            authorization.requested_version if authorization is not None else None
+        ),
+    }
 
 
 def _release_result(value: object, *, include_tracks: bool = False) -> dict[str, Any]:

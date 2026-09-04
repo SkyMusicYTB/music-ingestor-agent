@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -26,8 +27,8 @@ def reuse_or_create_decision_task(
     """Reuse one durable AI decision task for an exact finite candidate set.
 
     Callers must validate the active job lease in the same transaction before invoking
-    this helper. The job/category/fingerprint fields make the idempotency boundary
-    explicit instead of depending on prompt prose or candidate display ordering.
+    this helper. Candidate ordering is intentionally ignored, while the complete
+    normalized intent and matcher policy version are part of the reuse boundary.
     """
 
     job_id = payload.get("job_id")
@@ -43,6 +44,24 @@ def reuse_or_create_decision_task(
     safe_payload = stable_payload(payload)
     if not isinstance(safe_payload, dict):
         raise ValueError("decision task payload must be an object")
+    context = stable_payload(
+        {
+            "schema_version": safe_payload.get("schema_version"),
+            "decision_category": category,
+            "candidate_set_fingerprint": fingerprint,
+            "intent": safe_payload.get("intent"),
+            "matcher_prompt_version": safe_payload.get("matcher_prompt_version"),
+        }
+    )
+    context_serialized = json.dumps(
+        context,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    safe_payload["decision_context_fingerprint"] = hashlib.sha256(
+        context_serialized.encode("utf-8")
+    ).hexdigest()
     serialized = json.dumps(
         safe_payload,
         ensure_ascii=False,
@@ -60,6 +79,8 @@ def reuse_or_create_decision_task(
             func.json_extract(ServiceTask.payload_json, "$.decision_category") == category,
             func.json_extract(ServiceTask.payload_json, "$.candidate_set_fingerprint")
             == fingerprint,
+            func.json_extract(ServiceTask.payload_json, "$.decision_context_fingerprint")
+            == safe_payload["decision_context_fingerprint"],
         )
         .order_by(ServiceTask.created_at.desc())
         .limit(1)

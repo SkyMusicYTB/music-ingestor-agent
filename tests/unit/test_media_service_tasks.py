@@ -24,7 +24,7 @@ from app.db.models import (
     SourceCandidate as DbSourceCandidate,
 )
 from app.services.source_selection import SourceCandidate
-from app.sources import ProviderIdentity, UploaderRelationship
+from app.sources import EXECUTABLE_EVIDENCE_KINDS, ProviderIdentity, UploaderRelationship
 from app.tools.media_sources import (
     ProbeMediaSourceArguments,
     SearchMediaSourcesArguments,
@@ -63,6 +63,18 @@ class _ThirdPartyYouTubeYtDlp(_FakeYtDlp):
         }
 
 
+class _VersionedDirectYtDlp(_FakeYtDlp):
+    def probe(self, _value: str, *, cancel_signal=None) -> dict[str, object]:
+        return {
+            "id": "versioned-direct",
+            "extractor": "youtube",
+            "track": "Resolved Song",
+            "artist": "Resolved Artist",
+            "version": "radio_edit",
+            "duration": 180,
+        }
+
+
 class _RejectingYtDlp(_FakeYtDlp):
     def validate_url(self, value: str) -> str:
         raise SourceValidationError(f"rejected source: {value[:8]}")
@@ -71,6 +83,11 @@ class _RejectingYtDlp(_FakeYtDlp):
 class _UnavailableYtDlp(_FakeYtDlp):
     def probe(self, _value: str, *, cancel_signal=None) -> dict[str, object]:
         raise YtDlpError("temporary provider failure")
+
+
+class _RejectedSearchYtDlp(_FakeYtDlp):
+    def search_provider(self, query: str, *, provider, limit: int, cancel_signal=None):
+        raise SourceValidationError("provider search rejected")
 
 
 class _CancelledYtDlp(_FakeYtDlp):
@@ -145,6 +162,7 @@ class _BandcampCollectionYtDlp(_BandcampYtDlp):
                     "title": "Resolved Artist - First Song",
                     "artist": "Resolved Artist",
                     "uploader": "Resolved Artist",
+                    "version": "sped_up",
                     "duration": 181,
                     "webpage_url": "https://resolved-artist.bandcamp.com/track/first-song",
                 },
@@ -332,6 +350,46 @@ def test_direct_url_does_not_copy_third_party_creator_into_canonical_artist(
         assert candidate.uploader_relationship == "third_party"
 
 
+def test_direct_ingestion_derives_version_from_recording_level_provider_field(
+    session_factory,
+) -> None:
+    request_id = _request(session_factory, suffix="versioned-direct")
+    with session_factory.begin() as session:
+        session.add(
+            ServiceTask(
+                target="worker",
+                kind="resolve_direct_request",
+                payload_json=json.dumps({"request_id": request_id}),
+                available_at=datetime.now(UTC),
+            )
+        )
+    queue = ServiceTaskQueue(session_factory, target="worker", lease_seconds=30)
+    lease = queue.claim_next()
+    assert lease is not None
+    handler = WorkerServiceTaskHandler(
+        queue=queue,
+        factory=session_factory,
+        ytdlp=_VersionedDirectYtDlp(),  # type: ignore[arg-type]
+        youtube=_FakeYouTube(),  # type: ignore[arg-type]
+        scanner=_UnusedScanner(),  # type: ignore[arg-type]
+        max_duration_seconds=600,
+    )
+
+    assert handler.process(lease).completed
+    with session_factory() as session:
+        track = session.scalar(select(RequestTrack).where(RequestTrack.request_id == request_id))
+        assert track is not None and track.version_signature == "radio edit"
+        candidate = session.scalar(
+            select(DbSourceCandidate).where(DbSourceCandidate.request_track_id == track.id)
+        )
+        assert candidate is not None and candidate.version_signature == "radio edit"
+        provenance = json.loads(track.metadata_provenance_json)
+        assert provenance["recording_version"] == {
+            "signature": "radio edit",
+            "source": "provider_recording_metadata",
+        }
+
+
 def test_direct_collection_creates_bounded_selectable_per_track_candidates(
     session_factory,
 ) -> None:
@@ -396,6 +454,16 @@ def test_direct_collection_creates_bounded_selectable_per_track_candidates(
         }
         assert all(candidate.probe_status == "pending" for candidate in candidates)
         assert all(candidate.acquisition_url != collection_url for candidate in candidates)
+        assert [track.version_signature for track in tracks] == ["sped up", "studio"]
+        assert {candidate.source_id: candidate.version_signature for candidate in candidates} == {
+            "first-song": "sped up",
+            "second-song": "studio",
+        }
+        first_provenance = json.loads(tracks[0].metadata_provenance_json)
+        assert first_provenance["recording_version"] == {
+            "signature": "sped up",
+            "source": "provider_recording_metadata",
+        }
 
 
 def test_structured_artist_arrays_survive_flat_search_and_evidence_persistence(
@@ -539,6 +607,37 @@ def test_finite_media_search_persists_urls_only_in_worker_database(session_facto
         assert evidence.canonical_url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         assert candidate is not None and candidate.acquisition_url == evidence.canonical_url
         assert candidate.probe_status == "pending"
+        diagnostic = session.scalar(
+            select(EvidenceReference).where(
+                EvidenceReference.request_id == request_id,
+                EvidenceReference.evidence_kind == "source_search_diagnostics",
+            )
+        )
+        assert diagnostic is not None
+        assert diagnostic.request_track_id is None
+        assert diagnostic.job_id is None
+        assert diagnostic.provider == "automatic"
+        assert diagnostic.canonical_url is None
+        assert diagnostic.provider_item_id is None
+        assert diagnostic.evidence_kind not in EXECUTABLE_EVIDENCE_KINDS
+        diagnostic_payload = json.loads(diagnostic.sanitized_metadata_json)
+        assert diagnostic_payload["discovery_diagnostics"] == {
+            "accepted_count": 0,
+            "found_count": 1,
+            "probed_count": 0,
+            "query_attempts": [
+                {
+                    "found_count": 1,
+                    "provider": "youtube",
+                    "query": "[redacted unsafe query]",
+                }
+            ],
+            "query_variant_count": 1,
+            "rejection_counts": {},
+            "schema_version": 1,
+            "stopped_early": False,
+        }
+        assert "youtu.be" not in diagnostic.sanitized_metadata_json
 
 
 def test_finite_media_probe_returns_opaque_id_without_worker_url(session_factory) -> None:
@@ -561,6 +660,13 @@ def test_finite_media_probe_returns_opaque_id_without_worker_url(session_factory
     with session_factory() as session:
         search_task = session.get(ServiceTask, search_lease.task_id)
         evidence_id = json.loads(search_task.result_json or "{}")["candidates"][0]["evidence_id"]
+    _handler(session_factory, queue)._record_request_source_search(
+        request_id=request_id,
+        request_track_id=None,
+        provider=ProviderIdentity.SOUNDCLOUD,
+        query="Resolved Artist Resolved Song",
+        found_count=0,
+    )
     with session_factory.begin() as session:
         task = ServiceTask(
             target="worker",
@@ -584,6 +690,97 @@ def test_finite_media_probe_returns_opaque_id_without_worker_url(session_factory
         assert candidate.policy_status == "allowed"
         assert candidate.probe_status == "valid"
         assert candidate.acquisition_url is not None
+        diagnostic = session.scalar(
+            select(EvidenceReference).where(
+                EvidenceReference.request_id == request_id,
+                EvidenceReference.evidence_kind == "source_search_diagnostics",
+            )
+        )
+        assert diagnostic is not None
+        diagnostic_payload = json.loads(diagnostic.sanitized_metadata_json)
+        assert diagnostic_payload["discovery_diagnostics"]["probed_count"] == 1
+        assert diagnostic_payload["discovery_diagnostics"]["accepted_count"] == 1
+        assert diagnostic_payload["discovery_diagnostic_runs"][0]["probed_count"] == 1
+        assert diagnostic_payload["discovery_diagnostic_runs"][0]["accepted_count"] == 1
+        assert diagnostic_payload["discovery_diagnostic_runs"][-1]["probed_count"] == 0
+        assert diagnostic_payload["discovery_diagnostic_runs"][-1]["accepted_count"] == 0
+
+
+def test_request_source_diagnostic_history_is_bounded_and_deduplicated(session_factory) -> None:
+    request_id = _request(session_factory, suffix="diagnostic-history")
+    queue = ServiceTaskQueue(session_factory, target="worker", lease_seconds=30)
+    handler = _handler(session_factory, queue)
+
+    for index in range(12):
+        handler._record_request_source_search(
+            request_id=request_id,
+            request_track_id=None,
+            provider=ProviderIdentity.YOUTUBE,
+            query=f"Resolved Artist Song variant {index}",
+            found_count=1,
+        )
+    handler._record_request_source_search(
+        request_id=request_id,
+        request_track_id=None,
+        provider=ProviderIdentity.YOUTUBE,
+        query="Resolved Artist Song variant 11",
+        found_count=1,
+    )
+
+    with session_factory() as session:
+        diagnostics = list(
+            session.scalars(
+                select(EvidenceReference).where(
+                    EvidenceReference.request_id == request_id,
+                    EvidenceReference.evidence_kind == "source_search_diagnostics",
+                )
+            )
+        )
+        assert len(diagnostics) == 1
+        row = diagnostics[0]
+        assert row.canonical_url is None
+        assert row.provider_item_id is None
+        payload = json.loads(row.sanitized_metadata_json)
+        runs = payload["discovery_diagnostic_runs"]
+        assert len(runs) == 10
+        assert runs[0]["query_attempts"][0]["query"].endswith("variant 2")
+        assert runs[-1]["query_attempts"][0]["query"].endswith("variant 11")
+        assert payload["discovery_diagnostics"]["found_count"] == 10
+
+
+def test_failed_request_source_search_persists_only_bounded_diagnostics(session_factory) -> None:
+    request_id = _request(session_factory, suffix="rejected-search-diagnostics")
+    queue = ServiceTaskQueue(session_factory, target="worker", lease_seconds=30)
+    handler = WorkerServiceTaskHandler(
+        queue=queue,
+        factory=session_factory,
+        ytdlp=_RejectedSearchYtDlp(),  # type: ignore[arg-type]
+        youtube=_FakeYouTube(),  # type: ignore[arg-type]
+        scanner=_UnusedScanner(),  # type: ignore[arg-type]
+        max_duration_seconds=600,
+    )
+
+    with pytest.raises(SourceValidationError, match="provider search rejected"):
+        handler._search_media_sources(
+            {"intent_id": request_id, "provider": "soundcloud", "limit": 3}
+        )
+
+    with session_factory() as session:
+        diagnostic = session.scalar(
+            select(EvidenceReference).where(
+                EvidenceReference.request_id == request_id,
+                EvidenceReference.evidence_kind == "source_search_diagnostics",
+            )
+        )
+        assert diagnostic is not None
+        assert diagnostic.canonical_url is None
+        assert diagnostic.provider_item_id is None
+        payload = json.loads(diagnostic.sanitized_metadata_json)
+        assert payload["discovery_diagnostics"]["found_count"] == 0
+        assert payload["discovery_diagnostics"]["rejection_counts"] == {
+            "provider_search_rejected": 1
+        }
+        assert "youtu.be" not in diagnostic.sanitized_metadata_json
 
 
 def test_media_tool_schemas_expose_only_finite_ids_and_provider() -> None:

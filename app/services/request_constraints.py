@@ -5,6 +5,7 @@ import unicodedata
 from dataclasses import dataclass
 
 from app.services.duplicates import version_signature
+from app.services.recording_versions import recording_version_evidence
 from app.sources import ProviderIdentity, provider_for_url
 
 _ACQUISITION_PROVIDERS = (
@@ -50,7 +51,6 @@ _ALBUM_LABEL = re.compile(
     r"(?P<bare>[^,;.!?]{1,300}?)(?=\s+by\b|$))",
     re.IGNORECASE,
 )
-_BRACKETED = re.compile(r"[\[(](?P<value>[^\])]{1,100})[\])]")
 _EXPLICIT_VERSION = re.compile(
     r"\b(?P<value>live|acoustic|remix|remixed|demo|instrumental|karaoke|cover|"
     r"remaster(?:ed)?(?:\s+\d{4})?|radio\s+edit|sped[ -]?up|slowed(?:\s*[+&]\s*reverb)?|"
@@ -100,12 +100,13 @@ def parse_explicit_request_constraints(
             providers=((provider_name,) if provider_name is not None else ()),
         )
     providers, excluded_providers = _explicit_providers(normalized)
+    album, album_span = _explicit_album_with_span(normalized)
     return ExplicitRequestConstraints(
         provider=providers[0] if len(providers) == 1 else None,
         providers=providers,
         excluded_providers=excluded_providers,
-        album=_explicit_album(normalized),
-        version=_explicit_version(normalized),
+        album=album,
+        version=_explicit_version(_mask_span(normalized, album_span)),
     )
 
 
@@ -130,6 +131,18 @@ def _explicit_providers(value: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
 
 
 def _explicit_album(value: str) -> str | None:
+    album, _span = _explicit_album_with_span(value)
+    return album
+
+
+def _explicit_album_with_span(value: str) -> tuple[str | None, tuple[int, int] | None]:
+    """Return release text and the complete phrase that supplied it.
+
+    Album/release names are packaging context, not recording-version evidence.
+    The source span lets callers ignore words such as ``Live`` inside the album
+    phrase while retaining an independent ``live version`` qualifier elsewhere.
+    """
+
     for pattern in (_ALBUM_QUOTED, _ALBUM_LABEL, _ALBUM_BARE):
         match = pattern.search(value)
         if match is None:
@@ -146,12 +159,19 @@ def _explicit_album(value: str) -> str | None:
             continue
         cleaned = " ".join(raw.split()).strip(" \t\r\n\"'\u201c\u201d\u2018\u2019")
         if cleaned:
-            return cleaned[:300]
-    return None
+            return cleaned[:300], match.span()
+    return None, None
+
+
+def _mask_span(value: str, span: tuple[int, int] | None) -> str:
+    if span is None:
+        return value
+    start, end = span
+    return f"{value[:start]}{' ' * (end - start)}{value[end:]}"
 
 
 def _explicit_version(value: str) -> str | None:
-    samples = [match.group("value") for match in _BRACKETED.finditer(value)]
+    samples = list(recording_version_evidence(value))
     samples.extend(match.group("value") for match in _EXPLICIT_VERSION.finditer(value))
     samples.extend(match.group("value") for match in _STRONG_VERSION.finditer(value))
     signatures = {

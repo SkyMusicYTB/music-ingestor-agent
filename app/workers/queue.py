@@ -771,6 +771,59 @@ class DownloadJobQueue:
             session.commit()
             return result
 
+    def defer_for_equivalent_acquisition(
+        self, lease: JobLease, *, now: datetime | None = None
+    ) -> str:
+        """Release a corrected legacy job while an equivalent active job finishes.
+
+        This is coordination rather than a provider failure, so it does not consume
+        the bounded retry budget. The next claim rechecks the corrected deduplication
+        identity under the worker lease.
+        """
+
+        timestamp = now or utc_now()
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            job = session.scalar(
+                select(DownloadJob).where(
+                    DownloadJob.id == lease.job_id,
+                    DownloadJob.lease_token == lease.token,
+                    DownloadJob.status.in_(["active", "cancel_requested"]),
+                )
+            )
+            if job is None:
+                session.rollback()
+                raise LeaseLostError(
+                    "download lease lost while waiting for an equivalent acquisition"
+                )
+            if job.status == "cancel_requested":
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.completed_at = timestamp
+                event_type = "job.cancelled"
+                message = "Download cancelled"
+            else:
+                job.status = "retry_wait"
+                job.stage = "resolving_source"
+                job.available_at = timestamp + timedelta(seconds=30)
+                job.error_code = "equivalent_acquisition_active"
+                job.error_message = "Waiting for an equivalent acquisition already in progress"
+                event_type = "job.retry_wait"
+                message = "Download is waiting for an equivalent acquisition"
+            job.lease_token = None
+            job.lease_expires_at = None
+            job.updated_at = timestamp
+            _job_event(
+                session,
+                job.id,
+                event_type,
+                message,
+                details={"reason_code": "equivalent_acquisition_active"},
+            )
+            result = job.status
+            session.commit()
+            return result
+
     def wait_for_space(
         self,
         lease: JobLease,

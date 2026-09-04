@@ -13,24 +13,49 @@
       <div class="section-heading"><strong>{% if job.status == 'needs_review' and job.stage == 'resolving_metadata' %}Metadata needs review{% else %}{{ friendly_stage(job.stage) }}{% endif %}</strong><span class="status status-{{ job.status }}">{{ job.status|replace('_', ' ') }}</span></div>
       {% set snapshot = snapshots.get(job.id, {}) %}
       {% set bundle = review_bundles.get(job.id) %}
-      {% if snapshot.get('title') %}<p><strong>{{ snapshot.get('title') }}</strong>{% if snapshot.get('artist') %} · {{ snapshot.get('artist') }}{% endif %}{% if snapshot.get('album') %} · {{ snapshot.get('album') }}{% endif %}</p>{% endif %}
+      {% if snapshot.get('title') %}<p><strong>{{ snapshot.get('title') }}</strong>{% if snapshot.get('artist') %} — {{ snapshot.get('artist') }}{% endif %}</p>{% endif %}
+      {% if snapshot.get('version_signature') or snapshot.get('album') %}<p><small><strong>Requested version:</strong> {% if snapshot.get('requested_version') %}{{ snapshot.get('requested_version')|replace('_', ' ')|title }}{% else %}No special version (studio/original default){% endif %}{% if snapshot.get('version_signature') %} · <strong>Resolved recording version:</strong> {{ snapshot.get('version_signature')|replace('_', ' ')|title }}{% endif %}{% if snapshot.get('album') %} · <strong>Selected release:</strong> {{ snapshot.get('album') }}{% if snapshot.get('year') %} ({{ snapshot.get('year') }}){% endif %}{% endif %}</small></p>{% endif %}
       <progress max="1" value="{{ job.progress }}">{{ (job.progress * 100)|round }}%</progress>
       {% if job.final_relative_path %}<p><code>{{ job.final_relative_path }}</code></p>{% endif %}
       {% if job.error_message %}<div class="alert error">{{ job.error_message }}</div>{% endif %}
       {% for warning in warnings.get(job.id, []) %}{% if warning.message != job.error_message and warning.code != 'needs_review' %}<div class="alert warning">{{ warning.message }}</div>{% endif %}{% endfor %}
-      {% if selected_sources.get(job.id) %}{% set selected_source = selected_sources[job.id] %}<p class="source-summary">Source selected · {{ selected_source.provider|title }}{% if selected_source.uploader %} · uploaded by {{ selected_source.uploader }}{% endif %}</p>{% endif %}
+      {% if selected_sources.get(job.id) %}{% set selected_source = selected_sources[job.id] %}<p class="source-summary">Source selected · {{ selected_source.provider }}{% if selected_source.uploader %} · uploaded by {{ selected_source.uploader }}{% endif %}</p>{% endif %}
       {% if match_details.get(job.id) %}
       <details>
         <summary>How this was matched</summary>
         {% for decision in match_details.get(job.id, []) %}
         <p><strong>{{ decision.label }}</strong>
-          {% if decision.artist %} · {{ decision.artist }} — {{ decision.title }}{% endif %}
-          {% if decision.album %} · {{ decision.album }}{% endif %}
-          {% if decision.provider %} · {{ decision.provider|title }}{% endif %}
+          {% if decision.artist %} · Recording: {{ decision.artist }} — {{ decision.title }}{% endif %}
+          {% if decision.version %} · Version: {{ decision.version|replace('_', ' ')|title }}{% endif %}
+          {% if decision.album %} · Selected release: {{ decision.album }}{% if decision.year %} ({{ decision.year }}){% endif %}{% endif %}
+          {% if decision.provider %} · Source: {{ decision.provider }}{% endif %}
           {% if decision.uploader %} · uploaded by {{ decision.uploader }}{% endif %}
           {% if decision.confidence is not none %} · {{ (decision.confidence * 100)|round|int }}% confidence{% endif %}
           · decided by {{ decision.decided_by|replace('_', ' ') }}
         </p>
+        {% endfor %}
+      </details>
+      {% endif %}
+      {% set source_diagnostic = source_resolution_diagnostics.get(job.id) %}
+      {% if user.role == 'admin' and source_diagnostic %}
+      <details class="source-resolution-diagnostics">
+        <summary>Source resolution diagnostics</summary>
+        {% if source_diagnostic.discovery %}
+        <h4>Bounded source searches</h4>
+        {% for line in source_diagnostic.discovery %}<p><small>{{ line }}</small></p>{% endfor %}
+        {% else %}<p><small>No provider search was needed or recorded for this source.</small></p>{% endif %}
+        <h4>Evaluated candidates</h4>
+        {% if not source_diagnostic.candidates %}<p><small>No source candidate survived the bounded search and probe checks.</small></p>{% endif %}
+        {% for candidate in source_diagnostic.candidates %}
+        <div class="diagnostic-candidate">
+          <p><strong>Candidate {{ loop.index }} · {{ candidate.provider }}</strong> · {{ candidate.status }} · {{ candidate.policy }} · {{ candidate.probe }}{% if candidate.local_score is not none %} · {{ (candidate.local_score * 100)|round|int }}% local score{% endif %}</p>
+          {% if candidate.title %}<p><small><strong>Provider title:</strong> {{ candidate.title }}</small></p>{% endif %}
+          <p><small><strong>Reference:</strong> <code>{{ candidate.reference }}</code>{% if candidate.duration_seconds is not none %} · <strong>Duration:</strong> {{ candidate.duration_seconds|round|int }}s{% endif %}</small></p>
+          {% if candidate.uploader %}<p><small>Uploader: {{ candidate.uploader }}{% if candidate.uploader_relationship %} · {{ candidate.uploader_relationship|replace('_', ' ') }}{% endif %}</small></p>{% endif %}
+          {% if candidate.contradictions %}<p><small><strong>Conflicts:</strong> {% for contradiction in candidate.contradictions %}<code>{{ contradiction.code }}</code> — {{ contradiction.label }}{% if not loop.last %} · {% endif %}{% endfor %}</small></p>{% endif %}
+          <p><small><strong>Rationale:</strong> {{ candidate.rationale|join(' · ') }}</small></p>
+          {% for line in candidate.ranking %}<p><small>{{ line }}</small></p>{% endfor %}
+        </div>
         {% endfor %}
       </details>
       {% endif %}
@@ -50,12 +75,12 @@
           {% if decision.reason_codes and decision.reason_codes[0] != job.error_message and decision.reason_codes[0] != (job.error_message or '')[:160] %}<p>{{ decision.reason_codes[0] }}</p>{% endif %}
           {% set decision_options = reviews.get(job.id, [])|selectattr('decision_id', 'equalto', decision.id)|list %}
           {% for option in decision_options[:3] %}
-          <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}" {% if option.recommended %}checked{% endif %}> <span><strong>{% if option.recommended %}Recommended{% else %}Alternative {{ option.rank }}{% endif %}</strong> · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider|title }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
+          <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}" {% if option.recommended %}checked{% endif %}> <span><strong>{% if option.recommended %}Recommended{% else %}Alternative {{ option.rank }}{% endif %}</strong> · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
           {% endfor %}
           {% if decision_options|length > 3 %}
           <details><summary>Show more materially different options</summary>
             {% for option in decision_options[3:] %}
-            <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}"> <span>Alternative {{ option.rank }} · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider|title }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
+            <label class="check"><input type="radio" name="decision_{{ decision.id }}" value="{{ option.id }}"> <span>Alternative {{ option.rank }} · {{ option.label }}{% if option.score %} · {{ (option.score * 100)|round|int }}%{% endif %}<small>{% if option.version %}Version: {{ option.version }} · {% endif %}{% if option.provider %}Provider: {{ option.provider }} · {% endif %}{% if option.uploader %}Uploader: {{ option.uploader }}{% if option.uploader_relationship %} ({{ option.uploader_relationship|replace('_', ' ') }}){% endif %} · {% endif %}{% if option.duration_seconds %}Duration: {{ option.duration_seconds|round|int }}s · {% endif %}{% if option.album %}Album: {{ option.album }} · {% endif %}{% if option.year %}Year: {{ option.year }} · {% endif %}{% if option.release_status %}Status: {{ option.release_status }} · {% endif %}{% if option.primary_type %}Type: {{ option.primary_type }}{% endif %}</small></span></label>
             {% endfor %}
           </details>
           {% endif %}

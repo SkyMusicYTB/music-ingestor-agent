@@ -30,8 +30,8 @@ dependencies = [
 dev = [
   "mypy==1.18.1",
   "pip-audit==2.9.0",
-  "pytest==8.4.2",
-  "pytest-asyncio==1.1.0",
+  "pytest==9.0.3",
+  "pytest-asyncio==1.4.0",
   "pytest-cov==7.0.0",
   "respx==0.22.0",
   "ruff==0.13.0",

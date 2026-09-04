@@ -28,6 +28,7 @@ from app.workers.processor import DownloadJobProcessor, ProcessOutcome
 from app.workers.queue import DownloadJobQueue, ServiceTaskQueue
 from app.workers.recovery import StartupRecovery
 from app.workers.service_tasks import ServiceTaskOutcome, WorkerServiceTaskHandler
+from app.workers.source_discovery_state import delete_expired_source_search_cache
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,10 @@ class WorkerRunner:
                         )
                     except Exception:
                         logger.exception("completed-media retention cleanup will be retried")
+                    try:
+                        delete_expired_source_search_cache(self.queue.session_factory)
+                    except Exception:
+                        logger.exception("source-search cache cleanup will be retried")
                     if self.service_queue is not None:
                         self.service_queue.recover_expired()
                     recovery_at = time.monotonic() + 30

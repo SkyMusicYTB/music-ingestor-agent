@@ -26,6 +26,7 @@ from app.db.models import (
 from app.repositories.decisions import (
     DecisionSelection,
     apply_review_bundle,
+    record_selected_decision,
     review_bundle_fingerprint,
 )
 from app.repositories.jobs import JobRepository
@@ -62,6 +63,10 @@ class Provider:
         assert url == URL
         return dict(self.metadata)
 
+    def search_provider(self, query, *, provider, limit, **kwargs):
+        del query, provider, limit, kwargs
+        return {"entries": []}
+
     def download_audio(self, url, staging, **kwargs):
         assert url == URL
         self.downloads += 1
@@ -89,7 +94,7 @@ class MusicBrainz:
         )
 
 
-def queued_job(factory, *, direct=True, score=1.0):
+def queued_job(factory, *, direct=True, score=1.0, durable_source_decision=False):
     with factory.begin() as session:
         user = User(username="fixture", username_normalized="fixture", password_hash="fixture")  # noqa: S106
         session.add(user)
@@ -119,6 +124,9 @@ def queued_job(factory, *, direct=True, score=1.0):
             recording_mbid="11111111-1111-1111-1111-111111111111",
             release_mbid="22222222-2222-2222-2222-222222222222",
             release_group_mbid="33333333-3333-3333-3333-333333333333",
+            metadata_provenance_json=json.dumps(
+                {"artists": ["Gabry Ponte", "KEL"]}, separators=(",", ":")
+            ),
         )
         session.add(track)
         session.flush()
@@ -152,6 +160,21 @@ def queued_job(factory, *, direct=True, score=1.0):
         session.flush()
         user_id, request_id, track_id, source_id = user.id, request.id, track.id, source.id
     jobs = JobRepository(factory).queue_approved(request_id, user_id, [track_id])
+    if durable_source_decision:
+        with factory.begin() as session:
+            job = session.get(DownloadJob, jobs[0])
+            source = session.get(SourceCandidate, source_id)
+            assert job is not None and source is not None
+            record_selected_decision(
+                session,
+                job,
+                category="acquisition_source",
+                candidates=[{"source_candidate_id": source.id, "local_score": score}],
+                selected_payload={"source_candidate_id": source.id},
+                decided_by="deterministic",
+                reason_codes=["fixture_durable_source"],
+                local_confidence=score,
+            )
     return jobs[0], source_id, user_id
 
 
@@ -278,7 +301,12 @@ def test_require_review_before_download_and_durable_acceptance(
 def test_automatic_fallback_keeps_conservative_threshold(
     settings, session_factory, monkeypatch, score, expected
 ):
-    queued_job(session_factory, direct=False, score=score)
+    queued_job(
+        session_factory,
+        direct=False,
+        score=score,
+        durable_source_decision=True,
+    )
     worker, provider, _, tags = processor(settings, session_factory, monkeypatch)
     assert worker.process(worker.queue.claim_next()).status == expected
     assert provider.downloads == (1 if expected == "completed" else 0)

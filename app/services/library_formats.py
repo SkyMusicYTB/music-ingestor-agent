@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)

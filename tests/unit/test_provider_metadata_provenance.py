@@ -142,6 +142,66 @@ def test_real_provider_pipeline_reason_survives_tag_coercion_and_library_read():
     }
 
 
+def test_provider_fallback_repairs_only_non_explicit_release_inferred_version():
+    processor = object.__new__(DownloadJobProcessor)
+    values = processor._apply_provider_metadata(
+        {
+            "artist": "Gabry Ponte & KEL",
+            "title": "Tarantella",
+            "version_signature": "live",
+            "metadata_provenance": {
+                "request_constraints": {"version_constraint_explicit": False},
+                "recording_version": {
+                    "signature": "live",
+                    "source": "release_metadata",
+                },
+            },
+        },
+        {
+            "artist": "Gabry Ponte & KEL",
+            "title": "Tarantella",
+            "version": "studio",
+            "metadata_authority": "direct_user_source",
+            "reason_code": "no_candidates",
+        },
+        lease=None,
+    )
+
+    assert values["version_signature"] == "studio"
+    assert values["metadata_provenance"]["canonical_metadata_resolution"]["reason_codes"] == [
+        "inferred_version_corrected_to_studio"
+    ]
+
+
+def test_provider_metadata_preserves_provider_evidenced_live_with_plain_title():
+    processor = object.__new__(DownloadJobProcessor)
+    values = processor._apply_provider_metadata(
+        {
+            "artist": "Coldplay",
+            "title": "Yellow",
+            "version_signature": "live",
+            "metadata_provenance": {
+                "request_constraints": {"version_constraint_explicit": False},
+                "recording_version": {
+                    "signature": "live",
+                    "source": "provider_recording_metadata",
+                },
+            },
+        },
+        {
+            "artist": "Coldplay",
+            "title": "Yellow",
+            "version": "live",
+            "metadata_authority": "direct_user_source",
+            "reason_code": "no_candidates",
+        },
+        lease=None,
+    )
+
+    assert values["version_signature"] == "live"
+    assert "reason_codes" not in values["metadata_provenance"]["canonical_metadata_resolution"]
+
+
 def test_nested_resolution_is_allowlisted_bounded_and_not_recursively_copied():
     nested = {
         "source": "direct_user_source",

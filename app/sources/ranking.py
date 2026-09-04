@@ -118,7 +118,12 @@ def _rank_one(
     expected_artist = normalize_match_text(intent.artist)
     expected_title = _clean_title(intent.title)
     candidate_artist, candidate_title = candidate_track_fields(candidate)
-    artist_score = artist_credit_similarity(expected_artist, candidate_artist)
+    artist_score = artist_credit_similarity(
+        expected_artist,
+        candidate_artist,
+        left_artists=intent.artists,
+        right_artists=candidate.artists,
+    )
     title_score = _similarity(expected_title, candidate_title)
     canonical_score = (artist_score + title_score) / 2.0
     canonical_exact = bool(
@@ -128,19 +133,23 @@ def _rank_one(
         and candidate_title == expected_title
     )
 
-    requested_version = DEFAULT_VERSION_CLASSIFIER.classify(
+    requested_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
         intent.title,
-        intent.requested_version,
+        explicit_version=intent.requested_version,
     )
-    candidate_version = DEFAULT_VERSION_CLASSIFIER.classify(
+    candidate_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
         candidate.title,
         candidate.track,
-        candidate.version,
+        explicit_version=candidate.version,
     )
     version_match = DEFAULT_VERSION_CLASSIFIER.compatible(requested_version, candidate_version)
     contradictions = list(
         DEFAULT_VERSION_CLASSIFIER.contradictions(requested_version, candidate_version)
     )
+    # A nearly identical long credit can otherwise hide a missing short
+    # collaborator while still clearing the numeric auto-select threshold.
+    if expected_artist and candidate_artist and artist_score < 0.95:
+        contradictions.append("artist_credit_mismatch")
     if (
         candidate_artist
         and expected_artist
@@ -262,11 +271,14 @@ def sources_equivalent(
     if (
         not left_artist
         or not left_title
-        or (left_artist, left_title)
-        != (
+        or left_title != right_title
+        or artist_credit_similarity(
+            left_artist,
             right_artist,
-            right_title,
+            left_artists=left.artists,
+            right_artists=right.artists,
         )
+        != 1.0
     ):
         return False
     if _candidate_version(left).kinds != _candidate_version(right).kinds:
@@ -333,7 +345,11 @@ def group_ranked_sources(
 
 
 def _candidate_version(candidate: SourceCandidate) -> VersionClassification:
-    return DEFAULT_VERSION_CLASSIFIER.classify(candidate.title, candidate.track, candidate.version)
+    return DEFAULT_VERSION_CLASSIFIER.classify_recording(
+        candidate.title,
+        candidate.track,
+        explicit_version=candidate.version,
+    )
 
 
 def _group_id(candidates: list[SourceCandidate]) -> str:

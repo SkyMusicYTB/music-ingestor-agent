@@ -15,6 +15,7 @@ from app.clients.ytdlp import is_curated_collection_url
 from app.db.models import Conversation, Request, RequestTrack, ServiceTask
 from app.repositories.events import make_event
 from app.schemas import MusicProposal
+from app.services.duplicates import normalize_version_signature
 from app.services.request_constraints import parse_explicit_request_constraints
 from app.sources import ProviderIdentity, ProviderURLPolicy, provider_for_url
 
@@ -256,8 +257,10 @@ class RequestRepository:
                     suggested_release_group_mbid=item.release_group_mbid,
                     canonical_identity_verified=False,
                     source_url=None,
-                    version_signature=request_constraints.version or item.version or "studio",
-                    rationale=item.rationale,
+                    version_signature=normalize_version_signature(request_constraints.version),
+                    rationale=(
+                        "Provisional discovery candidate; canonical metadata is not yet verified."
+                    ),
                     evidence_json=json.dumps(
                         list(dict.fromkeys(display_evidence)), ensure_ascii=False
                     ),

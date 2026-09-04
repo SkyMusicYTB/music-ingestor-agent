@@ -21,7 +21,7 @@ from app.db.models import (
 )
 from app.repositories.events import make_event
 from app.services.artist_credits import structured_artists
-from app.services.duplicates import normalize_text
+from app.services.duplicates import normalize_text, normalize_version_signature
 from app.services.metadata_review_repair import repair_empty_metadata_review
 from app.sources import EXECUTABLE_EVIDENCE_KINDS
 
@@ -96,7 +96,7 @@ def _snapshot(track: RequestTrack) -> dict[str, object]:
         "source_url": track.source_url,
         "source_extractor": track.source_extractor,
         "source_id": track.source_id,
-        "version_signature": track.version_signature,
+        "version_signature": normalize_version_signature(track.version_signature),
         "metadata_confidence": track.metadata_confidence,
         "requested_provider": requested_provider,
         "requested_providers": requested_providers,
@@ -108,15 +108,13 @@ def _snapshot(track: RequestTrack) -> dict[str, object]:
 
 
 def dedup_key(track: RequestTrack) -> str:
+    version = normalize_version_signature(track.version_signature)
     if track.source_extractor and track.source_id:
         value = f"source:{track.source_extractor}:{track.source_id}"
     elif track.canonical_identity_verified and track.recording_mbid:
-        value = f"mbid:{track.recording_mbid}:{track.version_signature}"
+        value = f"mbid:{track.recording_mbid}:{version}"
     else:
-        value = (
-            f"text:{normalize_text(track.artist)}:{normalize_text(track.title)}:"
-            f"{track.version_signature}"
-        )
+        value = f"text:{normalize_text(track.artist)}:{normalize_text(track.title)}:{version}"
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -146,6 +144,7 @@ class JobRepository:
                 for track in tracks:
                     if track.duplicate_status == "owned":
                         continue
+                    track.version_signature = normalize_version_signature(track.version_signature)
                     existing = session.scalar(
                         select(DownloadJob.id).where(DownloadJob.request_track_id == track.id)
                     )

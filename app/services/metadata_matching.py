@@ -10,28 +10,22 @@ from typing import Any, Literal
 from rapidfuzz.fuzz import ratio, token_set_ratio
 
 from app.services.artist_credits import artist_credit_similarity, structured_artists
+from app.services.duplicates import recording_version_signature
 
 _SPACE_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[^\w\s]+", re.UNICODE)
-_VERSION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("live", re.compile(r"\b(live|concert|unplugged live)\b", re.I)),
-    ("remix", re.compile(r"\b(remix|mix by|club mix|rework)\b", re.I)),
-    ("acoustic", re.compile(r"\b(acoustic|unplugged)\b", re.I)),
-    ("instrumental", re.compile(r"\binstrumental\b", re.I)),
-    ("karaoke", re.compile(r"\bkaraoke\b", re.I)),
-    ("cover", re.compile(r"\bcover(?: version)?\b", re.I)),
-    ("demo", re.compile(r"\bdemo\b", re.I)),
-    ("radio-edit", re.compile(r"\bradio (edit|version)\b", re.I)),
-    ("remaster", re.compile(r"\b(re)?master(?:ed)?\b", re.I)),
-)
 _EDITION_PATTERNS: tuple[tuple[str, re.Pattern[str], float], ...] = (
     (
         "compilation",
         re.compile(r"\b(compilation|greatest hits|best of|various artists)\b", re.I),
         12,
     ),
-    ("deluxe", re.compile(r"\b(deluxe|expanded|anniversary edition)\b", re.I), 8),
+    ("deluxe", re.compile(r"\b(deluxe|expanded|anniversary(?: edition)?)\b", re.I), 8),
     ("remaster", re.compile(r"\b(re)?master(?:ed)?\b", re.I), 6),
+    ("reissue", re.compile(r"\breissue(?:d)?\b", re.I), 6),
+    ("soundtrack", re.compile(r"\b(?:soundtrack|original motion picture)\b", re.I), 8),
+    ("tribute", re.compile(r"\b(?:tribute|karaoke)\b", re.I), 15),
+    ("live_event", re.compile(r"\blive\s+(?:compilation|festival|event)\b", re.I), 8),
 )
 AssociationDecision = Literal["auto", "review", "reject"]
 
@@ -45,10 +39,11 @@ def normalize_text(value: str | None) -> str:
     return _SPACE_RE.sub(" ", normalized).strip()
 
 
-def version_signature(*values: str | None) -> str:
+def release_edition_signature(*values: str | None) -> tuple[str, ...]:
+    """Classify release packaging separately from the recorded performance."""
+
     combined = " ".join(value for value in values if value)
-    versions = [name for name, pattern in _VERSION_PATTERNS if pattern.search(combined)]
-    return "+".join(versions) if versions else "studio"
+    return tuple(label for label, pattern, _amount in _EDITION_PATTERNS if pattern.search(combined))
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +62,13 @@ class MetadataCandidate:
 
     @property
     def version(self) -> str:
-        return version_signature(self.title, self.album)
+        disambiguation = self.raw.get("disambiguation") if self.raw else None
+        return recording_version_signature(
+            recording_title=self.title,
+            recording_disambiguation=(
+                str(disambiguation) if isinstance(disambiguation, str) else None
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +104,10 @@ class MetadataMatcher:
         candidates: Iterable[MetadataCandidate],
         limit: int = 10,
     ) -> list[MatchResult]:
-        query_version = version_signature(requested_version, title, album)
+        query_version = recording_version_signature(
+            explicit_version=requested_version if version_is_explicit else None,
+            recording_title=title,
+        )
         results: list[MatchResult] = []
         for candidate in candidates:
             contradiction_codes: list[str] = []
@@ -111,7 +115,11 @@ class MetadataMatcher:
             artist_score = artist_credit_similarity(
                 artist, candidate.artist, left_artists=artists, right_artists=candidate.artists
             )
-            if artist_score < 0.90:
+            # Fuzzy similarity is useful for ordering review choices, but it must
+            # not authorize dropping or adding a required collaborator.  The
+            # structured-credit comparator deliberately caps subset/superset
+            # matches below this boundary.
+            if artist_score < 0.95:
                 contradiction_codes.append("artist_credit_mismatch")
             duration_score, duration_reason = _duration_score(
                 duration_seconds, candidate.duration_seconds
@@ -153,11 +161,25 @@ class MetadataMatcher:
                 isrcs = candidate.raw.get("isrcs")
                 if isinstance(isrcs, list) and requested_isrc.upper() in isrcs:
                     reasons.append("matching_isrc")
-            penalty, penalty_reasons = _edition_penalty(
-                requested=" ".join(value for value in (requested_version, title, album) if value),
-                candidate=" ".join(value for value in (candidate.title, candidate.album) if value),
+            # Release-edition allowances come only from trusted, explicit user
+            # constraints. A model-proposed album or a recording title must not
+            # turn a compilation/remaster into requested release context.
+            requested_edition_context = " ".join(
+                value
+                for value in (
+                    requested_version if version_is_explicit else None,
+                    album if album_is_explicit else None,
+                )
+                if value
             )
-            if query_version != candidate.version and candidate.version != "studio":
+            penalty, penalty_reasons = _edition_penalty(
+                requested=requested_edition_context,
+                candidate=candidate.album or "",
+            )
+            if query_version != candidate.version and version_is_explicit:
+                penalty += 12
+                penalty_reasons.append(f"explicit-version-mismatch:{candidate.version}=-12")
+            elif query_version != candidate.version and candidate.version != "studio":
                 penalty += 12
                 penalty_reasons.append(f"unrequested-version:{candidate.version}=-12")
             score = max(0.0, min(100.0, score - penalty))
@@ -312,21 +334,104 @@ def candidates_from_musicbrainz(payload: Mapping[str, Any]) -> list[MetadataCand
             release_group = {}
         date = str(value.get("first-release-date") or "")
         candidates.append(
-            MetadataCandidate(
-                artist=artist,
-                title=title.strip()[:500],
-                album=str(release.get("title")) if release.get("title") else None,
-                year=int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None,
-                duration_seconds=_recording_duration(value.get("length")),
-                recording_mbid=recording_id,
-                release_mbid=_valid_mbid(release.get("id")),
-                release_group_mbid=(_valid_mbid(release_group.get("id"))),
-                source="musicbrainz",
-                raw=value,
-                artists=_individual_artist_credit(credits),
+            select_sensible_release(
+                MetadataCandidate(
+                    artist=artist,
+                    title=title.strip()[:500],
+                    album=str(release.get("title")) if release.get("title") else None,
+                    year=int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None,
+                    duration_seconds=_recording_duration(value.get("length")),
+                    recording_mbid=recording_id,
+                    release_mbid=_valid_mbid(release.get("id")),
+                    release_group_mbid=(_valid_mbid(release_group.get("id"))),
+                    source="musicbrainz",
+                    raw=value,
+                    artists=_individual_artist_credit(credits),
+                ),
+                requested_album=None,
             )
         )
     return candidates
+
+
+def select_sensible_release(
+    candidate: MetadataCandidate, *, requested_album: str | None
+) -> MetadataCandidate:
+    """Choose canonical release packaging without changing recording identity.
+
+    MusicBrainz search ordering is not canonical-release ordering. Prefer an
+    explicitly requested release, then an official standard album/single, and
+    only then compilations, deluxe editions, remasters, or reissues.
+    """
+
+    raw = candidate.raw
+    if not isinstance(raw, Mapping):
+        return candidate
+    releases = raw.get("releases")
+    if not isinstance(releases, list):
+        return candidate
+    valid = [
+        release
+        for release in releases[:50]
+        if isinstance(release, Mapping) and _valid_mbid(release.get("id")) is not None
+    ]
+    if not valid:
+        return candidate
+    requested = normalize_text(requested_album)
+
+    def release_key(release: Mapping[str, Any]) -> tuple[object, ...]:
+        title = str(release.get("title") or "")
+        release_group = release.get("release-group")
+        group = release_group if isinstance(release_group, Mapping) else {}
+        secondary = group.get("secondary-types")
+        secondary_types = secondary if isinstance(secondary, list) else []
+        status = normalize_text(str(release.get("status") or ""))
+        primary = normalize_text(str(group.get("primary-type") or ""))
+        date = str(release.get("date") or "")
+        year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else 9999
+        normalized_title = normalize_text(title)
+        edition_flags = release_edition_signature(
+            title, *(str(item) for item in secondary_types[:10])
+        )
+        explicit_album = int(bool(requested) and normalized_title == requested)
+        official = int(status == "official")
+        standard = int(not edition_flags)
+        canonical_type = 2 if primary == "album" else 1 if primary == "single" else 0
+        date_key = (
+            year,
+            int(date[5:7]) if len(date) >= 7 and date[5:7].isdigit() else 13,
+            int(date[8:10]) if len(date) >= 10 and date[8:10].isdigit() else 32,
+        )
+        return (
+            -explicit_album,
+            -official,
+            -standard,
+            date_key,
+            -canonical_type,
+            normalized_title,
+        )
+
+    selected = min(valid, key=release_key)
+    group_value = selected.get("release-group")
+    release_group = group_value if isinstance(group_value, Mapping) else {}
+    selected_release_mbid = _valid_mbid(selected.get("id"))
+    selected_release_group_mbid = _valid_mbid(release_group.get("id"))
+    # A candidate may already carry IDs from a different release selected during
+    # an earlier bounded search. Never combine that prior release group's ID with
+    # the newly selected release. The same-release fallback is safe when a later
+    # provider response omitted details that were already validated locally.
+    same_release = selected_release_mbid == candidate.release_mbid
+    date = str(selected.get("date") or raw.get("first-release-date") or "")
+    year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else candidate.year
+    return replace(
+        candidate,
+        album=str(selected.get("title")) if selected.get("title") else candidate.album,
+        year=year,
+        release_mbid=selected_release_mbid,
+        release_group_mbid=(
+            selected_release_group_mbid or (candidate.release_group_mbid if same_release else None)
+        ),
+    )
 
 
 def candidates_from_apple(payload: Mapping[str, Any]) -> list[MetadataCandidate]:
@@ -442,7 +547,7 @@ def _edition_penalty(*, requested: str, candidate: str) -> tuple[float, list[str
 
 
 def _edition_flags(value: str) -> set[str]:
-    return {label for label, pattern, _amount in _EDITION_PATTERNS if pattern.search(value)}
+    return set(release_edition_signature(value))
 
 
 def _bounded_score(value: float) -> float:

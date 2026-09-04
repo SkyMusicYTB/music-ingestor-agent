@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -8,11 +9,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.clients.ytdlp import (
     CancellationSignal,
+    DownloadCancelled,
     SourceValidationError,
     YtDlpClient,
     YtDlpError,
@@ -29,9 +31,13 @@ from app.db.models import (
 from app.db.models import (
     SourceCandidate as DbSourceCandidate,
 )
+from app.prompts import SOURCE_MATCH_PROMPT_VERSION
 from app.repositories.decisions import candidate_set_fingerprint, record_selected_decision
-from app.services.artist_credits import structured_artists
+from app.repositories.jobs import dedup_key
+from app.services.artist_credits import artist_credit_variant, structured_artists
+from app.services.duplicates import normalize_version_signature
 from app.sources import (
+    DEFAULT_VERSION_CLASSIFIER,
     EXECUTABLE_EVIDENCE_KINDS,
     FiniteSourceResolver,
     MatchDecision,
@@ -51,7 +57,37 @@ from app.sources import (
 )
 from app.workers.ai_task_reuse import reuse_or_create_decision_task
 from app.workers.queue import DownloadJobQueue, JobLease, LeaseLostError
+from app.workers.source_discovery_state import CachedSourceSearch, SourceDiscoveryState
 from app.workers.source_failures import is_transient_source_error
+
+MAX_EXACT_TRACK_SEARCH_QUERIES = 6
+MAX_SEARCH_RESULTS_PER_QUERY = 6
+# The ordinary pass is deliberately small. Explicit provider-fallback consent
+# unlocks one bounded tranche for only the newly permitted providers; the
+# cumulative, crash-safe ledger still caps the entire job at twenty probes.
+MAX_SOURCE_DISCOVERY_PROBES = 12
+MAX_SOURCE_DISCOVERY_PROBES_WITH_FALLBACK = 20
+MAX_PROVIDER_FALLBACK_DISCOVERY_PROBES = (
+    MAX_SOURCE_DISCOVERY_PROBES_WITH_FALLBACK - MAX_SOURCE_DISCOVERY_PROBES
+)
+# Orchestration-time evidence must not consume the entire worker-owned search
+# budget. Direct user URLs are already attached as the active candidate, so six
+# evidence probes leave six independent probes for deterministic exact search.
+MAX_EVIDENCE_DISCOVERY_PROBES = 6
+_PERSISTED_PROBE_REJECTION_CODES = frozenset(
+    {
+        "probe_metadata_invalid",
+        "probe_provider_rejected",
+        "probe_validation_rejected",
+    }
+)
+_EARLY_STOP_UPLOADER_RELATIONSHIPS = frozenset(
+    {
+        UploaderRelationship.OFFICIAL_ARTIST,
+        UploaderRelationship.OFFICIAL_LABEL,
+        UploaderRelationship.TOPIC,
+    }
+)
 
 
 class LeaseMonitor(Protocol):
@@ -72,6 +108,10 @@ class SourceResolutionNeedsReview(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.options = options
+
+
+class EquivalentAcquisitionActive(RuntimeError):
+    """The corrected recording identity is already being acquired by another job."""
 
 
 class WorkerSourceResolver:
@@ -108,11 +148,9 @@ class WorkerSourceResolver:
         monitor: LeaseMonitor,
         cancellation: CancellationSignal,
     ) -> ResolvedSource:
-        active = self._active_candidate(lease)
-        if active is not None:
-            return active
         intent = SourceIntent(
             artist=_required_string(lease.approved_snapshot, "artist"),
+            artists=structured_artists(lease.approved_snapshot.get("artists")),
             title=_required_string(lease.approved_snapshot, "title"),
             requested_version=_requested_source_version(
                 lease.approved_snapshot,
@@ -120,11 +158,16 @@ class WorkerSourceResolver:
             ),
             duration_seconds=_optional_float(lease.approved_snapshot.get("duration_seconds")),
         )
+        self._repair_inferred_version_snapshot(lease, intent)
+        active = self._active_candidate(lease, intent)
+        if active is not None:
+            return active
         provider_scope = _effective_provider_scope(lease.approved_snapshot)
         candidates = self._discover(
             lease,
             intent,
             cancellation,
+            monitor,
             provider_scope=provider_scope,
         )
         if not candidates:
@@ -270,7 +313,7 @@ class WorkerSourceResolver:
             job.source_attempt_count += 1
             return job.source_attempt_count
 
-    def _active_candidate(self, lease: JobLease) -> ResolvedSource | None:
+    def _active_candidate(self, lease: JobLease, intent: SourceIntent) -> ResolvedSource | None:
         with self.factory.begin() as session:
             job = _leased_job(session, lease, action="restoring a source candidate")
             if not job.active_source_candidate_id:
@@ -304,13 +347,65 @@ class WorkerSourceResolver:
                 # may predate the worker's authoritative provider constraint check.
                 job.active_source_candidate_id = None
                 return None
-            existing_decision = session.scalar(
-                select(JobDecision.id).where(
-                    JobDecision.job_id == job.id,
-                    JobDecision.category == "acquisition_source",
-                    JobDecision.state == "selected",
+            evidence = session.get(EvidenceReference, row.evidence_id) if row.evidence_id else None
+            selected_decisions = list(
+                session.scalars(
+                    select(JobDecision)
+                    .where(
+                        JobDecision.job_id == job.id,
+                        JobDecision.category == "acquisition_source",
+                        JobDecision.state == "selected",
+                    )
+                    .order_by(JobDecision.revision.desc(), JobDecision.id.desc())
+                    .limit(20)
                 )
             )
+            existing_decision = next(
+                (
+                    decision
+                    for decision in selected_decisions
+                    if _decision_selects_source(decision, row.id)
+                ),
+                None,
+            )
+            user_selected = existing_decision is not None and existing_decision.decided_by == "user"
+            direct_source = bool(
+                evidence is not None and evidence.evidence_kind == "direct_user_url"
+            )
+            if existing_decision is None and not direct_source:
+                # Queue insertion may attach a locally allowed orchestration
+                # candidate as a convenience. Natural-language evidence is not a
+                # durable acquisition decision and must pass current intent ranking.
+                job.active_source_candidate_id = None
+                job.source_extractor = None
+                job.source_id = None
+                return None
+            candidate_version = DEFAULT_VERSION_CLASSIFIER.classify_signature(row.version_signature)
+            requested_version = DEFAULT_VERSION_CLASSIFIER.classify_signature(
+                intent.requested_version
+            )
+            if (
+                not user_selected
+                and not direct_source
+                and not DEFAULT_VERSION_CLASSIFIER.compatible(requested_version, candidate_version)
+            ):
+                # A pre-upgrade automatic decision may have inherited "live"
+                # from a compilation title.  Fence and retire it before the
+                # corrected recording intent is used for bounded rediscovery.
+                row.policy_status = "exhausted"
+                row.failure_code = "inferred_version_revalidated"
+                row.attempted_at = datetime.now(UTC)
+                if existing_decision is not None:
+                    existing_decision.state = "rejected"
+                    reasons = _json_string_list(existing_decision.reason_codes_json)
+                    reasons.append("inferred_version_revalidated")
+                    existing_decision.reason_codes_json = json.dumps(
+                        list(dict.fromkeys(reasons)), separators=(",", ":")
+                    )
+                job.active_source_candidate_id = None
+                job.source_extractor = None
+                job.source_id = None
+                return None
             if existing_decision is None:
                 record_selected_decision(
                     session,
@@ -329,96 +424,404 @@ class WorkerSourceResolver:
                 )
             return _resolved(row)
 
+    def _repair_inferred_version_snapshot(self, lease: JobLease, intent: SourceIntent) -> None:
+        """Repair only durable release/model inference, never recording evidence."""
+
+        snapshot = lease.approved_snapshot
+        prior = normalize_version_signature(_optional_string(snapshot.get("version_signature")))
+        requested = normalize_version_signature(intent.requested_version)
+        if (
+            _source_version_is_explicit(snapshot)
+            or not _release_only_version_inference(snapshot)
+            or DEFAULT_VERSION_CLASSIFIER.compatible(
+                DEFAULT_VERSION_CLASSIFIER.classify_signature(prior),
+                DEFAULT_VERSION_CLASSIFIER.classify_signature(requested),
+            )
+            or DEFAULT_VERSION_CLASSIFIER.classify_recording(
+                _optional_string(snapshot.get("title"))
+            ).kinds
+        ):
+            return
+        corrected = dict(snapshot)
+        corrected["version_signature"] = requested
+        provenance = corrected.get("metadata_provenance")
+        safe_provenance = dict(provenance) if isinstance(provenance, Mapping) else {}
+        safe_provenance["recording_version_correction"] = {
+            "reason_code": "release_context_not_recording_version",
+            "from": prior[:100],
+            "to": requested[:100],
+        }
+        corrected["metadata_provenance"] = safe_provenance
+        with self.factory() as session:
+            # Re-keying participates in the active-job uniqueness invariant. Take
+            # the SQLite writer reservation before checking for a conflicting key
+            # so another queue insertion cannot race the correction.
+            session.execute(text("BEGIN IMMEDIATE"))
+            job = _leased_job(session, lease, action="repairing inferred recording version")
+            track = session.get(RequestTrack, job.request_track_id)
+            if track is None:
+                session.rollback()
+                raise LookupError(job.request_track_id)
+            track_version = normalize_version_signature(track.version_signature)
+            if track_version not in {prior, requested}:
+                session.rollback()
+                raise LeaseLostError(
+                    "request track changed while repairing inferred recording version"
+                )
+            track.version_signature = requested
+            replacement_key = dedup_key(track)
+            conflicting_job = session.scalar(
+                select(DownloadJob.id).where(
+                    DownloadJob.id != job.id,
+                    DownloadJob.dedup_key == replacement_key,
+                    DownloadJob.status.not_in(("cancelled", "failed", "completed")),
+                )
+            )
+            if conflicting_job is not None:
+                session.rollback()
+                raise EquivalentAcquisitionActive(
+                    "an equivalent corrected acquisition is already active"
+                )
+            job.approved_snapshot_json = json.dumps(
+                corrected, ensure_ascii=False, separators=(",", ":")
+            )
+            job.dedup_key = replacement_key
+            track.metadata_provenance_json = json.dumps(
+                safe_provenance, ensure_ascii=False, separators=(",", ":")
+            )
+            session.commit()
+        snapshot.clear()
+        snapshot.update(corrected)
+
     def _discover(
         self,
         lease: JobLease,
         intent: SourceIntent,
         cancellation: CancellationSignal,
+        monitor: LeaseMonitor,
         *,
         provider_scope: frozenset[ProviderIdentity] | None,
     ) -> tuple[SourceCandidate, ...]:
         request_track_id = _required_string(lease.approved_snapshot, "request_track_id")
         request_id, request_track_count = self._request_context(request_track_id)
+        consented_fallback_scope = frozenset(
+            provider
+            for provider in _consented_fallback_provider_scope(lease.approved_snapshot)
+            if provider in self.policy.allowed_providers
+        )
+        probe_limit = MAX_SOURCE_DISCOVERY_PROBES
+        probe_epoch: str | None = None
+        probe_epoch_limit: int | None = None
+        if consented_fallback_scope:
+            # The requested provider has already completed its bounded pass before
+            # the user was asked. Spend the additional tranche only on providers
+            # that the user has now explicitly permitted.
+            provider_scope = consented_fallback_scope
+            probe_limit = MAX_SOURCE_DISCOVERY_PROBES_WITH_FALLBACK
+            probe_epoch = "provider_fallback"
+            probe_epoch_limit = MAX_PROVIDER_FALLBACK_DISCOVERY_PROBES
+        discovery_state = SourceDiscoveryState(
+            self.factory,
+            lease,
+            request_id=request_id,
+            request_track_id=request_track_id,
+            policy_fingerprint=_source_search_policy_fingerprint(self.policy),
+            max_diagnostic_runs=self.policy.max_attempts,
+        )
         if request_track_count == 1:
             self._adopt_request_evidence(request_id, request_track_id, lease)
-        exhausted = self._exhausted_identity_keys(request_track_id)
+        blocked = self._blocked_identity_keys(request_track_id)
         existing = tuple(
             candidate
             for candidate in self._existing_domain_candidates(request_id, request_track_id, lease)
             if provider_scope is None or candidate.provider in provider_scope
         )
-        needed = max(0, self.policy.max_candidates - len(existing))
         discovered: list[SourceCandidate] = list(existing)
-        if needed:
-            discovered.extend(
-                self._evidence_candidates(
+        probe_count = discovery_state.probe_total()
+        searched_queries: set[str] = set()
+        query_attempts: list[dict[str, object]] = []
+        found_count = 0
+        rejection_counts: dict[str, int] = {}
+        transient_error: SourceValidationError | YtDlpError | None = None
+        transient_count = 0
+        attempted_evidence_identities: set[str] = set()
+        if not _has_early_stop_source(intent, discovered, self.policy):
+            needed = max(0, self.policy.max_candidates - len(discovered))
+            if needed:
+                (
+                    evidence_candidates,
+                    _evidence_probe_count,
+                    attempted_evidence_identities,
+                    evidence_transient_error,
+                    evidence_transient_count,
+                ) = self._evidence_candidates(
                     request_id,
                     request_track_id,
-                    needed,
+                    lease,
+                    min(needed, MAX_EVIDENCE_DISCOVERY_PROBES),
                     cancellation,
-                    excluded={item.identity.stable_key for item in discovered} | exhausted,
+                    monitor,
+                    excluded={item.identity.stable_key for item in discovered} | blocked,
                     provider_scope=provider_scope,
+                    intent=intent,
+                    probe_budget=MAX_EVIDENCE_DISCOVERY_PROBES,
+                    total_probe_limit=probe_limit,
+                    probe_epoch=probe_epoch,
+                    probe_epoch_limit=probe_epoch_limit,
+                    discovery_state=discovery_state,
                 )
-            )
-        query = f"{intent.artist} {intent.title}"
-        for provider in self.policy.provider_preference:
-            if len(discovered) >= self.policy.max_candidates:
+                discovered.extend(evidence_candidates)
+                probe_count = discovery_state.probe_total()
+                transient_error = evidence_transient_error
+                transient_count = evidence_transient_count
+                if evidence_transient_count:
+                    rejection_counts["transient_evidence_probe"] = min(
+                        1_000, evidence_transient_count
+                    )
+        seen = (
+            {item.identity.stable_key for item in discovered}
+            | blocked
+            | attempted_evidence_identities
+        )
+        stop = _has_early_stop_source(intent, discovered, self.policy)
+        queries = _exact_track_search_queries(intent)
+        # Query-first ordering tries the strongest phrase across every permitted
+        # provider before progressively broadening it. This prevents one provider's
+        # weaker variants from delaying an exact result on the next provider. Each
+        # query gets a fair share of the remaining probe budget; unused shares roll
+        # forward, and a validated official source stops later searches immediately.
+        for query_index, query in enumerate(queries):
+            if stop or len(discovered) >= self.policy.max_candidates:
                 break
-            if provider not in self.policy.allowed_providers:
-                continue
-            if provider_scope is not None and provider not in provider_scope:
-                continue
-            if provider is ProviderIdentity.BANDCAMP:
-                continue
-            limit = min(8, self.policy.max_candidates - len(discovered))
-            try:
-                payload = self.ytdlp.search_provider(
-                    query,
-                    provider=provider,
-                    limit=limit,
-                    cancel_signal=cancellation,
-                )
-            except (SourceValidationError, YtDlpError) as exc:
-                if is_transient_source_error(exc):
-                    raise
-                continue
-            entries = payload.get("entries")
-            if not isinstance(entries, list):
-                continue
-            for entry in entries[:limit]:
-                flat = _candidate_from_metadata(provider, entry)
-                if (
-                    flat is None
-                    or flat.identity.stable_key in exhausted
-                    or any(item.identity == flat.identity for item in discovered)
-                ):
+            if cancellation.is_set():
+                raise InterruptedError("source discovery was cancelled")
+            monitor.raise_if_unusable()
+            query_candidates: list[SourceCandidate] = []
+            query_seen: set[str] = set()
+            for provider in self.policy.provider_preference:
+                if stop or len(discovered) >= self.policy.max_candidates:
+                    break
+                if provider not in self.policy.allowed_providers:
                     continue
+                if provider_scope is not None and provider not in provider_scope:
+                    continue
+                if provider is ProviderIdentity.BANDCAMP:
+                    continue
+                candidate_room = self.policy.max_candidates - len(discovered)
+                if candidate_room <= 0 or probe_count >= probe_limit:
+                    stop = True
+                    break
+                limit = MAX_SEARCH_RESULTS_PER_QUERY
+                searched_queries.add(query)
+                cached_search = discovery_state.cached_search(
+                    provider,
+                    query,
+                    maximum_candidates=MAX_SEARCH_RESULTS_PER_QUERY,
+                )
+                if cached_search is None:
+                    try:
+                        payload = self.ytdlp.search_provider(
+                            query,
+                            provider=provider,
+                            limit=limit,
+                            cancel_signal=cancellation,
+                        )
+                    except (SourceValidationError, YtDlpError) as exc:
+                        _record_query_attempt(query_attempts, provider, query, found_count=0)
+                        _raise_if_discovery_interrupted(exc, cancellation, monitor)
+                        if is_transient_source_error(exc):
+                            transient_error = transient_error or exc
+                            transient_count = min(1_000, transient_count + 1)
+                            _increment(rejection_counts, "transient_provider_search")
+                            continue
+                        _increment(rejection_counts, "provider_search_rejected")
+                        continue
+                    entries = payload.get("entries")
+                    if not isinstance(entries, list):
+                        _record_query_attempt(query_attempts, provider, query, found_count=0)
+                        _increment(rejection_counts, "malformed_search_result")
+                        continue
+                    bounded_entries = entries[:limit]
+                    flat_candidates: list[SourceCandidate] = []
+                    invalid_count = 0
+                    for entry in bounded_entries:
+                        flat = _candidate_from_metadata(provider, entry)
+                        if flat is None:
+                            invalid_count += 1
+                        else:
+                            flat_candidates.append(flat)
+                    cached_search = CachedSourceSearch(
+                        candidates=tuple(flat_candidates),
+                        found_count=len(bounded_entries),
+                        invalid_count=invalid_count,
+                    )
+                    discovery_state.store_search(provider, query, cached_search)
+                _record_query_attempt(
+                    query_attempts,
+                    provider,
+                    query,
+                    found_count=cached_search.found_count,
+                )
+                found_count += cached_search.found_count
+                for _index in range(cached_search.invalid_count):
+                    _increment(rejection_counts, "invalid_flat_candidate")
+                for flat in cached_search.candidates:
+                    if cancellation.is_set():
+                        raise InterruptedError("source discovery was cancelled")
+                    monitor.raise_if_unusable()
+                    if flat.identity.stable_key in seen or flat.identity.stable_key in query_seen:
+                        _increment(rejection_counts, "duplicate_source_id")
+                        continue
+                    query_seen.add(flat.identity.stable_key)
+                    query_candidates.append(flat)
+
+            remaining_probe_budget = max(0, probe_limit - probe_count)
+            remaining_queries = len(queries) - query_index
+            query_probe_budget = min(
+                remaining_probe_budget,
+                max(1, math.ceil(remaining_probe_budget / remaining_queries)),
+            )
+            # Flat ranking is advisory only: every candidate selected from this
+            # query is still fully probed and validated before it can stop discovery.
+            ranked_query = _rank_discovery_candidates(intent, query_candidates, self.policy)
+            prior_attempts = discovery_state.probe_attempt_counts(
+                [item.candidate.identity.stable_key for item in ranked_query]
+            )
+            # After restart, continue through untried cached results before using
+            # the one bounded transient retry for an identity already probed.
+            ordered_query = sorted(
+                ranked_query,
+                key=lambda item: prior_attempts.get(item.candidate.identity.stable_key, 0),
+            )
+            for item in ordered_query[:query_probe_budget]:
+                if stop or len(discovered) >= self.policy.max_candidates:
+                    break
+                if cancellation.is_set():
+                    raise InterruptedError("source discovery was cancelled")
+                monitor.raise_if_unusable()
+                flat = item.candidate
+                # Mark the identity only when it spends a probe. An unprobed result
+                # may reappear with stronger metadata in a later official query.
+                reservation = discovery_state.reserve_probe(
+                    flat.identity.stable_key,
+                    maximum_total=probe_limit,
+                    epoch=probe_epoch,
+                    maximum_epoch=probe_epoch_limit,
+                )
+                if not reservation.reserved:
+                    seen.add(flat.identity.stable_key)
+                    if reservation.remaining == 0:
+                        stop = True
+                        _increment(rejection_counts, "probe_budget_exhausted")
+                        break
+                    continue
+                seen.add(flat.identity.stable_key)
+                probe_count = reservation.total
                 try:
                     full = self.ytdlp.probe(flat.url, cancel_signal=cancellation)
-                    candidate = _candidate_from_metadata(provider, full, fallback=flat)
+                    candidate = _candidate_from_metadata(flat.provider, full, fallback=flat)
                 except (SourceValidationError, YtDlpError) as exc:
+                    _raise_if_discovery_interrupted(exc, cancellation, monitor)
                     if is_transient_source_error(exc):
-                        raise
+                        transient_error = transient_error or exc
+                        transient_count = min(1_000, transient_count + 1)
+                        _increment(rejection_counts, "transient_candidate_probe")
+                        continue
+                    reason_code, probe_status = _probe_rejection(exc)
+                    self._persist_probe_rejection(
+                        request_track_id,
+                        lease,
+                        flat,
+                        reason_code=reason_code,
+                        probe_status=probe_status,
+                    )
+                    _increment(rejection_counts, "probe_rejected")
                     continue
-                if candidate is not None and candidate.identity.stable_key not in exhausted:
+                if candidate is None:
+                    self._persist_probe_rejection(
+                        request_track_id,
+                        lease,
+                        flat,
+                        reason_code="probe_metadata_invalid",
+                        probe_status="invalid",
+                    )
+                    _increment(rejection_counts, "invalid_probe_candidate")
+                elif candidate.identity.stable_key in blocked:
+                    _increment(rejection_counts, "exhausted_source_id")
+                else:
                     discovered.append(candidate)
-                if len(discovered) >= self.policy.max_candidates:
-                    break
+                    if _has_early_stop_source(intent, [candidate], self.policy):
+                        stop = True
+                        break
         unique = {candidate.identity.stable_key: candidate for candidate in discovered}
-        bounded = tuple(unique[key] for key in sorted(unique)[: self.policy.max_candidates])
-        self._persist_candidates(request_track_id, lease, bounded)
+        bounded = tuple(
+            item.candidate
+            for item in _rank_discovery_candidates(intent, tuple(unique.values()), self.policy)[
+                : self.policy.max_candidates
+            ]
+        )
+        diagnostics = {
+            "schema_version": 1,
+            "query_variant_count": len(searched_queries),
+            "query_attempts": query_attempts,
+            "found_count": min(found_count, 1_000),
+            "probed_count": probe_count,
+            "accepted_count": len(bounded),
+            "rejection_counts": dict(sorted(rejection_counts.items())),
+            "stopped_early": stop and probe_count < probe_limit,
+        }
+        self._persist_candidates(
+            request_track_id,
+            lease,
+            bounded,
+            diagnostics=diagnostics,
+        )
+        discovery_state.persist_diagnostics(diagnostics)
+        if transient_count:
+            self.queue.add_warning(
+                lease,
+                code="source_discovery_transient",
+                message=(
+                    f"{transient_count} temporary media source check(s) failed; "
+                    "other safe alternatives were attempted."
+                ),
+            )
+        if transient_error is not None and (
+            not bounded
+            or decide_source_match(intent, bounded, policy=self.policy).decision
+            is not MatchDecision.MATCH
+        ):
+            # A weak or contradictory candidate is not a successful fallback: a
+            # temporarily unavailable provider may still contain the correct item.
+            # Preserve the inspected candidates/diagnostics and retry instead of
+            # turning that outage into an exceptional user review.
+            raise transient_error
         return bounded
 
     def _evidence_candidates(
         self,
         request_id: str,
         request_track_id: str,
+        lease: JobLease,
         limit: int,
         cancellation: CancellationSignal,
+        monitor: LeaseMonitor,
         *,
         excluded: set[str],
         provider_scope: frozenset[ProviderIdentity] | None,
-    ) -> list[SourceCandidate]:
+        intent: SourceIntent,
+        probe_budget: int,
+        total_probe_limit: int,
+        probe_epoch: str | None,
+        probe_epoch_limit: int | None,
+        discovery_state: SourceDiscoveryState,
+    ) -> tuple[
+        list[SourceCandidate],
+        int,
+        set[str],
+        SourceValidationError | YtDlpError | None,
+        int,
+    ]:
         with self.factory() as session:
             evidence = list(
                 session.scalars(
@@ -447,12 +850,37 @@ class WorkerSourceResolver:
                 )
             )
         result: list[SourceCandidate] = []
+        probe_count = 0
+        attempted_identities: set[str] = set()
+        transient_error: SourceValidationError | YtDlpError | None = None
+        transient_count = 0
+        eligible_evidence: list[
+            tuple[EvidenceReference, ProviderIdentity, SourceCandidate | None, str]
+        ] = []
         for reference in evidence:
             provider = provider_for_url(reference.canonical_url or "")
             if provider not in self.policy.allowed_providers:
                 continue
             if provider_scope is not None and provider not in provider_scope:
                 continue
+            candidate_stub = _candidate_from_evidence_reference(provider, reference)
+            identity = (
+                candidate_stub.identity.stable_key
+                if candidate_stub is not None
+                else (
+                    f"{provider.value}:url:"
+                    f"{hashlib.sha256((reference.canonical_url or '').encode()).hexdigest()}"
+                )
+            )
+            eligible_evidence.append((reference, provider, candidate_stub, identity))
+        evidence_attempts = discovery_state.probe_attempt_counts(
+            [identity for _reference, _provider, _stub, identity in eligible_evidence]
+        )
+        eligible_evidence.sort(key=lambda item: evidence_attempts.get(item[3], 0))
+        for reference, provider, candidate_stub, identity in eligible_evidence:
+            if cancellation.is_set():
+                raise InterruptedError("source discovery was cancelled")
+            monitor.raise_if_unusable()
             if reference.provider_item_id:
                 identity_key = (
                     f"{provider.value}:{provider_capability(provider).canonical_extractor}:"
@@ -460,20 +888,64 @@ class WorkerSourceResolver:
                 )
                 if identity_key in excluded:
                     continue
+                # A failed evidence probe must not be repeated when the same
+                # stable provider/extractor/ID appears in a later search result.
+                attempted_identities.add(identity_key)
             try:
+                if probe_count >= probe_budget:
+                    break
+                reservation = discovery_state.reserve_probe(
+                    identity,
+                    maximum_total=total_probe_limit,
+                    epoch=probe_epoch,
+                    maximum_epoch=probe_epoch_limit,
+                )
+                if not reservation.reserved:
+                    if reservation.remaining == 0:
+                        break
+                    continue
+                probe_count += 1
                 metadata = self.ytdlp.probe(
                     reference.canonical_url or "", cancel_signal=cancellation
                 )
             except (SourceValidationError, YtDlpError) as exc:
+                _raise_if_discovery_interrupted(exc, cancellation, monitor)
                 if is_transient_source_error(exc):
-                    raise
+                    transient_error = transient_error or exc
+                    transient_count = min(1_000, transient_count + 1)
+                    continue
+                reason_code, probe_status = _probe_rejection(exc)
+                self._persist_probe_rejection(
+                    request_track_id,
+                    lease,
+                    candidate_stub,
+                    evidence_id=reference.id,
+                    reason_code=reason_code,
+                    probe_status=probe_status,
+                )
                 continue
             candidate = _candidate_from_metadata(provider, metadata)
-            if candidate is not None and candidate.identity.stable_key not in excluded:
+            if candidate is None:
+                self._persist_probe_rejection(
+                    request_track_id,
+                    lease,
+                    candidate_stub,
+                    evidence_id=reference.id,
+                    reason_code="probe_metadata_invalid",
+                    probe_status="invalid",
+                )
+            elif candidate.identity.stable_key not in excluded:
+                attempted_identities.add(candidate.identity.stable_key)
                 result.append(candidate)
-                if len(result) >= limit:
+                if len(result) >= limit or _has_early_stop_source(intent, [candidate], self.policy):
                     break
-        return result
+        return (
+            result,
+            probe_count,
+            attempted_identities,
+            transient_error,
+            transient_count,
+        )
 
     def _existing_domain_candidates(
         self, request_id: str, request_track_id: str, lease: JobLease
@@ -583,7 +1055,7 @@ class WorkerSourceResolver:
                     candidate.superseded_by_id = existing.id
                     candidate.policy_status = "rejected"
 
-    def _exhausted_identity_keys(self, request_track_id: str) -> set[str]:
+    def _blocked_identity_keys(self, request_track_id: str) -> set[str]:
         with self.factory() as session:
             rows = session.execute(
                 select(
@@ -592,18 +1064,82 @@ class WorkerSourceResolver:
                     DbSourceCandidate.source_id,
                 ).where(
                     DbSourceCandidate.request_track_id == request_track_id,
-                    DbSourceCandidate.policy_status == "exhausted",
+                    or_(
+                        DbSourceCandidate.policy_status == "exhausted",
+                        and_(
+                            DbSourceCandidate.policy_status == "rejected",
+                            DbSourceCandidate.probe_status.in_(["invalid", "failed"]),
+                            DbSourceCandidate.failure_code.in_(
+                                sorted(_PERSISTED_PROBE_REJECTION_CODES)
+                            ),
+                        ),
+                    ),
                 )
             )
             return {
                 f"{provider}:{extractor}:{source_id}" for provider, extractor, source_id in rows
             }
 
+    def _persist_probe_rejection(
+        self,
+        request_track_id: str,
+        lease: JobLease,
+        candidate: SourceCandidate | None,
+        *,
+        reason_code: str,
+        probe_status: str,
+        evidence_id: str | None = None,
+    ) -> None:
+        """Persist a permanent, identity-scoped rejection without raw error text."""
+
+        if reason_code not in _PERSISTED_PROBE_REJECTION_CODES:
+            raise ValueError("unsupported persisted probe rejection")
+        with self.factory.begin() as session:
+            _leased_job(session, lease, action="persisting a rejected source probe")
+            if evidence_id is not None:
+                evidence = session.get(EvidenceReference, evidence_id)
+                if evidence is not None:
+                    evidence.status = "rejected"
+                    evidence.negative_reason = reason_code
+                    evidence.negative_until = None
+            if candidate is None:
+                return
+            row = session.scalar(
+                select(DbSourceCandidate).where(
+                    DbSourceCandidate.request_track_id == request_track_id,
+                    DbSourceCandidate.provider == candidate.provider.value,
+                    DbSourceCandidate.extractor == candidate.extractor,
+                    DbSourceCandidate.source_id == candidate.source_id,
+                )
+            )
+            if row is not None and (
+                row.policy_status == "exhausted" or row.probe_status == "valid"
+            ):
+                return
+            values = _db_candidate_values(candidate)
+            values.update(
+                {
+                    "evidence_id": evidence_id,
+                    "job_id": lease.job_id,
+                    "policy_status": "rejected",
+                    "probe_status": probe_status,
+                    "failure_code": reason_code,
+                    "attempted_at": datetime.now(UTC),
+                }
+            )
+            if row is None:
+                session.add(DbSourceCandidate(request_track_id=request_track_id, **values))
+                return
+            for key, value in values.items():
+                setattr(row, key, value)
+
     def _persist_candidates(
         self,
         request_track_id: str,
         lease: JobLease,
         candidates: tuple[SourceCandidate, ...],
+        *,
+        diagnostics: Mapping[str, object] | None = None,
     ) -> None:
         with self.factory.begin() as session:
             _leased_job(session, lease, action="persisting source candidates")
@@ -617,6 +1153,25 @@ class WorkerSourceResolver:
                     )
                 )
                 values = _db_candidate_values(candidate)
+                metadata = _json_object(str(values["sanitized_metadata_json"]))
+                if row is not None:
+                    # Matching-domain rows intentionally omit operational
+                    # provenance. Preserve it across retries and restarts.
+                    metadata = {
+                        **_json_object(row.sanitized_metadata_json),
+                        **metadata,
+                    }
+                if diagnostics is not None:
+                    previous = metadata.get("discovery_diagnostics")
+                    if not (
+                        isinstance(previous, Mapping)
+                        and previous
+                        and not _discovery_diagnostics_has_new_work(diagnostics)
+                    ):
+                        metadata["discovery_diagnostics"] = dict(diagnostics)
+                values["sanitized_metadata_json"] = json.dumps(
+                    metadata, ensure_ascii=False, separators=(",", ":")
+                )
                 if row is None:
                     row = DbSourceCandidate(
                         request_track_id=request_track_id,
@@ -706,7 +1261,7 @@ class WorkerSourceResolver:
                 local_confidence=local_confidence,
                 model_confidence=model_confidence,
                 openai_call_id=openai_call_id,
-                prompt_version="source_matcher_v2",
+                prompt_version=(SOURCE_MATCH_PROMPT_VERSION if authority == "openai" else None),
             )
             job.active_source_candidate_id = row.id
             job.source_extractor = row.extractor[:40]
@@ -830,6 +1385,7 @@ class WorkerSourceResolver:
             )
         payload = {
             "schema_version": 2,
+            "matcher_prompt_version": SOURCE_MATCH_PROMPT_VERSION,
             "request_id": request_id,
             "job_id": lease.job_id,
             "decision_category": "acquisition_source",
@@ -845,7 +1401,7 @@ class WorkerSourceResolver:
                 session,
                 target="web",
                 kind="select_source",
-                payload_version=2,
+                payload_version=3,
                 payload=payload,
             )
             task_id = task.id
@@ -899,7 +1455,9 @@ def _candidate_from_metadata(
     if duration is not None and duration > 14_400:
         return None
     abr = _optional_float(value.get("abr"))
-    quality = min(1.0, max(0.1, (abr or 128.0) / 256.0))
+    # Missing bitrate is neutral, not maximum quality evidence. Full
+    # format choice and byte/codec validation still happen before acquisition.
+    quality = 0.5 if abr is None else min(1.0, max(0.1, abr / 256.0))
     try:
         return SourceCandidate(
             source_id=source_id[:200],
@@ -924,14 +1482,324 @@ def _candidate_from_metadata(
         return fallback
 
 
+def _candidate_from_evidence_reference(
+    provider: ProviderIdentity,
+    reference: EvidenceReference,
+) -> SourceCandidate | None:
+    """Build the smallest safe identity record for a permanently failed probe."""
+
+    source_id = _optional_string(reference.provider_item_id)
+    url = _optional_string(reference.canonical_url)
+    if source_id is None or url is None:
+        return None
+    metadata = _json_object(reference.sanitized_metadata_json)
+    title = _optional_string(metadata.get("title")) or "Rejected source candidate"
+    try:
+        return SourceCandidate(
+            source_id=source_id,
+            provider=provider,
+            extractor=provider_capability(provider).canonical_extractor,
+            url=url,
+            title=title[:500],
+            audio_available=False,
+            audio_quality=0.0,
+        )
+    except ValueError:
+        return None
+
+
+def _probe_rejection(exc: SourceValidationError | YtDlpError) -> tuple[str, str]:
+    """Map provider failures to bounded codes; never persist exception text."""
+
+    if isinstance(exc, SourceValidationError):
+        return "probe_validation_rejected", "invalid"
+    return "probe_provider_rejected", "failed"
+
+
+def _raise_if_discovery_interrupted(
+    exc: SourceValidationError | YtDlpError,
+    cancellation: CancellationSignal,
+    monitor: LeaseMonitor,
+) -> None:
+    """Never reinterpret process cancellation or a lost lease as provider failure."""
+
+    if isinstance(exc, DownloadCancelled):
+        raise exc
+    if cancellation.is_set():
+        raise InterruptedError("source discovery was cancelled") from exc
+    monitor.raise_if_unusable()
+
+
+def _rank_discovery_candidates(
+    intent: SourceIntent,
+    candidates: list[SourceCandidate] | tuple[SourceCandidate, ...],
+    policy: SourcePolicy,
+) -> tuple[Any, ...]:
+    """Rank the bounded discovery superset before applying the persisted cap."""
+
+    if not candidates:
+        return ()
+    discovery_policy = policy.model_copy(
+        update={"max_candidates": min(100, max(policy.max_candidates, len(candidates)))}
+    )
+    return rank_sources(intent, candidates[:100], policy=discovery_policy)
+
+
+def _source_search_policy_fingerprint(policy: SourcePolicy) -> str:
+    """Invalidate job-local flat searches when matching policy semantics change."""
+
+    material = json.dumps(
+        {
+            "schema_version": 1,
+            "recording_version_policy": "recording_version_v2",
+            "source_match_prompt": SOURCE_MATCH_PROMPT_VERSION,
+            "policy": policy.model_dump(mode="json"),
+            "query_limit": MAX_SEARCH_RESULTS_PER_QUERY,
+            "initial_probe_limit": MAX_SOURCE_DISCOVERY_PROBES,
+            "fallback_probe_limit": MAX_SOURCE_DISCOVERY_PROBES_WITH_FALLBACK,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 def _requested_source_version(snapshot: Mapping[str, object], default: str) -> str:
-    """Use only a user-authored version constraint, otherwise operator policy.
+    """Use user intent, then recording-level provider evidence, then policy.
 
     ``version_signature`` can originate in model proposal text and therefore is
-    not authoritative for unattended source selection.
+    not authoritative by itself for unattended source selection. Direct and
+    collection ingestion record a separate durable provenance marker after a
+    policy-validated provider probe; that recording-level evidence is safe to
+    retain across the later source and canonical-metadata stages.
     """
 
-    return _optional_string(snapshot.get("requested_version")) or default
+    requested = _optional_string(snapshot.get("requested_version"))
+    raw_explicit = snapshot.get("version_constraint_explicit")
+    explicit: bool | None = raw_explicit if isinstance(raw_explicit, bool) else None
+    provenance = snapshot.get("metadata_provenance")
+    if explicit is None and isinstance(provenance, Mapping):
+        for key in ("request_constraints", "user_constraints"):
+            constraints = provenance.get(key)
+            marker = (
+                constraints.get("version_constraint_explicit")
+                if isinstance(constraints, Mapping)
+                else None
+            )
+            if isinstance(marker, bool):
+                explicit = marker
+                break
+    # A value explicitly marked as inferred is only a proposal hint. Keeping it
+    # would reject the exact studio source as (for example) an unwanted live cut.
+    if explicit is True:
+        return normalize_version_signature(
+            requested or _optional_string(snapshot.get("version_signature")) or default
+        )
+    durable_version = _durable_recording_version_constraint(snapshot)
+    if durable_version is not None:
+        return durable_version
+    if explicit is False:
+        return normalize_version_signature(default)
+    return normalize_version_signature(requested or default)
+
+
+def _source_version_is_explicit(snapshot: Mapping[str, object]) -> bool:
+    raw_explicit = snapshot.get("version_constraint_explicit")
+    if isinstance(raw_explicit, bool):
+        return raw_explicit
+    provenance = snapshot.get("metadata_provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    for key in ("user_constraints", "request_constraints"):
+        constraints = provenance.get(key)
+        if isinstance(constraints, Mapping):
+            marker = constraints.get("version_constraint_explicit")
+            if isinstance(marker, bool):
+                return marker
+    return provenance.get("version_constraint_explicit") is True
+
+
+def _durable_recording_version_constraint(snapshot: Mapping[str, object]) -> str | None:
+    """Return a version only when durable provenance names recording evidence."""
+
+    provenance = snapshot.get("metadata_provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    recording_version = provenance.get("recording_version")
+    if not isinstance(recording_version, Mapping):
+        return None
+    if recording_version.get("source") not in {
+        "musicbrainz_recording_disambiguation",
+        "provider_recording_metadata",
+    }:
+        return None
+    value = _optional_string(recording_version.get("signature"))
+    if value is None:
+        return None
+    return normalize_version_signature(value)
+
+
+def _release_only_version_inference(snapshot: Mapping[str, object]) -> bool:
+    """Identify legacy special versions known to come from non-recording text.
+
+    Missing provenance is deliberately not repaired. That conservative default
+    protects genuine MusicBrainz disambiguation and provider-evidenced live or
+    remix recordings whose canonical title itself is plain.
+    """
+
+    provenance = snapshot.get("metadata_provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    if provenance.get("source") == "unverified_model_output":
+        return True
+    recording_version = provenance.get("recording_version")
+    if isinstance(recording_version, Mapping):
+        return recording_version.get("source") in {
+            "model_inference",
+            "model_release_context",
+            "release_context",
+            "release_metadata",
+            "release_only",
+        }
+
+    # Releases built by 9b8cc17 used ``item.version, item.title, item.album``
+    # to fill version_signature. They can be identified without guessing from
+    # arbitrary old rows: the verified MB provenance predates both structured
+    # artist credits and the recording-version marker, and the album alone
+    # reproduces the stored special signature while the recording title does not.
+    if not (
+        provenance.get("source") == "musicbrainz_search_recordings"
+        and provenance.get("automatic_association") is True
+        and snapshot.get("canonical_identity_verified") is True
+        and "artists" not in provenance
+    ):
+        return False
+    prior = normalize_version_signature(_optional_string(snapshot.get("version_signature")))
+    if prior == "studio":
+        return False
+    title = _optional_string(snapshot.get("title"))
+    album = _optional_string(snapshot.get("album"))
+    return (
+        not DEFAULT_VERSION_CLASSIFIER.classify_recording(title).kinds
+        and normalize_version_signature(album) == prior
+    )
+
+
+def _exact_track_search_queries(intent: SourceIntent) -> tuple[str, ...]:
+    """Return a deterministic, finite exact-track search cascade."""
+
+    artist = _search_piece(intent.artist)
+    title = _search_piece(intent.title)
+    credit_variant = _artist_credit_search_variant(artist, intent.artists)
+    variants = [
+        f"{artist} {title}",
+    ]
+    if credit_variant != artist:
+        variants.append(f"{credit_variant} {title}")
+    variants.extend(
+        [
+            f"{title} {artist}",
+        ]
+    )
+    requested = DEFAULT_VERSION_CLASSIFIER.classify_signature(intent.requested_version)
+    if requested.kinds:
+        variants.append(f"{artist} {title} {_search_piece(intent.requested_version, limit=40)}")
+    variants.extend(
+        [
+            f"{artist} {title} official audio",
+            f"{artist} {title} official video",
+            f"{artist} - {title}",
+            f'"{artist}" "{title}"',
+        ]
+    )
+    unique: list[str] = []
+    for value in variants:
+        normalized = " ".join(value.split())[:300].strip()
+        if normalized and normalized not in unique:
+            unique.append(normalized)
+    return tuple(unique[:MAX_EXACT_TRACK_SEARCH_QUERIES])
+
+
+def _search_piece(value: str, *, limit: int = 125) -> str:
+    # Quotes are generated by this module for one bounded phrase variant. User
+    # punctuation remains data and cannot reshape that search operator.
+    return " ".join(value.replace('"', " ").split())[:limit].strip()
+
+
+def _artist_credit_search_variant(value: str, artists: tuple[str, ...] = ()) -> str:
+    """Normalize collaboration punctuation only as a query, never as identity."""
+
+    # A mixed comma/ampersand credit such as "Earth, Wind & Fire" is too
+    # ambiguous to reinterpret. Structured provider artist arrays remain the
+    # authoritative way to represent actual collaborators.
+    if len(artists) > 1:
+        return _search_piece(" & ".join(artists))
+    if "," in value and "&" in value:
+        return value
+    variant = artist_credit_variant(value)
+    if variant == value and "&" in value:
+        variant = value.replace("&", " and ")
+    return _search_piece(variant)
+
+
+def _increment(counts: dict[str, int], reason: str) -> None:
+    counts[reason] = min(1_000, counts.get(reason, 0) + 1)
+
+
+def _record_query_attempt(
+    attempts: list[dict[str, object]],
+    provider: ProviderIdentity,
+    query: str,
+    *,
+    found_count: int,
+) -> None:
+    if len(attempts) >= 12:
+        return
+    attempts.append(
+        {
+            "provider": provider.value,
+            "query": query[:300],
+            "found_count": min(MAX_SEARCH_RESULTS_PER_QUERY, max(0, found_count)),
+        }
+    )
+
+
+def _discovery_diagnostics_has_new_work(value: Mapping[str, object]) -> bool:
+    attempts = value.get("query_attempts")
+    if isinstance(attempts, list) and any(
+        isinstance(attempt, Mapping)
+        and isinstance(attempt.get("found_count"), int)
+        and not isinstance(attempt.get("found_count"), bool)
+        and attempt["found_count"] > 0
+        for attempt in attempts
+    ):
+        return True
+    for key in ("found_count", "probed_count"):
+        count = value.get(key)
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            return True
+    rejections = value.get("rejection_counts")
+    return isinstance(rejections, Mapping) and bool(rejections)
+
+
+def _has_early_stop_source(
+    intent: SourceIntent,
+    candidates: list[SourceCandidate] | tuple[SourceCandidate, ...],
+    policy: SourcePolicy,
+) -> bool:
+    """Stop discovery only for a validated high-confidence official source.
+
+    A third-party exact match remains eligible for final automatic selection, but
+    does not prevent the bounded official-audio/video queries from finding a
+    preferable equivalent upload.
+    """
+
+    return any(
+        candidate.uploader_relationship in _EARLY_STOP_UPLOADER_RELATIONSHIPS
+        and decide_source_match(intent, [candidate], policy=policy).decision is MatchDecision.MATCH
+        for candidate in candidates
+    )
 
 
 def _provider_url(
@@ -970,6 +1838,11 @@ def _uploader_relationship(
 
 
 def _db_candidate_values(candidate: SourceCandidate) -> dict[str, object]:
+    recording_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
+        candidate.title,
+        candidate.track,
+        explicit_version=candidate.version,
+    ).signature
     return {
         "provider": candidate.provider.value,
         "extractor": candidate.extractor,
@@ -980,7 +1853,7 @@ def _db_candidate_values(candidate: SourceCandidate) -> dict[str, object]:
         "uploader": candidate.uploader_name,
         "uploader_relationship": candidate.uploader_relationship.value,
         "duration_seconds": candidate.duration_seconds,
-        "version_signature": candidate.version or "studio",
+        "version_signature": normalize_version_signature(recording_version),
         "group_key": candidate.identity.stable_key[:500],
         "local_score": 0.0,
         "policy_status": "allowed",
@@ -1024,7 +1897,7 @@ def _domain_from_row(row: DbSourceCandidate) -> SourceCandidate:
         uploader_id=_optional_string(metadata.get("uploader_id")),
         uploader_relationship=UploaderRelationship(row.uploader_relationship),
         audio_available=audio_available if isinstance(audio_available, bool) else True,
-        audio_quality=audio_quality if audio_quality is not None else 1.0,
+        audio_quality=audio_quality if audio_quality is not None else 0.5,
         description=_optional_string(metadata.get("description_untrusted")),
     )
 
@@ -1047,6 +1920,11 @@ def _decision_candidate(row: DbSourceCandidate) -> dict[str, object]:
         "source_id": row.source_id,
         "local_score": row.local_score,
     }
+
+
+def _decision_selects_source(decision: JobDecision, candidate_id: str) -> bool:
+    payload = _json_object(decision.selected_payload_json or "{}")
+    return payload.get("source_candidate_id") == candidate_id
 
 
 def _review_reason(code: str) -> str:
@@ -1122,6 +2000,23 @@ def _provider_fallback_allowed(value: Mapping[str, object]) -> bool:
     return value.get("provider_fallback_allowed") is True
 
 
+def _consented_fallback_provider_scope(
+    value: Mapping[str, object],
+) -> frozenset[ProviderIdentity]:
+    """Return only newly consented providers from a valid constrained request."""
+
+    if not _provider_fallback_allowed(value):
+        return frozenset()
+    requested = _requested_provider_scope(value)
+    excluded = _excluded_provider_scope(value)
+    if not requested and not excluded:
+        return frozenset()
+    initial_scope = set(requested or _ACQUISITION_PROVIDER_SET)
+    initial_scope.difference_update(excluded)
+    fallbacks = _provider_scope_list(value, "provider_fallback_providers")
+    return frozenset(provider for provider in fallbacks if provider not in initial_scope)
+
+
 def _effective_provider_scope(
     value: Mapping[str, object],
 ) -> frozenset[ProviderIdentity] | None:
@@ -1131,20 +2026,7 @@ def _effective_provider_scope(
         return None
     providers = set(requested or _ACQUISITION_PROVIDER_SET)
     providers.difference_update(excluded)
-    if not _provider_fallback_allowed(value):
-        return frozenset(providers)
-    raw_fallbacks = value.get("provider_fallback_providers")
-    if not isinstance(raw_fallbacks, list):
-        return frozenset(providers)
-    for raw in raw_fallbacks:
-        if not isinstance(raw, str):
-            continue
-        try:
-            provider = ProviderIdentity(raw)
-        except ValueError:
-            continue
-        if provider in _ACQUISITION_PROVIDER_SET:
-            providers.add(provider)
+    providers.update(_consented_fallback_provider_scope(value))
     return frozenset(providers)
 
 

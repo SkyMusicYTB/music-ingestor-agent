@@ -11,11 +11,12 @@ from app.config import Settings
 from app.db.models import Request, RequestTrack
 from app.repositories.events import make_event
 from app.schemas import MusicProposal
+from app.services.artist_credits import artist_credit_similarity
 from app.services.duplicates import (
     DuplicateCandidate,
     DuplicateDetector,
     normalize_text,
-    version_signature,
+    normalize_version_signature,
     versions_compatible,
 )
 from app.services.request_constraints import parse_explicit_request_constraints
@@ -36,6 +37,9 @@ class VerifiedMetadata:
     release_mbid: str | None
     release_group_mbid: str | None
     score: float
+    year: int | None = None
+    artists: tuple[str, ...] = ()
+    contradiction_codes: tuple[str, ...] = ()
     decided_by: str = "deterministic"
     model_confidence: float | None = None
     openai_call_id: str | None = None
@@ -74,20 +78,37 @@ class ProposalService:
             selected_count = 0
             warning_count = 0
             for ordinal, item in enumerate(proposal.tracks, start=1):
-                signature = request_constraints.version or version_signature(
-                    item.version, item.title, item.album
+                # A model-proposed title/version is not recording authority. An
+                # unverified candidate defaults to studio unless the user's own
+                # text supplied a special-version constraint.
+                signature = normalize_version_signature(request_constraints.version)
+                verified = _verified_match(
+                    item,
+                    request_constraints.version,
+                    verified_metadata or {},
                 )
-                verified = _verified_match(item, signature, verified_metadata or {})
+                stored_artist = verified.artist if verified is not None else item.artist
+                stored_title = verified.title if verified is not None else item.title
+                stored_album = verified.album if verified is not None else item.album
+                stored_album_artist = verified.artist if verified is not None else item.album_artist
+                stored_year = verified.year if verified is not None else item.year
+                stored_duration = (
+                    verified.duration_seconds if verified is not None else item.duration_seconds
+                )
+                if verified is not None:
+                    signature = normalize_version_signature(
+                        request_constraints.version or verified.version_signature
+                    )
                 recording_mbid = verified.recording_mbid if verified is not None else None
                 release_mbid = verified.release_mbid if verified is not None else None
                 release_group_mbid = verified.release_group_mbid if verified is not None else None
                 duplicate = self._duplicates.find(
                     session,
                     DuplicateCandidate(
-                        artist=item.artist,
-                        title=item.title,
+                        artist=stored_artist,
+                        title=stored_title,
                         version_signature=signature,
-                        duration_seconds=item.duration_seconds,
+                        duration_seconds=stored_duration,
                         recording_mbid=recording_mbid,
                     ),
                 )
@@ -101,12 +122,12 @@ class ProposalService:
                 track = RequestTrack(
                     request_id=request_id,
                     ordinal=ordinal,
-                    artist=item.artist,
-                    title=item.title,
-                    album=item.album,
-                    album_artist=item.album_artist,
-                    year=item.year,
-                    duration_seconds=item.duration_seconds,
+                    artist=stored_artist,
+                    title=stored_title,
+                    album=stored_album,
+                    album_artist=stored_album_artist,
+                    year=stored_year,
+                    duration_seconds=stored_duration,
                     recording_mbid=recording_mbid,
                     release_mbid=release_mbid,
                     release_group_mbid=release_group_mbid,
@@ -120,7 +141,15 @@ class ProposalService:
                     # accepted exclusively from a worker-owned, policy-validated candidate.
                     source_url=None,
                     version_signature=signature,
-                    rationale=item.rationale,
+                    rationale=(
+                        "Verified canonical recording identity; recording version and release "
+                        "context were resolved independently."
+                        if verified is not None
+                        else (
+                            "Provisional discovery candidate; canonical metadata is not yet "
+                            "verified."
+                        )
+                    ),
                     evidence_json=json.dumps(display_evidence, ensure_ascii=False),
                     duplicate_status=duplicate.status,
                     duplicate_track_id=duplicate.track_id,
@@ -147,8 +176,21 @@ class ProposalService:
                                 if verified is not None
                                 else "unverified_model_output"
                             ),
+                            "recording_version": (
+                                {
+                                    "signature": signature,
+                                    "source": "musicbrainz_recording_disambiguation",
+                                }
+                                if verified is not None
+                                else None
+                            ),
                             "recording_mbid": recording_mbid,
                             "release_mbid": release_mbid,
+                            "artists": (
+                                list(verified.artists or (verified.artist,))
+                                if verified is not None
+                                else []
+                            ),
                             "suggested_recording_mbid": (
                                 item.recording_mbid if verified is None else None
                             ),
@@ -220,7 +262,7 @@ def _proposal_status(proposal: MusicProposal) -> str:
 
 def _verified_match(
     item: object,
-    signature: str,
+    explicit_version: str | None,
     verified_metadata: Mapping[str, VerifiedMetadata],
 ) -> VerifiedMetadata | None:
     recording_mbid = getattr(item, "recording_mbid", None)
@@ -229,11 +271,24 @@ def _verified_match(
     verified = verified_metadata.get(recording_mbid)
     if verified is None:
         return None
-    if normalize_text(str(getattr(item, "artist", ""))) != normalize_text(verified.artist):
+    if (
+        artist_credit_similarity(
+            str(getattr(item, "artist", "")),
+            verified.artist,
+            right_artists=verified.artists,
+        )
+        < 0.95
+    ):
         return None
     if normalize_text(str(getattr(item, "title", ""))) != normalize_text(verified.title):
         return None
-    if not versions_compatible(signature, verified.version_signature):
+    # With no explicit user constraint, the finite MusicBrainz candidate is the
+    # recording-version authority. This permits a genuinely live/acoustic/etc.
+    # recording while preventing model-only version text or release wording from
+    # redefining the recording. An explicit user version remains a hard gate.
+    if explicit_version is not None and not versions_compatible(
+        explicit_version, verified.version_signature
+    ):
         return None
     proposed_duration = getattr(item, "duration_seconds", None)
     if (

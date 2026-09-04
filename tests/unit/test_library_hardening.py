@@ -16,8 +16,13 @@ from app.repositories.library import LibraryRepository
 from app.services import library_metadata, library_scan
 from app.services.duplicates import DuplicateCandidate, DuplicateDetector
 from app.services.library_audit import audit_library
-from app.services.library_formats import FORMATS
-from app.services.library_metadata import LibraryReadError, filename_metadata, probe_metadata
+from app.services.library_formats import FORMATS, PARSER_VERSION
+from app.services.library_metadata import (
+    LibraryReadError,
+    filename_metadata,
+    probe_metadata,
+    read_audio_metadata,
+)
 from app.services.library_scan import LibraryScanner, ScanAlreadyRunning, ScanDiagnostics
 
 
@@ -39,6 +44,36 @@ def create_file(root: Path, name: str = "song.mp3") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"test")
     return path
+
+
+def test_library_recording_version_ignores_album_edition_text(monkeypatch, tmp_path: Path) -> None:
+    class Info:
+        length = 146.0
+        bitrate = 192_000
+
+    class MP3:
+        info = Info()
+
+        def __init__(self, tags):
+            self.tags = tags
+
+    path = create_file(tmp_path, "track.mp3")
+    monkeypatch.setattr(
+        library_metadata,
+        "MutagenFile",
+        lambda _file, *, easy: MP3(
+            {
+                "artist": ["Gabry Ponte & KEL"],
+                "title": ["Tarantella"],
+                "album": ["Radio Italia Live Compilation"],
+            }
+            if easy
+            else {}
+        ),
+    )
+    values = read_audio_metadata(path, music_root=tmp_path)
+    assert values["version_signature"] == "studio"
+    assert PARSER_VERSION == 3
 
 
 def test_full_reread_and_parser_version_invalidation(monkeypatch, session_factory, settings):

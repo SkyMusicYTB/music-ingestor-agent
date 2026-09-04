@@ -13,27 +13,20 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.db.models import Track
 from app.services.library_presence import library_presence
+from app.services.recording_versions import (
+    canonical_recording_version_labels,
+    recording_version_evidence,
+)
 
 _SAFE_SUFFIX = re.compile(
     r"\s*[\[(]\s*(?:official\s+(?:music\s+)?video|official\s+audio|lyrics?|hd|4k)\s*[\])]\s*$",
     re.IGNORECASE,
 )
 _PUNCT = re.compile(r"[^\w]+", re.UNICODE)
-_VERSION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("live", re.compile(r"\blive(?:\s+at|\s+from|\s+version)?\b", re.I)),
-    ("acoustic", re.compile(r"\bacoustic\b", re.I)),
-    ("remix", re.compile(r"\b(?:re)?mix\b", re.I)),
-    ("radio edit", re.compile(r"\bradio\s+edit\b", re.I)),
-    ("remaster", re.compile(r"\bremaster(?:ed)?(?:\s+\d{4})?\b", re.I)),
-    ("demo", re.compile(r"\bdemo\b", re.I)),
-    ("instrumental", re.compile(r"\binstrumental\b", re.I)),
-    ("sped up", re.compile(r"\bsped[ -]?up\b", re.I)),
-    ("slowed", re.compile(r"\bslowed(?:\s*[+&]\s*reverb)?\b", re.I)),
-    ("extended", re.compile(r"\bextended(?:\s+(?:mix|version))?\b", re.I)),
-    ("cover", re.compile(r"\bcover\b", re.I)),
-    ("karaoke", re.compile(r"\bkaraoke\b", re.I)),
-)
-_FEATURE = re.compile(r"\b(?:feat\.?|ft\.?)\s+([^][()\-\u2013\u2014]+)", re.I)
+# ``|`` is the durable serialized boundary and must never become part of a
+# featured-artist credit. A plus sign can be part of a real artist credit, so it
+# remains raw input for ``normalize_text`` rather than being truncated here.
+_FEATURE = re.compile(r"\b(?:feat\.?|ft\.?)\s+([^][()\-\u2013\u2014|]+)", re.I)
 
 
 def strip_provider_suffixes(value: str) -> str:
@@ -52,11 +45,11 @@ def normalize_text(value: str) -> str:
 
 
 def version_signature(*values: str | None) -> str:
+    # Version values cross several bounded provider/model interfaces. Normalize
+    # compound labels before classification so ``radio_edit`` and ``radio edit``
+    # (and the equivalent sped-up spellings) cannot become distinct identities.
     combined = " ".join(value for value in values if value)
-    found: list[str] = []
-    for label, pattern in _VERSION_PATTERNS:
-        if pattern.search(combined):
-            found.append(label)
+    found = list(canonical_recording_version_labels(combined))
     feature = _FEATURE.search(combined)
     if feature:
         featured = normalize_text(feature.group(1))[:100]
@@ -65,10 +58,41 @@ def version_signature(*values: str | None) -> str:
     return "|".join(sorted(set(found))) or "studio"
 
 
+def normalize_version_signature(value: str | None) -> str:
+    """Return the one durable serialization used by comparisons and dedup keys.
+
+    Both ``+`` and ``|`` are accepted as legacy/internal compound separators.
+    The classifier extracts the bounded supported version vocabulary and emits
+    stable, sorted pipe-separated labels.
+    """
+
+    return version_signature(value)
+
+
+def recording_version_signature(
+    *,
+    explicit_version: str | None = None,
+    recording_title: str | None = None,
+    recording_disambiguation: str | None = None,
+) -> str:
+    """Classify recording evidence without accepting album/release text."""
+
+    signature = version_signature(
+        explicit_version,
+        recording_disambiguation,
+        *recording_version_evidence(recording_title),
+    )
+    found = [] if signature == "studio" else signature.split("|")
+    feature = _FEATURE.search(recording_title or "")
+    if feature:
+        featured = normalize_text(feature.group(1))[:100]
+        if featured:
+            found.append(f"feat {featured}")
+    return "|".join(sorted(set(found))) or "studio"
+
+
 def versions_compatible(left: str | None, right: str | None) -> bool:
-    left_parts = set((left or "studio").split("|"))
-    right_parts = set((right or "studio").split("|"))
-    return left_parts == right_parts
+    return normalize_version_signature(left) == normalize_version_signature(right)
 
 
 @dataclass(frozen=True)

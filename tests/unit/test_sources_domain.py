@@ -50,6 +50,7 @@ def _candidate(
     relationship: UploaderRelationship = UploaderRelationship.OFFICIAL_ARTIST,
     uploader: str = "Someone",
     description: str | None = None,
+    artists: tuple[str, ...] = (),
 ) -> SourceCandidate:
     extractor = provider.value
     urls = {
@@ -70,6 +71,7 @@ def _candidate(
         uploader_name=uploader,
         uploader_relationship=relationship,
         description=description,
+        artists=artists,
     )
 
 
@@ -180,6 +182,88 @@ def test_version_classifier_detects_requested_and_contradictory_versions() -> No
     ].version_match
 
 
+@pytest.mark.parametrize(
+    ("requested_version", "candidate_title", "expected_signature"),
+    [
+        ("extended", "Artist - Song (Extended Mix)", "extended"),
+        ("nightcore", "Artist - Song (Nightcore)", "nightcore"),
+    ],
+)
+def test_explicit_extended_and_nightcore_versions_round_trip_through_source_matching(
+    requested_version: str,
+    candidate_title: str,
+    expected_signature: str,
+) -> None:
+    intent = SourceIntent(
+        artist="Artist",
+        title="Song",
+        requested_version=requested_version,
+        duration_seconds=200,
+    )
+
+    ranked = rank_sources(
+        intent,
+        [_candidate(expected_signature, title=candidate_title, track="Song")],
+    )[0]
+
+    assert classify_version(candidate_title).signature == expected_signature
+    assert ranked.version_match
+    assert decide_source_match(intent, [ranked.candidate]).decision is MatchDecision.MATCH
+
+
+def test_unrequested_nightcore_is_not_treated_as_studio() -> None:
+    intent = SourceIntent(artist="Artist", title="Song", duration_seconds=200)
+
+    ranked = rank_sources(intent, [_candidate("nightcore", title="Artist - Song (Nightcore)")])[0]
+
+    assert not ranked.version_match
+
+
+@pytest.mark.parametrize(
+    "ordinary_title",
+    [
+        "Live Forever",
+        "Song (Live Forever)",
+        "Cover Me",
+        "Song (Cover Me)",
+        "Extended Family",
+        "Live - Lightning Crashes",
+        "Cover Drive - Twilight",
+    ],
+)
+def test_ordinary_names_are_not_recording_version_markers(ordinary_title: str) -> None:
+    assert classify_version(ordinary_title).signature == "studio"
+
+
+def test_missing_required_collaborator_is_a_hard_source_contradiction() -> None:
+    main_artist = "A Very Long Canonical Main Artist Name"
+    intent = SourceIntent(
+        artist=f"{main_artist} & X",
+        artists=(main_artist, "X"),
+        title="Exact Song",
+        duration_seconds=200,
+    )
+    candidate = SourceCandidate(
+        source_id="missing-collaborator",
+        provider=ProviderIdentity.YOUTUBE,
+        extractor="youtube",
+        url="https://youtube.com/watch?v=missing-collaborator",
+        title=f"{main_artist} - Exact Song",
+        artist=main_artist,
+        artists=(main_artist,),
+        track="Exact Song",
+        duration_seconds=200,
+        uploader_relationship=UploaderRelationship.TOPIC,
+    )
+
+    ranked = rank_sources(intent, [candidate])[0]
+    decision = decide_source_match(intent, [candidate])
+
+    assert ranked.score >= 0.88
+    assert "artist_credit_mismatch" in ranked.contradiction_codes
+    assert decision.decision is MatchDecision.REJECT
+
+
 def test_equivalent_uploads_ignore_uploader_and_do_not_create_false_ambiguity() -> None:
     bandcamp = _candidate("bc", uploader="Artist")
     youtube = _candidate(
@@ -212,6 +296,36 @@ def test_equivalent_official_audio_and_video_allow_bounded_duration_variance() -
     groups = group_equivalent_sources([audio, video, materially_different])
 
     assert sorted(len(group.candidates) for group in groups) == [1, 2]
+
+
+def test_equivalent_collaboration_separator_variants_form_one_source_group() -> None:
+    comma = _candidate(
+        "comma",
+        provider=ProviderIdentity.YOUTUBE,
+        title="Gabry Ponte, KEL - Tarantella (Official Audio)",
+        artist="Gabry Ponte, KEL",
+        track="Tarantella",
+        duration=146,
+        artists=("Gabry Ponte", "KEL"),
+    )
+    ampersand = _candidate(
+        "ampersand",
+        provider=ProviderIdentity.YOUTUBE,
+        title="Gabry Ponte & KEL - Tarantella (Official Video)",
+        artist="Gabry Ponte & KEL",
+        track="Tarantella",
+        duration=146,
+        artists=("Gabry Ponte", "KEL"),
+    )
+    intent = SourceIntent(
+        artist="Gabry Ponte & KEL",
+        title="Tarantella",
+        duration_seconds=146,
+        artists=("Gabry Ponte", "KEL"),
+    )
+
+    assert [len(group.candidates) for group in group_equivalent_sources([comma, ampersand])] == [2]
+    assert decide_source_match(intent, [comma, ampersand]).decision is MatchDecision.MATCH
 
 
 def test_duration_is_compatible_within_ten_seconds_or_five_percent() -> None:

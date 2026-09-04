@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from rapidfuzz.fuzz import token_set_ratio
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.clients.ytdlp import (
@@ -21,6 +21,7 @@ from app.clients.ytdlp import (
     DownloadCancelled,
     DownloadProgress,
     DownloadResult,
+    DownloadTimedOut,
     SourceValidationError,
     YtDlpClient,
     YtDlpError,
@@ -28,16 +29,26 @@ from app.clients.ytdlp import (
 )
 from app.config import Settings
 from app.db.enums import JobStage
-from app.db.models import DownloadJob, EvidenceReference, RequestTrack, ServiceTask, Track
+from app.db.models import (
+    DownloadJob,
+    EvidenceReference,
+    JobDecision,
+    RequestTrack,
+    ServiceTask,
+    Track,
+)
 from app.db.models import SourceCandidate as DbSourceCandidate
 from app.logging import redact
+from app.prompts import CANONICAL_MATCH_PROMPT_VERSION
 from app.repositories.decisions import (
+    CanonicalDecisionReplay,
     candidate_set_fingerprint,
     latest_canonical_selection,
     record_selected_decision,
     selected_decision,
     selected_payload,
 )
+from app.repositories.jobs import dedup_key
 from app.repositories.library import LibraryRepository
 from app.services.artist_credits import structured_artists
 from app.services.artwork import (
@@ -52,6 +63,7 @@ from app.services.artwork import (
 from app.services.duplicates import (
     DuplicateCandidate,
     DuplicateDetector,
+    normalize_version_signature,
     strip_provider_suffixes,
 )
 from app.services.filesystem import (
@@ -114,11 +126,22 @@ from app.workers.source_failures import (
     is_transient_source_error as _is_transient_source_error,
 )
 from app.workers.source_resolution import (
+    EquivalentAcquisitionActive,
     SourceResolutionNeedsReview,
     WorkerSourceResolver,
 )
 
 logger = logging.getLogger(__name__)
+
+_CANONICAL_MATCH_POLICY_VERSION = "recording_version_v2"
+_CANONICAL_LOCAL_CONTRADICTION_CODES = frozenset(
+    {
+        "artist_credit_mismatch",
+        "explicit_album_mismatch",
+        "explicit_album_missing",
+        "explicit_version_mismatch",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +460,14 @@ class DownloadJobProcessor:
         except LeaseLostError:
             monitor.stop()
             return ProcessOutcome(job_id=lease.job_id, status="lease_lost")
+        except EquivalentAcquisitionActive:
+            monitor.stop()
+            try:
+                status = self.queue.defer_for_equivalent_acquisition(lease)
+            except LeaseLostError:
+                return ProcessOutcome(job_id=lease.job_id, status="lease_lost")
+            cleanup_staging_directory(staging)
+            return ProcessOutcome(job_id=lease.job_id, status=status)
         except InsufficientSpaceError:
             monitor.stop()
             self.queue.wait_for_space(lease)
@@ -457,7 +488,7 @@ class DownloadJobProcessor:
             status = self.queue.fail(
                 lease,
                 error_code=_error_code(exc),
-                error_message=redact(str(exc) or type(exc).__name__),
+                error_message=_safe_job_error(exc),
                 retryable=retryable,
             )
             if status == "failed" and (
@@ -837,15 +868,16 @@ class DownloadJobProcessor:
     ) -> None:
         expected_artist = _required_string(expected, "artist")
         expected_title = _required_string(expected, "title")
-        expected_version = DEFAULT_VERSION_CLASSIFIER.classify(
+        version_constraint = _authoritative_version_constraint(expected)
+        expected_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
             expected_title,
-            _explicit_version_constraint(expected),
+            explicit_version=version_constraint,
         )
-        source_version = DEFAULT_VERSION_CLASSIFIER.classify(
+        source_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
             _first_source_string(source, "title"),
             _first_source_string(source, "track"),
             _first_source_string(source, "alt_title"),
-            _first_source_string(source, "version"),
+            explicit_version=_first_source_string(source, "version"),
         )
         if DEFAULT_VERSION_CLASSIFIER.contradictions(expected_version, source_version):
             raise SourceCandidateRejected(
@@ -885,8 +917,8 @@ class DownloadJobProcessor:
             title=expected_title,
             album=_explicit_album_constraint(expected),
             duration_seconds=_float_or_none(expected.get("duration_seconds")),
-            requested_version=_explicit_version_constraint(expected),
-            version_is_explicit=_version_constraint_explicit(expected),
+            requested_version=version_constraint,
+            version_is_explicit=version_constraint is not None,
             candidates=[candidate],
             limit=1,
         )
@@ -975,6 +1007,28 @@ class DownloadJobProcessor:
                     source_extractor=_string_or_none(values.get("source_extractor")),
                     source_id=_string_or_none(values.get("source_id")),
                 )
+            if durable_replay is not None and _canonical_replay_is_suspect(values, durable_replay):
+                decision_id = durable_replay.decision_id
+                if decision_id is not None:
+                    with self.session_factory.begin() as session:
+                        job = _leased_job(session, lease, action="revalidating canonical metadata")
+                        decision = session.scalar(
+                            select(JobDecision).where(
+                                JobDecision.id == decision_id,
+                                JobDecision.job_id == job.id,
+                                JobDecision.category == "canonical_metadata",
+                                JobDecision.state == "selected",
+                                JobDecision.decided_by != "user",
+                            )
+                        )
+                        if decision is not None:
+                            decision.state = "rejected"
+                            reason_codes = _json_string_list(decision.reason_codes_json)
+                            reason_codes.append("inferred_version_revalidated")
+                            decision.reason_codes_json = json.dumps(
+                                list(dict.fromkeys(reason_codes)), separators=(",", ":")
+                            )
+                durable_replay = None
         if durable_replay is not None:
             if durable_replay.payload.get("metadata_authority") in FALLBACK_AUTHORITIES:
                 return self._apply_provider_metadata(values, durable_replay.payload, lease)
@@ -993,7 +1047,7 @@ class DownloadJobProcessor:
                     title=_required_string(values, "title"),
                     album=_explicit_album_constraint(values),
                     duration_seconds=probe.duration_seconds,
-                    version_signature=_explicit_version_constraint(values),
+                    version_signature=_authoritative_version_constraint(values),
                     album_is_explicit=_album_constraint_explicit(values),
                     year=_int_or_none(values.get("year")),
                 )
@@ -1054,10 +1108,10 @@ class DownloadJobProcessor:
                     values,
                     options,
                 )
-                selected, decision = self._adjudicate_canonical_model(
+                selected, canonical_decision = self._adjudicate_canonical_model(
                     values, probe, options, model_result
                 )
-                if selected is None or decision is None:
+                if selected is None or canonical_decision is None:
                     return self._fallback_or_review(
                         values,
                         probe,
@@ -1068,7 +1122,7 @@ class DownloadJobProcessor:
                     )
                 candidate = _metadata_candidate_from_payload(selected)
                 authority = "openai"
-                model_confidence = decision.confidence
+                model_confidence = canonical_decision.confidence
                 openai_call_id = _string_or_none(model_result.get("openai_call_id"))
             else:
                 return self._fallback_or_review(
@@ -1090,6 +1144,9 @@ class DownloadJobProcessor:
                 _metadata_payload(candidate),
             )
             local_confidence = _float_or_none(selected_option.get("local_score"))
+            version_correction_reason = _inferred_version_correction_reason(
+                values, candidate.version
+            )
             with self.session_factory.begin() as session:
                 job = _leased_job(session, lease, action="persisting canonical metadata")
                 record_selected_decision(
@@ -1103,26 +1160,40 @@ class DownloadJobProcessor:
                         "source_id": values.get("source_id"),
                         "metadata_authority": "musicbrainz",
                         "canonical_identity_verified": candidate.recording_mbid is not None,
+                        "matching_policy_version": _CANONICAL_MATCH_POLICY_VERSION,
                         "recording_candidate_id": selected_option.get("recording_candidate_id"),
                         "release_candidate_id": selected_option.get("release_candidate_id"),
                     },
                     decided_by=authority,
-                    reason_codes=["canonical_match_accepted"],
+                    reason_codes=[
+                        "canonical_match_accepted",
+                        *([version_correction_reason] if version_correction_reason else []),
+                    ],
                     local_confidence=local_confidence,
                     model_confidence=model_confidence,
                     openai_call_id=openai_call_id,
-                    prompt_version=("canonical_matcher_v2" if authority == "openai" else None),
+                    prompt_version=(
+                        CANONICAL_MATCH_PROMPT_VERSION if authority == "openai" else None
+                    ),
                 )
         enriched = dict(values)
         enriched["artist"] = candidate.artist
         enriched["artists"] = list(candidate.artists or (candidate.artist,))
         enriched["title"] = candidate.title
-        if candidate.album:
+        explicit_album = _explicit_album_constraint(values)
+        if explicit_album is not None:
+            enriched["album"] = explicit_album
+        elif candidate.album:
             enriched["album"] = candidate.album
         enriched["album_artist"] = candidate.artist
         enriched["album_artists"] = [candidate.artist]
         if candidate.year is not None:
             enriched["year"] = candidate.year
+        resolved_version = normalize_version_signature(
+            _explicit_version_constraint(values) or candidate.version
+        )
+        version_correction_reason = _inferred_version_correction_reason(values, resolved_version)
+        enriched["version_signature"] = resolved_version
         for key in ("recording_mbid", "release_mbid", "release_group_mbid"):
             # Always overwrite these fields so an unverified model suggestion can
             # never survive a later local MusicBrainz resolution by omission.
@@ -1146,8 +1217,16 @@ class DownloadJobProcessor:
                 "decided_by": authority,
             }
         )
+        if version_correction_reason is not None:
+            canonical_resolution["reason_codes"] = [version_correction_reason]
         provenance["canonical_metadata_resolution"] = canonical_resolution
+        provenance["recording_version"] = {
+            "signature": resolved_version,
+            "source": "musicbrainz_recording_disambiguation",
+        }
         enriched["metadata_provenance"] = provenance
+        if lease is not None:
+            self._persist_resolved_identity(lease, enriched)
         return enriched
 
     def _source_authority(
@@ -1198,15 +1277,29 @@ class DownloadJobProcessor:
         options: list[dict[str, Any]],
         reason_code: str,
     ) -> dict[str, Any]:
+        fallback_values = dict(values)
+        version_constraint = _authoritative_version_constraint(values)
+        if version_constraint is not None:
+            # provider_fallback intentionally treats requested_version as a hard
+            # recording constraint. Supply durable provider evidence here without
+            # rewriting the user's original request-constraint provenance.
+            fallback_values["requested_version"] = version_constraint
         fallback = provider_fallback(
-            values,
+            fallback_values,
             source_metadata or {},
             authority=self._source_authority(lease, values),
             duration=probe.duration_seconds,
             minimum_score=getattr(self.settings, "provider_metadata_fallback_min_score", 0.90),
         )
         if fallback is not None:
-            payload = {**fallback.payload, "reason_code": reason_code}
+            payload = {
+                **fallback.payload,
+                "reason_code": reason_code,
+                "matching_policy_version": _CANONICAL_MATCH_POLICY_VERSION,
+            }
+            version_correction_reason = _inferred_version_correction_reason(
+                values, _string_or_none(payload.get("version"))
+            )
             if self.settings.canonical_metadata_policy == "prefer" and fallback.automatic:
                 assert lease is not None and self.session_factory is not None
                 with self.session_factory.begin() as session:
@@ -1220,7 +1313,11 @@ class DownloadJobProcessor:
                         candidates=[payload],
                         selected_payload=payload,
                         decided_by="deterministic",
-                        reason_codes=["provider_metadata_fallback", reason_code],
+                        reason_codes=[
+                            "provider_metadata_fallback",
+                            reason_code,
+                            *([version_correction_reason] if version_correction_reason else []),
+                        ],
                         local_confidence=_float_or_none(fallback.payload["local_score"]),
                     )
                 return self._apply_provider_metadata(values, payload, lease)
@@ -1254,6 +1351,14 @@ class DownloadJobProcessor:
         ):
             if key in payload:
                 enriched[key] = payload[key]
+        version = _string_or_none(payload.get("version"))
+        version_correction_reason = _inferred_version_correction_reason(values, version)
+        resolved_version = _explicit_version_constraint(values) or version
+        if resolved_version is not None:
+            enriched["version_signature"] = normalize_version_signature(resolved_version)
+        explicit_album = _explicit_album_constraint(values)
+        if explicit_album is not None:
+            enriched["album"] = explicit_album
         enriched["album_artists"] = [enriched.get("album_artist") or enriched["artist"]]
         for key in ("recording_mbid", "release_mbid", "release_group_mbid"):
             enriched[key] = None
@@ -1261,7 +1366,7 @@ class DownloadJobProcessor:
         enriched["canonical_identity_verified"] = False
         authority = str(payload["metadata_authority"])
         provenance = dict(values.get("metadata_provenance") or {})
-        provenance["canonical_metadata_resolution"] = {
+        canonical_resolution: dict[str, object] = {
             "source": authority,
             "automatic_association": authority != "user_confirmed_provider_metadata",
             "decided_by": "user"
@@ -1269,12 +1374,114 @@ class DownloadJobProcessor:
             else "deterministic",
             "reason_code": payload.get("reason_code") or "user_selected_provider_metadata",
         }
+        if version_correction_reason is not None:
+            canonical_resolution["reason_codes"] = [version_correction_reason]
+        provenance["canonical_metadata_resolution"] = canonical_resolution
+        if resolved_version is not None:
+            provenance["recording_version"] = {
+                "signature": normalize_version_signature(resolved_version),
+                "source": "provider_recording_metadata",
+            }
         enriched["metadata_provenance"] = provenance
         if lease is not None:
+            self._persist_resolved_identity(lease, enriched)
             self.queue.add_warning(
                 lease, code="provider_metadata_fallback", message=FALLBACK_WARNING
             )
         return enriched
+
+    def _persist_resolved_identity(
+        self,
+        lease: JobLease,
+        values: Mapping[str, Any],
+    ) -> None:
+        """Atomically persist canonical/provider corrections under the job lease.
+
+        RequestTrack is the durable request identity while approved_snapshot is
+        the worker's restart envelope. Updating either alone can make retries use
+        stale metadata or a stale dedup key, so all three values are fenced by one
+        SQLite writer transaction and the active-key uniqueness invariant.
+        """
+
+        if self.session_factory is None:
+            raise RuntimeError("canonical identity persistence is not configured")
+        corrected = dict(lease.approved_snapshot)
+        identity_fields = (
+            "artist",
+            "artists",
+            "title",
+            "album",
+            "album_artist",
+            "album_artists",
+            "year",
+            "duration_seconds",
+            "recording_mbid",
+            "release_mbid",
+            "release_group_mbid",
+            "canonical_identity_verified",
+            "metadata_authority",
+            "metadata_provenance",
+        )
+        for key in identity_fields:
+            if key in values:
+                corrected[key] = values[key]
+
+        explicit_album = _explicit_album_constraint(lease.approved_snapshot)
+        if explicit_album is not None:
+            corrected["album"] = explicit_album
+        corrected["version_signature"] = normalize_version_signature(
+            _explicit_version_constraint(lease.approved_snapshot)
+            or _string_or_none(values.get("version_signature"))
+        )
+
+        with self.session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            job = _leased_job(session, lease, action="persisting resolved recording identity")
+            track = session.get(RequestTrack, job.request_track_id)
+            if track is None:
+                session.rollback()
+                raise LookupError(job.request_track_id)
+
+            track.artist = _required_string(corrected, "artist")[:300]
+            track.title = _required_string(corrected, "title")[:300]
+            track.album = _bounded_optional_string(corrected.get("album"), 300)
+            track.album_artist = _bounded_optional_string(corrected.get("album_artist"), 300)
+            track.year = _int_or_none(corrected.get("year"))
+            track.duration_seconds = _float_or_none(corrected.get("duration_seconds"))
+            track.version_signature = str(corrected["version_signature"])
+            track.recording_mbid = _bounded_optional_string(corrected.get("recording_mbid"), 36)
+            track.release_mbid = _bounded_optional_string(corrected.get("release_mbid"), 36)
+            track.release_group_mbid = _bounded_optional_string(
+                corrected.get("release_group_mbid"), 36
+            )
+            track.canonical_identity_verified = corrected.get("canonical_identity_verified") is True
+            provenance = corrected.get("metadata_provenance")
+            if isinstance(provenance, Mapping):
+                track.metadata_provenance_json = json.dumps(
+                    dict(provenance), ensure_ascii=False, separators=(",", ":")
+                )
+
+            replacement_key = dedup_key(track)
+            conflicting_job = session.scalar(
+                select(DownloadJob.id).where(
+                    DownloadJob.id != job.id,
+                    DownloadJob.dedup_key == replacement_key,
+                    DownloadJob.status.not_in(("cancelled", "failed", "completed")),
+                )
+            )
+            if conflicting_job is not None:
+                session.rollback()
+                raise EquivalentAcquisitionActive(
+                    "an equivalent resolved acquisition is already active"
+                )
+            job.approved_snapshot_json = json.dumps(
+                corrected, ensure_ascii=False, separators=(",", ":")
+            )
+            job.dedup_key = replacement_key
+            session.commit()
+
+        lease.approved_snapshot.clear()
+        lease.approved_snapshot.update(corrected)
 
     def _ask_openai_canonical(
         self,
@@ -1291,36 +1498,10 @@ class DownloadJobProcessor:
                 request_id = session.scalar(
                     select(RequestTrack.request_id).where(RequestTrack.id == request_track_id)
                 )
-        recording_candidates = [
-            {
-                "recording_candidate_id": option.get("recording_candidate_id"),
-                "release_candidate_id": option.get("release_candidate_id"),
-                "artist": option.get("artist"),
-                "title": option.get("title"),
-                "album": option.get("album"),
-                "year": option.get("year"),
-                "duration_seconds": option.get("duration_seconds"),
-                "local_score": option.get("local_score"),
-                "version": option.get("version"),
-                "reason_codes": option.get("reason_codes", []),
-            }
-            for option in options[:8]
-        ]
-        release_candidates = [
-            {
-                "release_candidate_id": option.get("release_candidate_id"),
-                "recording_candidate_id": option.get("recording_candidate_id"),
-                "album": option.get("album"),
-                "year": option.get("year"),
-                "status": option.get("release_status"),
-                "primary_type": option.get("primary_type"),
-                "local_score": option.get("local_score"),
-            }
-            for option in options[:8]
-            if option.get("release_candidate_id") is not None
-        ]
+        recording_candidates, release_candidates = _canonical_match_candidate_summaries(options)
         payload = {
             "schema_version": 2,
+            "matcher_prompt_version": CANONICAL_MATCH_PROMPT_VERSION,
             "request_id": request_id,
             "job_id": lease.job_id,
             "decision_category": "canonical_metadata",
@@ -1328,7 +1509,7 @@ class DownloadJobProcessor:
                 "artist": _required_string(dict(values), "artist"),
                 "title": _required_string(dict(values), "title"),
                 "album": _explicit_album_constraint(values),
-                "version": _explicit_version_constraint(values),
+                "version": _authoritative_version_constraint(values),
                 "duration_seconds": _float_or_none(values.get("duration_seconds")),
             },
             "recording_candidates": recording_candidates,
@@ -1344,7 +1525,7 @@ class DownloadJobProcessor:
                 session,
                 target="web",
                 kind="match_canonical",
-                payload_version=2,
+                payload_version=3,
                 payload=payload,
             )
             task_id = task.id
@@ -1423,7 +1604,7 @@ class DownloadJobProcessor:
         option_contradictions = selected.get("contradiction_codes")
         if isinstance(option_contradictions, list) and option_contradictions:
             return None, decision
-        expected_version = _explicit_version_constraint(values)
+        expected_version = _authoritative_version_constraint(values)
         if expected_version is None:
             expected_version = self.settings.default_version_preference
         candidate_version = _string_or_none(selected.get("version")) or "studio"
@@ -1684,7 +1865,7 @@ def _metadata_payload(candidate: MetadataCandidate) -> dict[str, object]:
         "recording_mbid": candidate.recording_mbid,
         "release_mbid": candidate.release_mbid,
         "release_group_mbid": candidate.release_group_mbid,
-        "version": candidate.version,
+        "version": normalize_version_signature(candidate.version),
     }
 
 
@@ -1693,6 +1874,8 @@ def _metadata_candidate_from_payload(value: Mapping[str, object]) -> MetadataCan
     title = _string_or_none(value.get("title"))
     if artist is None or title is None:
         raise JobNeedsReview("the persisted canonical metadata decision is incomplete")
+    raw_version = _string_or_none(value.get("version"))
+    version = normalize_version_signature(raw_version) if raw_version is not None else None
     return MetadataCandidate(
         artist=artist,
         artists=structured_artists(value.get("artists")),
@@ -1704,6 +1887,7 @@ def _metadata_candidate_from_payload(value: Mapping[str, object]) -> MetadataCan
         release_mbid=_string_or_none(value.get("release_mbid")),
         release_group_mbid=_string_or_none(value.get("release_group_mbid")),
         source="persisted_canonical_decision",
+        raw={"disambiguation": version} if version is not None else None,
     )
 
 
@@ -1740,6 +1924,11 @@ def _possible_duplicate_options(track: Track | None, reason: str | None) -> list
 
 def _string_or_none(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _bounded_optional_string(value: object, limit: int) -> str | None:
+    result = _string_or_none(value)
+    return result[:limit] if result is not None else None
 
 
 def _int_or_none(value: object) -> int | None:
@@ -1816,6 +2005,82 @@ def _explicit_version_constraint(values: Mapping[str, object]) -> str | None:
     )
 
 
+def _durable_recording_version_constraint(values: Mapping[str, object]) -> str | None:
+    """Read only a locally verified recording-version provenance marker."""
+
+    provenance = values.get("metadata_provenance")
+    if not isinstance(provenance, Mapping):
+        return None
+    recording_version = provenance.get("recording_version")
+    if not isinstance(recording_version, Mapping):
+        return None
+    if recording_version.get("source") not in {
+        "musicbrainz_recording_disambiguation",
+        "provider_recording_metadata",
+    }:
+        return None
+    value = _string_or_none(recording_version.get("signature"))
+    return normalize_version_signature(value) if value is not None else None
+
+
+def _authoritative_version_constraint(values: Mapping[str, object]) -> str | None:
+    explicit = _explicit_version_constraint(values)
+    if explicit is not None:
+        return normalize_version_signature(explicit)
+    return _durable_recording_version_constraint(values)
+
+
+def _release_only_version_inference(values: Mapping[str, object]) -> bool:
+    """Recognize explicit inference markers and the bounded 9b8cc17 row shape."""
+
+    provenance = values.get("metadata_provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    if provenance.get("source") == "unverified_model_output":
+        return True
+    recording_version = provenance.get("recording_version")
+    if isinstance(recording_version, Mapping):
+        return recording_version.get("source") in {
+            "model_inference",
+            "model_release_context",
+            "release_context",
+            "release_metadata",
+            "release_only",
+        }
+    if not (
+        provenance.get("source") == "musicbrainz_search_recordings"
+        and provenance.get("automatic_association") is True
+        and values.get("canonical_identity_verified") is True
+        and "artists" not in provenance
+    ):
+        return False
+    prior = normalize_version_signature(_string_or_none(values.get("version_signature")))
+    if prior == "studio":
+        return False
+    title = _string_or_none(values.get("title"))
+    album = _string_or_none(values.get("album"))
+    return (
+        not DEFAULT_VERSION_CLASSIFIER.classify_recording(title).kinds
+        and normalize_version_signature(album) == prior
+    )
+
+
+def _inferred_version_correction_reason(
+    values: Mapping[str, object], selected_version: str | None
+) -> str | None:
+    """Explain safe repair of legacy release-derived version signatures."""
+
+    if _explicit_version_constraint(values) is not None:
+        return None
+    prior = _string_or_none(values.get("version_signature")) or "studio"
+    selected = selected_version or "studio"
+    if not _metadata_versions_compatible(prior, "studio") and _metadata_versions_compatible(
+        selected, "studio"
+    ):
+        return "inferred_version_corrected_to_studio"
+    return None
+
+
 def _metadata_versions_compatible(left: str | None, right: str | None) -> bool:
     def parts(value: str | None) -> frozenset[str]:
         normalized = (value or "studio").casefold().replace("_", " ").replace("-", " ")
@@ -1857,3 +2122,132 @@ def _error_code(exc: Exception) -> str:
             result.append("_")
         result.append(character.casefold())
     return "".join(result)[:80]
+
+
+def _safe_job_error(exc: Exception) -> str:
+    """Return an allowlisted owner-visible message without provider stderr or URLs."""
+
+    if isinstance(exc, WorkerMetadataError):
+        return {
+            "not_found": "Canonical metadata for this recording could not be found.",
+            "malformed_response": "The metadata provider returned an unusable response.",
+            "rejected_request": "The metadata provider rejected the lookup.",
+        }.get(exc.reason_code, "The metadata provider is temporarily unavailable.")
+    if isinstance(exc, DownloadTimedOut):
+        return "The media provider did not respond before the timeout."
+    if isinstance(exc, YtDlpError):
+        return "The media provider could not supply a usable source."
+    if isinstance(exc, SourceValidationError):
+        return "The selected source did not pass media safety or identity validation."
+    if isinstance(exc, MediaBudgetExceeded):
+        return "The media source exceeds the configured download limit."
+    if isinstance(exc, UnsupportedMediaFormat):
+        return "The source audio format is not supported for safe tagging."
+    if isinstance(exc, MediaValidationError):
+        return "The downloaded file did not pass audio verification."
+    if isinstance(exc, TaggingError):
+        return "The downloaded audio could not be tagged and verified safely."
+    if isinstance(exc, PublicationConflict):
+        return "The destination already contains a different file for this recording."
+    if isinstance(exc, ArtworkError):
+        return "Artwork could not be processed safely."
+    if isinstance(exc, OSError):
+        return "A local filesystem operation prevented the download from completing."
+    return "The download could not be completed safely."
+
+
+def _canonical_replay_is_suspect(
+    values: Mapping[str, object], replay: CanonicalDecisionReplay
+) -> bool:
+    """Reject only legacy automatic special-version inference lacking title evidence."""
+
+    if replay.decided_by == "user":
+        return False
+    if _explicit_version_constraint(values) is not None:
+        return False
+    payload = replay.payload
+    if not isinstance(payload, Mapping):
+        return False
+    selected_version = _string_or_none(payload.get("version")) or _string_or_none(
+        payload.get("version_signature")
+    )
+    durable_version = _durable_recording_version_constraint(values)
+    if durable_version is not None and not _metadata_versions_compatible(
+        durable_version, selected_version
+    ):
+        return True
+    if payload.get("matching_policy_version") == _CANONICAL_MATCH_POLICY_VERSION:
+        return False
+    if _metadata_versions_compatible(selected_version, "studio"):
+        return False
+    if not _release_only_version_inference(values):
+        return False
+    title = _string_or_none(payload.get("title"))
+    return not DEFAULT_VERSION_CLASSIFIER.classify_recording(title).kinds
+
+
+def _json_string_list(value: str | None) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item[:160] for item in parsed if isinstance(item, str)][:32]
+
+
+def _canonical_match_candidate_summaries(
+    options: list[dict[str, Any]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Build finite model-visible summaries without forwarding arbitrary local codes."""
+
+    bounded_options = options[:8]
+    recording_candidates = [
+        {
+            "recording_candidate_id": option.get("recording_candidate_id"),
+            "release_candidate_id": option.get("release_candidate_id"),
+            "artist": option.get("artist"),
+            "title": option.get("title"),
+            "album": option.get("album"),
+            "year": option.get("year"),
+            "duration_seconds": option.get("duration_seconds"),
+            "local_score": option.get("local_score"),
+            "version": option.get("version"),
+            "reason_codes": option.get("reason_codes", []),
+            "contradiction_codes": _canonical_local_contradiction_codes(
+                option.get("contradiction_codes")
+            ),
+        }
+        for option in bounded_options
+    ]
+    release_candidates = [
+        {
+            "release_candidate_id": option.get("release_candidate_id"),
+            "recording_candidate_id": option.get("recording_candidate_id"),
+            "album": option.get("album"),
+            "year": option.get("year"),
+            "status": option.get("release_status"),
+            "primary_type": option.get("primary_type"),
+            "local_score": option.get("local_score"),
+            "contradiction_codes": _canonical_local_contradiction_codes(
+                option.get("contradiction_codes")
+            ),
+        }
+        for option in bounded_options
+        if option.get("release_candidate_id") is not None
+    ]
+    return recording_candidates, release_candidates
+
+
+def _canonical_local_contradiction_codes(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value[:16]:
+        if (
+            isinstance(item, str)
+            and item in _CANONICAL_LOCAL_CONTRADICTION_CODES
+            and item not in result
+        ):
+            result.append(item)
+    return result

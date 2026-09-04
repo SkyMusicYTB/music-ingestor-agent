@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.db.ids import uuid7
+from app.prompts import ORCHESTRATOR_PROMPT_VERSION
 
 
 def utc_now() -> datetime:
@@ -124,7 +125,7 @@ class Request(TimestampMixin, Base):
     input_kind: Mapped[str] = mapped_column(String(32), default="natural_language")
     requested_count: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), default="pending")
-    prompt_version: Mapped[str] = mapped_column(String(64), default="orchestrator_v1")
+    prompt_version: Mapped[str] = mapped_column(String(64), default=ORCHESTRATOR_PROMPT_VERSION)
     discovered_count: Mapped[int] = mapped_column(Integer, default=0)
     selected_count: Mapped[int] = mapped_column(Integer, default=0)
     warning_count: Mapped[int] = mapped_column(Integer, default=0)

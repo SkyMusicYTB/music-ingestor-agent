@@ -21,6 +21,7 @@ from app.db.models import (
     User,
 )
 from app.main import create_app
+from app.prompts import ORCHESTRATOR_PROMPT_VERSION
 from app.repositories.decisions import (
     DecisionSelection,
     apply_review_bundle,
@@ -115,6 +116,10 @@ def test_setup_closes_and_authenticated_request_is_idempotent(client) -> None:
     assert first.json()["created"] is True
     assert second.json()["created"] is False
     assert second.json()["request"]["id"] == first.json()["request"]["id"]
+    with client.app.state.session_factory() as session:
+        stored = session.get(Request, first.json()["request"]["id"])
+        assert stored is not None
+        assert stored.prompt_version == ORCHESTRATOR_PROMPT_VERSION
 
 
 def test_mutation_rejects_cross_origin_and_bad_csrf(client) -> None:
@@ -639,7 +644,7 @@ def test_provider_metadata_review_retains_source_and_displays_one_clear_message(
     assert page.status_code == 200
     article = page.text.split(f'data-job-id="{job_id}"', 1)[1].split("</article>", 1)[0]
     assert "Metadata needs review" in article
-    assert "Source selected · Youtube · uploaded by Gabry Ponte" in article
+    assert "Source selected · YouTube · uploaded by Gabry Ponte" in article
     assert "No safe permitted source" not in article
     assert article.count(reason) == 1
     assert 'name="year"' in article

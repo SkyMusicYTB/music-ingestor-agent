@@ -65,11 +65,14 @@ def provider_fallback(
     title_score = SequenceMatcher(
         None, normalize_text(requested_title), normalize_text(title), autojunk=False
     ).ratio()
-    expected_version = DEFAULT_VERSION_CLASSIFIER.classify(
-        requested_title, _text(values.get("requested_version"), 100) or "studio"
+    expected_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
+        requested_title,
+        explicit_version=_text(values.get("requested_version"), 100) or "studio",
     )
-    actual_version = DEFAULT_VERSION_CLASSIFIER.classify(
-        _text(source.get("title"), 500), title, _text(source.get("version"), 100)
+    actual_version = DEFAULT_VERSION_CLASSIFIER.classify_recording(
+        _text(source.get("title"), 500),
+        title,
+        explicit_version=_text(source.get("version"), 100),
     )
     compatible = DEFAULT_VERSION_CLASSIFIER.compatible(expected_version, actual_version)
     expected_duration = _number(values.get("duration_seconds"))

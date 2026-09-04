@@ -8,6 +8,7 @@ from app.services.metadata_matching import (
     candidates_from_apple,
     candidates_from_musicbrainz,
     normalize_text,
+    release_edition_signature,
 )
 from app.workers.metadata import _selected_release_summary, _with_sensible_release
 
@@ -97,9 +98,92 @@ def test_explicit_version_mismatch_cannot_auto_associate() -> None:
         ],
     )
 
-    assert ranked[0].score >= 88
+    assert ranked[0].score < 88
     assert ranked[0].decision == "review"
     assert ranked[0].contradiction_codes == ("explicit_version_mismatch",)
+    assert any("explicit-version-mismatch" in reason for reason in ranked[0].reasons)
+
+
+def test_explicit_version_candidate_keeps_a_decisive_lead_over_studio() -> None:
+    for version in ("live", "remix", "acoustic"):
+        requested = MetadataCandidate(
+            artist="Artist",
+            title=f"Song ({version.title()})",
+            album="Original Release",
+            duration_seconds=200,
+            recording_mbid=f"00000000-0000-4000-8000-0000000000{len(version):02d}",
+        )
+        studio = MetadataCandidate(
+            artist="Artist",
+            title="Song",
+            album="Original Release",
+            duration_seconds=200,
+            recording_mbid=f"10000000-0000-4000-8000-0000000000{len(version):02d}",
+        )
+
+        ranked = MetadataMatcher().rank(
+            artist="Artist",
+            title="Song",
+            requested_version=version,
+            version_is_explicit=True,
+            duration_seconds=200,
+            candidates=[studio, requested],
+        )
+
+        assert ranked[0].candidate is requested
+        assert ranked[0].score - ranked[1].score >= 8
+        assert ranked[0].decision == "auto"
+
+
+def test_model_album_text_does_not_authorize_a_compilation_edition() -> None:
+    candidate = MetadataCandidate(
+        artist="Artist",
+        title="Song",
+        album="Battiti Live Compilation",
+        duration_seconds=200,
+    )
+
+    untrusted = MetadataMatcher().rank(
+        artist="Artist",
+        title="Song",
+        album="Battiti Live Compilation",
+        album_is_explicit=False,
+        duration_seconds=200,
+        candidates=[candidate],
+    )[0]
+    explicit = MetadataMatcher().rank(
+        artist="Artist",
+        title="Song",
+        album="Battiti Live Compilation",
+        album_is_explicit=True,
+        duration_seconds=200,
+        candidates=[candidate],
+    )[0]
+
+    assert any("unrequested-compilation" in reason for reason in untrusted.reasons)
+    assert not any("unrequested-compilation" in reason for reason in explicit.reasons)
+
+
+def test_missing_required_collaborator_cannot_auto_associate() -> None:
+    main_artist = "A Very Long Canonical Main Artist Name"
+    ranked = MetadataMatcher().rank(
+        artist=f"{main_artist} & X",
+        artists=(main_artist, "X"),
+        title="Exact Song",
+        duration_seconds=200,
+        candidates=[
+            MetadataCandidate(
+                artist=main_artist,
+                artists=(main_artist,),
+                title="Exact Song",
+                duration_seconds=200,
+            )
+        ],
+    )
+
+    assert ranked[0].score >= 88
+    assert ranked[0].decision != "auto"
+    assert "artist_credit_mismatch" in ranked[0].contradiction_codes
 
 
 def test_explicit_album_mismatch_or_missing_album_cannot_auto_associate() -> None:
@@ -286,8 +370,180 @@ def test_worker_selects_original_official_standard_release_without_review() -> N
         "release_status": "Official",
         "primary_type": "Album",
     }
-
     explicitly_requested = _with_sensible_release(
         candidate, requested_album="Parachutes (Deluxe Edition)"
     )
     assert explicitly_requested.release_mbid == "00000000-0000-4000-8000-000000000003"
+
+
+def test_release_title_cannot_change_recording_version_and_standard_release_wins() -> None:
+    candidate = candidates_from_musicbrainz(
+        {
+            "recordings": [
+                {
+                    "id": "24f4e1df-a51a-4dc4-a0a3-28f8dd66a011",
+                    "title": "Tarantella",
+                    "length": 146000,
+                    "artist-credit": [
+                        {"name": "Gabry Ponte", "joinphrase": " & "},
+                        {"name": "KEL", "joinphrase": ""},
+                    ],
+                    "releases": [
+                        {
+                            "id": "53674b6e-0df0-4631-87d0-83146155e169",
+                            "title": "Radio Italia Live Compilation",
+                            "status": "Official",
+                            "date": "2023-01-01",
+                            "release-group": {
+                                "id": "ad1275fe-dce8-4cf4-bfc8-84aeeb4ae66f",
+                                "primary-type": "Album",
+                                "secondary-types": ["Compilation"],
+                            },
+                        },
+                        {
+                            "id": "bb7c6979-b9ad-43cf-a264-387ec53a817f",
+                            "title": "Tarantella",
+                            "status": "Official",
+                            "date": "2024-04-12",
+                            "release-group": {
+                                "id": "28738316-cba2-43c6-938b-d156669e0e82",
+                                "primary-type": "Single",
+                                "secondary-types": [],
+                            },
+                        },
+                    ],
+                }
+            ]
+        }
+    )[0]
+
+    # The recording is studio even while one release title contains "Live".
+    assert candidate.version == "studio"
+    assert candidate.artists == ("Gabry Ponte", "KEL")
+    assert candidate.album == "Tarantella"
+    assert candidate.release_mbid == "bb7c6979-b9ad-43cf-a264-387ec53a817f"
+    assert release_edition_signature("Radio Italia Live Compilation") == (
+        "compilation",
+        "live_event",
+    )
+    ranked = MetadataMatcher().rank(
+        artist="Gabry Ponte, KEL",
+        artists=("Gabry Ponte", "KEL"),
+        title="Tarantella",
+        duration_seconds=146,
+        candidates=[candidate],
+    )
+    assert ranked[0].decision == "auto"
+    selected = _with_sensible_release(candidate, requested_album=None)
+    assert selected.album == "Tarantella"
+    assert selected.release_mbid == "bb7c6979-b9ad-43cf-a264-387ec53a817f"
+    assert selected.version == "studio"
+
+
+def test_recording_title_and_disambiguation_preserve_explicit_special_version() -> None:
+    album_only = MetadataCandidate(artist="Artist", title="Studio Song", album="Live")
+    title_version = MetadataCandidate(artist="Artist", title="Song (Live)")
+    disambiguated = MetadataCandidate(
+        artist="Artist",
+        title="Song",
+        raw={"disambiguation": "live recording at Wembley", "releases": []},
+    )
+    assert album_only.version == "studio"
+    assert title_version.version == "live"
+    assert disambiguated.version == "live"
+
+    ranked = MetadataMatcher().rank(
+        artist="Artist",
+        title="Song (Live)",
+        candidates=[title_version, MetadataCandidate(artist="Artist", title="Song")],
+    )
+    assert ranked[0].candidate is title_version
+
+
+def test_sensible_release_prefers_earlier_official_single_over_later_album_same_year() -> None:
+    recording_id = "24f4e1df-a51a-4dc4-a0a3-28f8dd66a011"
+    selected = candidates_from_musicbrainz(
+        {
+            "recordings": [
+                {
+                    "id": recording_id,
+                    "title": "Song",
+                    "artist-credit": [{"name": "Artist"}],
+                    "releases": [
+                        {
+                            "id": "53674b6e-0df0-4631-87d0-83146155e169",
+                            "title": "Later Album",
+                            "status": "Official",
+                            "date": "2024-12-01",
+                            "release-group": {
+                                "primary-type": "Album",
+                                "secondary-types": [],
+                            },
+                        },
+                        {
+                            "id": "bb7c6979-b9ad-43cf-a264-387ec53a817f",
+                            "title": "Original Single",
+                            "status": "Official",
+                            "date": "2024-01-01",
+                            "release-group": {
+                                "primary-type": "Single",
+                                "secondary-types": [],
+                            },
+                        },
+                    ],
+                }
+            ]
+        }
+    )[0]
+
+    assert selected.album == "Original Single"
+    assert selected.release_mbid == "bb7c6979-b9ad-43cf-a264-387ec53a817f"
+    assert set(release_edition_signature("Anniversary soundtrack reissue")) == {
+        "deluxe",
+        "reissue",
+        "soundtrack",
+    }
+
+
+def test_sensible_release_never_cross_wires_release_and_release_group_ids() -> None:
+    old_release = "53674b6e-0df0-4631-87d0-83146155e169"
+    old_group = "ad1275fe-dce8-4cf4-bfc8-84aeeb4ae66f"
+    selected_release = "bb7c6979-b9ad-43cf-a264-387ec53a817f"
+    candidate = MetadataCandidate(
+        artist="Artist",
+        title="Song",
+        album="Old Compilation",
+        recording_mbid="24f4e1df-a51a-4dc4-a0a3-28f8dd66a011",
+        release_mbid=old_release,
+        release_group_mbid=old_group,
+        raw={
+            "releases": [
+                {
+                    "id": old_release,
+                    "title": "Old Compilation",
+                    "status": "Official",
+                    "date": "2000-01-01",
+                    "release-group": {
+                        "id": old_group,
+                        "primary-type": "Album",
+                        "secondary-types": ["Compilation"],
+                    },
+                },
+                {
+                    "id": selected_release,
+                    "title": "Original Single",
+                    "status": "Official",
+                    "date": "2001-01-01",
+                    "release-group": {
+                        "primary-type": "Single",
+                        "secondary-types": [],
+                    },
+                },
+            ]
+        },
+    )
+
+    selected = _with_sensible_release(candidate, requested_album=None)
+
+    assert selected.release_mbid == selected_release
+    assert selected.release_group_mbid is None

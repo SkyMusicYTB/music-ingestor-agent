@@ -16,7 +16,7 @@ from mutagen import File as MutagenFile  # type: ignore[attr-defined]
 from mutagen import MutagenError  # type: ignore[attr-defined]
 
 from app.clients.ytdlp import minimal_subprocess_env
-from app.services.duplicates import version_signature
+from app.services.duplicates import recording_version_signature
 from app.services.library_formats import FORMATS, LibraryFormat, extension_for
 from app.services.library_presence import open_library_file
 from app.tags.provenance import PROVENANCE_TAG_FIELDS, provenance_snapshot
@@ -412,9 +412,7 @@ def read_audio_metadata(path: Path, *, music_root: Path | None = None) -> dict[s
     if not values.get("artist"):
         fallback = True
     values["artist"] = values.get("artist") or "Unknown Artist"
-    values["version_signature"] = version_signature(
-        str(values["title"]), str(values.get("album") or "")
-    )
+    values["version_signature"] = recording_version_signature(recording_title=str(values["title"]))
     values["file_extension"] = extension
     values["_metadata_fallback"] = fallback
     values["_file_size"] = after.st_size

@@ -75,10 +75,12 @@ effective policy. See [operations](operations.md#canonical-metadata-and-validate
 for null MBIDs, warnings, review and the narrowly scoped legacy-job repair.
 
 The database stays at schema **0004**; no migration or account reset is required.
-The library parser revision increases to **2** so subsequent scans retain explicit
-provider authority and structured artist provenance. This rereads changed parser
-records only; it does not alter or retag media. Run normal clean deployment and
-service validation, then preview/apply the repair only for the affected source ID.
+The library parser revision is now **3** so subsequent scans retain explicit
+provider authority and structured artist provenance while recalculating recording
+versions without release-title contamination. The next scan rereads indexed files
+whose parser revision is older; it does not alter or retag media. Run normal clean
+deployment and service validation, then retry the affected natural-language request
+or its failed download. The worker safely revalidates obsolete inferred versions.
 The existing paired-backup activation and rollback procedure remains in force.
 If rolling back after jobs have advanced, retain the newer state backup and use
 the release-matched backup when instructed by the rollback validator; its recovery

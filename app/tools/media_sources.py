@@ -29,6 +29,8 @@ _MEDIA_PROVIDER_ORDER: tuple[MediaProvider, ...] = ("bandcamp", "soundcloud", "y
 class MediaToolAuthorization:
     user_id: str
     request_id: str
+    requested_album: str | None = None
+    requested_version: str | None = None
 
 
 _MEDIA_TOOL_AUTHORIZATION: ContextVar[MediaToolAuthorization | None] = ContextVar(
@@ -38,15 +40,32 @@ _MEDIA_TOOL_AUTHORIZATION: ContextVar[MediaToolAuthorization | None] = ContextVa
 
 
 @contextmanager
-def media_tool_authorization(user_id: str, request_id: str) -> Iterator[None]:
-    """Bind finite media tools to one orchestrated user request and async task."""
+def media_tool_authorization(
+    user_id: str,
+    request_id: str,
+    *,
+    requested_album: str | None = None,
+    requested_version: str | None = None,
+) -> Iterator[None]:
+    """Bind read-only tools to one request and its trusted explicit constraints."""
 
-    authorization = MediaToolAuthorization(user_id=user_id, request_id=request_id)
+    authorization = MediaToolAuthorization(
+        user_id=user_id,
+        request_id=request_id,
+        requested_album=requested_album,
+        requested_version=requested_version,
+    )
     token = _MEDIA_TOOL_AUTHORIZATION.set(authorization)
     try:
         yield
     finally:
         _MEDIA_TOOL_AUTHORIZATION.reset(token)
+
+
+def current_tool_authorization() -> MediaToolAuthorization | None:
+    """Return request-scoped trusted context without accepting model-supplied flags."""
+
+    return _MEDIA_TOOL_AUTHORIZATION.get()
 
 
 class SearchMediaSourcesArguments(StrictModel):

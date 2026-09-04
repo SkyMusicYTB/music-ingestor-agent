@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import re
 import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -23,21 +22,16 @@ from app.services.artist_credits import (
     artist_credit_variant,
     structured_artists,
 )
+from app.services.duplicates import recording_version_signature
 from app.services.metadata_matching import (
     MatchResult,
     MetadataCandidate,
     MetadataMatcher,
     candidates_from_musicbrainz,
     normalize_text,
-)
-from app.services.metadata_matching import (
-    version_signature as classify_version,
+    select_sensible_release,
 )
 
-_NONSTANDARD_EDITION = re.compile(
-    r"\b(compilation|greatest hits|best of|deluxe|expanded|anniversary|remaster|reissue)\b",
-    re.IGNORECASE,
-)
 MAX_METADATA_SEARCH_REQUESTS = 12
 MAX_RECORDING_SEARCHES = 7
 MAX_RECORDING_CANDIDATES = 100
@@ -234,7 +228,7 @@ class MusicBrainzWorkerResolver:
             # Some recordings are only discoverable from a release's tracklist.
             # Search a bounded release/group set and inspect only returned IDs.
             release_title = album if album_is_explicit and album else title
-            release_artist = artist_credit_variant(artist)
+            release_artist = artist_credit_variant(artist, artists=artists)
             release_ids: list[str] = []
             releases = await budget.call(
                 self._client.search_releases,
@@ -378,7 +372,7 @@ def _recording_queries(
     artist: str, artists: tuple[str, ...]
 ) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
     queries: list[tuple[str | None, tuple[str, ...]]] = [(artist, ())]
-    variant = artist_credit_variant(artist)
+    variant = artist_credit_variant(artist, artists=artists)
     if variant != artist:
         queries.append((variant, ()))
     # Only provider-supplied structured artists are individual search terms.
@@ -413,7 +407,12 @@ def _safe_broad_candidate(
         and duration_seconds is not None
         and candidate.duration_seconds is not None
         and abs(duration_seconds - candidate.duration_seconds) <= max(10, duration_seconds * 0.05)
-        and classify_version(version_signature, title) == candidate.version
+        and (
+            recording_version_signature(explicit_version=version_signature)
+            if version_signature is not None
+            else "studio"
+        )
+        == candidate.version
     )
 
 
@@ -508,54 +507,7 @@ def _release_recordings(release: dict[str, Any]) -> list[dict[str, Any]]:
 def _with_sensible_release(
     candidate: MetadataCandidate, *, requested_album: str | None
 ) -> MetadataCandidate:
-    raw = candidate.raw
-    if not isinstance(raw, dict):
-        return candidate
-    releases = raw.get("releases")
-    if not isinstance(releases, list):
-        return candidate
-    valid = [release for release in releases if isinstance(release, dict)]
-    if not valid:
-        return candidate
-    requested = normalize_text(requested_album)
-
-    def release_key(release: dict[str, Any]) -> tuple[object, ...]:
-        title = str(release.get("title") or "")
-        release_group = release.get("release-group")
-        group = release_group if isinstance(release_group, dict) else {}
-        secondary = group.get("secondary-types")
-        secondary_types = secondary if isinstance(secondary, list) else []
-        status = normalize_text(str(release.get("status") or ""))
-        primary = normalize_text(str(group.get("primary-type") or ""))
-        date = str(release.get("date") or raw.get("first-release-date") or "9999")
-        year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else 9999
-        normalized_title = normalize_text(title)
-        explicit_album = int(bool(requested) and normalized_title == requested)
-        official = int(status == "official")
-        standard = int(
-            not secondary_types
-            and not _NONSTANDARD_EDITION.search(
-                " ".join([title, *(str(item) for item in secondary_types)])
-            )
-        )
-        canonical_type = 2 if primary == "album" else 1 if primary == "single" else 0
-        # Higher semantic precedence first, then the earliest sensible edition.
-        return (-explicit_album, -official, -standard, -canonical_type, year, normalized_title)
-
-    selected = min(valid, key=release_key)
-    group_value = selected.get("release-group")
-    release_group = group_value if isinstance(group_value, dict) else {}
-    date = str(selected.get("date") or raw.get("first-release-date") or "")
-    year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else candidate.year
-    return replace(
-        candidate,
-        album=str(selected.get("title")) if selected.get("title") else candidate.album,
-        year=year,
-        release_mbid=_provider_mbid(selected.get("id")) or candidate.release_mbid,
-        release_group_mbid=(
-            _provider_mbid(release_group.get("id")) or candidate.release_group_mbid
-        ),
-    )
+    return select_sensible_release(candidate, requested_album=requested_album)
 
 
 def _selected_release_summary(candidate: MetadataCandidate) -> dict[str, str | None]:

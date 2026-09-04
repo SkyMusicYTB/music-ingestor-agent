@@ -14,9 +14,11 @@ def _payload(*, job_id: str, candidate_id: str) -> dict[str, object]:
     ]
     return {
         "schema_version": 2,
+        "matcher_prompt_version": "canonical_matcher_v3",
         "job_id": job_id,
         "decision_category": "canonical_metadata",
         "candidate_set_fingerprint": candidate_set_fingerprint("canonical_metadata", candidates),
+        "intent": {"artist": "Coldplay", "title": "Yellow", "version": "studio"},
         "candidates": candidates,
     }
 
@@ -68,6 +70,44 @@ def test_completed_and_pending_decision_tasks_are_reused_by_fingerprint(session_
 
     with session_factory() as session:
         assert session.scalar(select(func.count(ServiceTask.id))) == 2
+
+
+def test_intent_and_matcher_version_are_part_of_task_reuse_boundary(session_factory) -> None:
+    payload = _payload(job_id="job-context", candidate_id="candidate-a")
+    with session_factory.begin() as session:
+        original = reuse_or_create_decision_task(
+            session,
+            target="web",
+            kind="match_canonical",
+            payload_version=3,
+            payload=payload,
+        )
+        original_id = original.id
+    changed_intent = dict(payload)
+    changed_intent["intent"] = {
+        "artist": "Coldplay",
+        "title": "Yellow",
+        "version": "live",
+    }
+    changed_prompt = dict(payload)
+    changed_prompt["matcher_prompt_version"] = "canonical_matcher_v4"
+    with session_factory.begin() as session:
+        intent_task = reuse_or_create_decision_task(
+            session,
+            target="web",
+            kind="match_canonical",
+            payload_version=3,
+            payload=changed_intent,
+        )
+        prompt_task = reuse_or_create_decision_task(
+            session,
+            target="web",
+            kind="match_canonical",
+            payload_version=3,
+            payload=changed_prompt,
+        )
+        assert intent_task.id != original_id
+        assert prompt_task.id not in {original_id, intent_task.id}
 
 
 def test_failed_decision_task_is_not_reused(session_factory) -> None:

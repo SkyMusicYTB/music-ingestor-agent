@@ -105,8 +105,17 @@ async def resolve(fake: FakeMusicBrainz, **kwargs: Any) -> Any:
 )
 def test_collaboration_separator_comparison_preserves_full_identity(separator: str) -> None:
     credit = f"Gabry Ponte{separator}KEL"
-    assert artist_credit_similarity(credit, "Gabry Ponte & KEL") == 1
-    assert artist_credit_variant(credit) == "Gabry Ponte & KEL"
+    artists = ("Gabry Ponte", "KEL")
+    assert (
+        artist_credit_similarity(
+            credit,
+            "Gabry Ponte & KEL",
+            left_artists=artists,
+            right_artists=artists,
+        )
+        == 1
+    )
+    assert artist_credit_variant(credit, artists=artists) == "Gabry Ponte & KEL"
     assert artist_credit_similarity(credit, "Gabry Ponte") < 0.9
 
 
@@ -121,7 +130,7 @@ def test_structured_artists_preserve_punctuation_and_do_not_invent_performers() 
     assert resolved.artist_source == "artist"
     assert structured_artists(["KEL", "kel", "", 123, "Bad\nArtist"]) == ("KEL",)
     queries = _recording_queries("Earth, Wind & Fire", ("Earth, Wind & Fire",))
-    assert not any(artist in {"Earth", "Wind", "Fire"} for artist, _ in queries)
+    assert queries == (("Earth, Wind & Fire", ()), (None, ()))
     assert (
         artist_credit_similarity(
             "KEL & Gabry Ponte",
@@ -130,6 +139,37 @@ def test_structured_artists_preserve_punctuation_and_do_not_invent_performers() 
             right_artists=("Gabry Ponte", "KEL"),
         )
         == 1
+    )
+
+
+def test_singleton_artist_punctuation_is_not_collaboration_authority() -> None:
+    assert artist_credit_similarity("Tyler, the Creator", "Tyler & the Creator") < 0.95
+    assert (
+        artist_credit_variant("Earth, Wind & Fire", artists=("Earth, Wind & Fire",))
+        == "Earth, Wind & Fire"
+    )
+    assert (
+        artist_credit_similarity(
+            "Gabry Ponte, KEL",
+            "Gabry Ponte & KEL",
+            right_artists=("Gabry Ponte", "KEL"),
+        )
+        == 1
+    )
+
+
+def test_long_artist_credit_cannot_hide_a_missing_short_collaborator() -> None:
+    artist = "The Really Really Really Really Long Named Artist"
+
+    assert artist_credit_similarity(artist, f"{artist} & X") < 0.95
+    assert (
+        artist_credit_similarity(
+            artist,
+            f"{artist} & X",
+            left_artists=(artist,),
+            right_artists=(artist, "X"),
+        )
+        < 0.95
     )
 
 

@@ -108,6 +108,9 @@ class SourceCandidate(SourceModel):
 
 class SourceIntent(SourceModel):
     artist: str = Field(min_length=1, max_length=300)
+    artists: tuple[Annotated[str, Field(min_length=1, max_length=300)], ...] = Field(
+        default=(), max_length=12
+    )
     title: str = Field(min_length=1, max_length=300)
     requested_version: str = Field(
         default="studio",

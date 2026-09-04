@@ -583,8 +583,10 @@ async def test_only_server_verified_musicbrainz_evidence_can_auto_queue(
             "matches": [
                 {
                     "artist": "Massive Attack",
+                    "artists": ["Massive Attack"],
                     "title": "Teardrop",
                     "album": "Mezzanine",
+                    "year": 1998,
                     "duration_seconds": 330.0,
                     "version": "studio",
                     "recording_mbid": "11111111-1111-1111-1111-111111111111",
@@ -633,6 +635,8 @@ async def test_only_server_verified_musicbrainz_evidence_can_auto_queue(
         decision = confirmation_decision(stored_request, [stored_track], runtime_settings)
     assert provenance["automatic_association"] is True
     assert provenance["source"] == "musicbrainz_search_recordings"
+    assert provenance["artists"] == ["Massive Attack"]
+    assert stored_track.year == 1998
     assert stored_track.metadata_confidence == pytest.approx(0.96)
     assert decision.auto_queue is True
 
@@ -727,6 +731,83 @@ async def test_borderline_finite_canonical_match_auto_queues_exact_add(
     assert provenance["model_confidence"] == pytest.approx(0.96)
     assert stored_track.canonical_identity_verified is True
     assert decision.auto_queue is True
+
+
+@pytest.mark.asyncio
+async def test_borderline_model_cannot_clear_explicit_album_contradiction(
+    tmp_path: Path,
+) -> None:
+    factory = database()
+    request_id = request_row(
+        factory,
+        "Add Teardrop by Massive Attack from album Protection",
+        action="add",
+    )
+    registry = ToolRegistry(factory)
+    recording_mbid = "11111111-1111-1111-1111-111111111111"
+
+    async def recordings(_arguments: dict[str, Any]) -> dict[str, object]:
+        return {
+            "fallback_used": False,
+            "matches": [
+                {
+                    "artist": "Massive Attack",
+                    "artists": ["Massive Attack"],
+                    "title": "Teardrop",
+                    "album": "Mezzanine",
+                    "duration_seconds": 330.0,
+                    "version": "studio",
+                    "recording_mbid": recording_mbid,
+                    "release_mbid": "22222222-2222-2222-2222-222222222222",
+                    "release_group_mbid": None,
+                    "source": "musicbrainz",
+                    "score": 82.0,
+                    "decision": "review",
+                    "association_scope": "canonical_musicbrainz",
+                    "lead": 3.0,
+                    "contradiction_codes": ["explicit_album_mismatch"],
+                }
+            ],
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="musicbrainz_search_recordings",
+            description="Canonical recording fixture",
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=recordings,
+        )
+    )
+    fake = FakeOpenAI(
+        [
+            response(
+                [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_musicbrainz_album_mismatch",
+                        "name": "musicbrainz_search_recordings",
+                        "arguments": "{}",
+                    }
+                ]
+            ),
+            response([], proposal(tracks=[_canonical_track()])),
+        ]
+    )
+    runtime_settings = settings(tmp_path)
+    service = OrchestrationService(runtime_settings, factory, registry, openai_client=fake)
+
+    await service.run_request(request_id)
+
+    with factory() as session:
+        stored_request = session.get(Request, request_id)
+        stored_track = session.scalar(
+            select(RequestTrack).where(RequestTrack.request_id == request_id)
+        )
+        assert stored_request is not None and stored_track is not None
+        decision = confirmation_decision(stored_request, [stored_track], runtime_settings)
+    assert len(fake.calls) == 2
+    assert stored_track.canonical_identity_verified is False
+    assert decision.auto_queue is False
 
 
 @pytest.mark.asyncio
@@ -1267,7 +1348,7 @@ async def test_canonical_matcher_selects_only_supplied_recording_and_release_ids
                     "local_score": 82,
                     "lead": 5,
                     "reason_codes": ["duration_compatible"],
-                    "contradiction_codes": [],
+                    "contradiction_codes": ["explicit_album_mismatch"],
                 }
             ],
             "release_candidates": [
@@ -1286,7 +1367,7 @@ async def test_canonical_matcher_selects_only_supplied_recording_and_release_ids
                     "version": "studio",
                     "local_score": 91,
                     "reason_codes": ["original_official_release"],
-                    "contradiction_codes": [],
+                    "contradiction_codes": ["explicit_album_mismatch"],
                 }
             ],
         }
@@ -1304,6 +1385,10 @@ async def test_canonical_matcher_selects_only_supplied_recording_and_release_ids
     encoded_input = json.dumps(fake.calls[0]["input_items"])
     assert "must-not-be-returned-by-the-model" not in encoded_input
     assert "must-also-stay-local" not in encoded_input
+    assert "explicit_album_mismatch" in encoded_input
+    model_payload = json.loads(fake.calls[0]["input_items"][0]["content"][0]["text"])
+    assert model_payload["recording_candidates"][0]["local_score"] == pytest.approx(0.82)
+    assert model_payload["release_candidates"][0]["local_score"] == pytest.approx(0.91)
     properties = fake.calls[0]["text_format"]["schema"]["properties"]
     assert properties["selected_recording_candidate_id"]["enum"] == ["recording_A", None]
     assert properties["selected_release_candidate_id"]["enum"] == ["release_A", None]

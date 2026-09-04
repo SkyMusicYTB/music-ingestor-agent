@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,8 +31,14 @@ from app.db.models import (
 )
 from app.repositories.events import make_event
 from app.services.artist_credits import structured_artists
-from app.services.duplicates import normalize_text, strip_provider_suffixes
+from app.services.duplicates import (
+    normalize_text,
+    normalize_version_signature,
+    strip_provider_suffixes,
+    version_signature,
+)
 from app.services.library_scan import LibraryScanner, ScanAlreadyRunning
+from app.services.recording_versions import recording_version_evidence
 from app.services.request_constraints import ExplicitRequestConstraints
 from app.sources import (
     EXECUTABLE_EVIDENCE_KINDS,
@@ -55,6 +62,13 @@ from app.workers.source_failures import is_transient_source_error
 
 logger = logging.getLogger(__name__)
 _SAFE_MEDIA_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_SOURCE_DISCOVERY_DIAGNOSTICS_KIND = "source_search_diagnostics"
+_MAX_SOURCE_DIAGNOSTIC_RUNS = 10
+_DIAGNOSTIC_QUERY_SECRET = re.compile(
+    r"(?:https?://|\b(?:authorization|bearer|cookie|credential|password|secret|"
+    r"api[_ -]?key|token)\b)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +241,11 @@ class WorkerServiceTaskHandler:
         uploader = recording.uploader
         uploader_relationship = _uploader_relationship(artist, uploader, metadata)
         extractor = provider_capability(provider).canonical_extractor
+        recording_version = _provider_recording_version(
+            metadata,
+            recording.title,
+            raw_title,
+        )
         with self.factory.begin() as session:
             request = session.get(Request, request_id)
             if request is None:
@@ -249,7 +268,7 @@ class WorkerServiceTaskHandler:
                     source_url=None,
                     source_extractor=extractor,
                     source_id=source_id[:100],
-                    version_signature="studio",
+                    version_signature=recording_version,
                     rationale="Resolved directly from the reviewed media URL.",
                     evidence_json=json.dumps(["yt-dlp metadata"], separators=(",", ":")),
                     metadata_confidence=0.80,
@@ -259,6 +278,10 @@ class WorkerServiceTaskHandler:
                             "album_constraint_explicit": False,
                             "source": "validated_direct_provider_metadata",
                             "artists": list(recording.artists),
+                            "recording_version": {
+                                "signature": recording_version,
+                                "source": "provider_recording_metadata",
+                            },
                             "request_constraints": ExplicitRequestConstraints(
                                 provider=provider.value
                             ).as_provenance(),
@@ -284,6 +307,7 @@ class WorkerServiceTaskHandler:
                             "artists": list(recording.artists),
                             "uploader": uploader,
                             "duration_seconds": duration,
+                            "version_signature": recording_version,
                         },
                         ensure_ascii=False,
                         separators=(",", ":"),
@@ -304,9 +328,10 @@ class WorkerServiceTaskHandler:
                         uploader=uploader[:300] if uploader else None,
                         uploader_relationship=uploader_relationship.value,
                         duration_seconds=duration,
-                        version_signature="studio",
+                        version_signature=recording_version,
                         group_key=(
-                            f"direct:{normalize_text(artist)}:{normalize_text(title)}:studio"
+                            f"direct:{normalize_text(artist)}:{normalize_text(title)}:"
+                            f"{recording_version}"
                         )[:500],
                         local_score=1.0,
                         policy_status="allowed",
@@ -318,6 +343,7 @@ class WorkerServiceTaskHandler:
                                 "track": title,
                                 "artists": list(recording.artists),
                                 "artist_source": recording.artist_source,
+                                "version": recording_version,
                             },
                             separators=(",", ":"),
                         ),
@@ -391,6 +417,9 @@ class WorkerServiceTaskHandler:
                 continue
             url = _bounded_string(parsed.get("url"), 2_048, "collection item URL")
             uploader = _optional_bounded_string(parsed.get("uploader"), 300)
+            recording_version = normalize_version_signature(
+                _optional_bounded_string(parsed.get("version_signature"), 100)
+            )
             prepared.append(
                 {
                     "artist": artist[:300],
@@ -403,6 +432,7 @@ class WorkerServiceTaskHandler:
                     "extractor": extractor,
                     "url": url,
                     "uploader": uploader,
+                    "version_signature": recording_version,
                 }
             )
         if not prepared:
@@ -446,7 +476,7 @@ class WorkerServiceTaskHandler:
                     source_url=None,
                     source_extractor=str(item["extractor"]),
                     source_id=str(item["source_id"])[:100],
-                    version_signature="studio",
+                    version_signature=str(item["version_signature"]),
                     rationale="Selectable item from the bounded direct collection.",
                     evidence_json=json.dumps(["bounded direct collection"], separators=(",", ":")),
                     metadata_confidence=0.80,
@@ -456,6 +486,10 @@ class WorkerServiceTaskHandler:
                             "album_constraint_explicit": False,
                             "source": "validated_direct_collection_metadata",
                             "artists": item["artists"],
+                            "recording_version": {
+                                "signature": item["version_signature"],
+                                "source": "provider_recording_metadata",
+                            },
                             "request_constraints": ExplicitRequestConstraints(
                                 provider=provider.value
                             ).as_provenance(),
@@ -481,6 +515,7 @@ class WorkerServiceTaskHandler:
                             "artists": item["artists"],
                             "uploader": item["uploader"],
                             "duration_seconds": item["duration"],
+                            "version_signature": item["version_signature"],
                         },
                         ensure_ascii=False,
                         separators=(",", ":"),
@@ -501,7 +536,7 @@ class WorkerServiceTaskHandler:
                         uploader=str(item["uploader"]) if item["uploader"] else None,
                         uploader_relationship="unknown",
                         duration_seconds=stored_duration,
-                        version_signature="studio",
+                        version_signature=str(item["version_signature"]),
                         group_key=(
                             f"collection:{provider.value}:{item['extractor']}:{item['source_id']}"
                         )[:500],
@@ -560,22 +595,54 @@ class WorkerServiceTaskHandler:
             raise ValueError("search_media_sources limit must be between 1 and 10")
         request_id, request_track_id, query = self._load_media_intent(intent_id)
 
-        if provider is ProviderIdentity.BANDCAMP:
-            candidates = self._existing_media_evidence(
+        try:
+            if provider is ProviderIdentity.BANDCAMP:
+                candidates = self._existing_media_evidence(
+                    request_id=request_id,
+                    request_track_id=request_track_id,
+                    provider=provider,
+                    limit=limit,
+                )
+            else:
+                candidates = self._search_provider_candidates(provider, query, limit)
+                candidates = self._persist_media_evidence(
+                    request_id=request_id,
+                    request_track_id=request_track_id,
+                    provider=provider,
+                    candidates=candidates,
+                    limit=limit,
+                )
+        except DownloadCancelled:
+            raise
+        except (SourceValidationError, YtDlpError) as exc:
+            try:
+                self._record_request_source_search(
+                    request_id=request_id,
+                    request_track_id=request_track_id,
+                    provider=provider,
+                    query=query,
+                    found_count=0,
+                    rejection_code=(
+                        "transient_provider_search"
+                        if is_transient_source_error(exc)
+                        else "provider_search_rejected"
+                    ),
+                )
+            except Exception:
+                logger.warning("request-scoped source-search diagnostics could not be persisted")
+            raise
+        try:
+            self._record_request_source_search(
                 request_id=request_id,
                 request_track_id=request_track_id,
                 provider=provider,
-                limit=limit,
+                query=query,
+                found_count=len(candidates),
             )
-        else:
-            candidates = self._search_provider_candidates(provider, query, limit)
-            candidates = self._persist_media_evidence(
-                request_id=request_id,
-                request_track_id=request_track_id,
-                provider=provider,
-                candidates=candidates,
-                limit=limit,
-            )
+        except Exception:
+            # Diagnostics are useful but must never turn a safe source search into
+            # a failed acquisition task or leak database/query details into logs.
+            logger.warning("request-scoped source-search diagnostics could not be persisted")
         return {
             "intent_id": intent_id,
             "provider": provider.value,
@@ -612,7 +679,23 @@ class WorkerServiceTaskHandler:
                         row.negative_until = datetime.now(UTC) + timedelta(
                             seconds=self.source_probe_negative_ttl_seconds
                         )
+            try:
+                self._record_request_source_probe(
+                    evidence_id,
+                    accepted=False,
+                    rejection_code=(
+                        "transient_candidate_probe"
+                        if is_transient_source_error(exc)
+                        else "probe_rejected"
+                    ),
+                )
+            except Exception:
+                logger.warning("request-scoped source-probe diagnostics could not be persisted")
             raise
+        try:
+            self._record_request_source_probe(evidence_id, accepted=True)
+        except Exception:
+            logger.warning("request-scoped source-probe diagnostics could not be persisted")
         return result
 
     def _load_media_intent(self, intent_id: str) -> tuple[str, str | None, str]:
@@ -640,6 +723,146 @@ class WorkerServiceTaskHandler:
                 query = _query_from_request_text(request.raw_text)
                 track_id = None
             return request.id, track_id, query
+
+    def _record_request_source_search(
+        self,
+        *,
+        request_id: str,
+        request_track_id: str | None,
+        provider: ProviderIdentity,
+        query: str,
+        found_count: int,
+        rejection_code: str | None = None,
+    ) -> None:
+        """Persist bounded request-scoped search facts without an executable URL."""
+
+        safe_query = _safe_diagnostic_query(query)
+        run = {
+            "schema_version": 1,
+            "query_variant_count": 1,
+            "query_attempts": [
+                {
+                    "provider": provider.value,
+                    "query": safe_query,
+                    "found_count": min(10, max(0, found_count)),
+                }
+            ],
+            "found_count": min(10, max(0, found_count)),
+            "probed_count": 0,
+            "accepted_count": 0,
+            "rejection_counts": (
+                {rejection_code: 1}
+                if rejection_code in {"provider_search_rejected", "transient_provider_search"}
+                else {}
+            ),
+            "stopped_early": False,
+        }
+        with self.factory.begin() as session:
+            row = _request_source_diagnostic_row(
+                session,
+                request_id=request_id,
+                request_track_id=request_track_id,
+                create=True,
+            )
+            assert row is not None
+            payload = _json_object(row.sanitized_metadata_json)
+            runs = _source_diagnostic_runs(payload)
+            run_key = (provider.value, safe_query)
+            if not any(_source_diagnostic_run_key(existing) == run_key for existing in runs):
+                runs.append(run)
+                runs = runs[-_MAX_SOURCE_DIAGNOSTIC_RUNS:]
+            payload["discovery_diagnostic_runs"] = runs
+            payload["discovery_diagnostics"] = _aggregate_source_diagnostics(
+                runs,
+                previous=payload.get("discovery_diagnostics"),
+            )
+            row.sanitized_metadata_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+
+    def _record_request_source_probe(
+        self,
+        evidence_id: str,
+        *,
+        accepted: bool,
+        rejection_code: str | None = None,
+    ) -> None:
+        """Update aggregate probe facts for an orchestration-time finite candidate."""
+
+        with self.factory.begin() as session:
+            evidence = session.get(EvidenceReference, evidence_id)
+            if evidence is None or evidence.evidence_kind not in EXECUTABLE_EVIDENCE_KINDS:
+                return
+            row = _request_source_diagnostic_row(
+                session,
+                request_id=evidence.request_id,
+                request_track_id=evidence.request_track_id,
+                create=False,
+            )
+            if row is None:
+                return
+            payload = _json_object(row.sanitized_metadata_json)
+            current = payload.get("discovery_diagnostics")
+            diagnostics = dict(current) if isinstance(current, dict) else {}
+            diagnostics["schema_version"] = 1
+            diagnostics["probed_count"] = min(
+                12,
+                (_diagnostic_count(diagnostics.get("probed_count"), maximum=12) or 0) + 1,
+            )
+            if accepted:
+                diagnostics["accepted_count"] = min(
+                    100,
+                    (_diagnostic_count(diagnostics.get("accepted_count"), maximum=100) or 0) + 1,
+                )
+            if rejection_code in {"probe_rejected", "transient_candidate_probe"}:
+                raw_rejections = diagnostics.get("rejection_counts")
+                rejections = dict(raw_rejections) if isinstance(raw_rejections, dict) else {}
+                rejections[rejection_code] = min(
+                    1_000,
+                    (_diagnostic_count(rejections.get(rejection_code), maximum=1_000) or 0) + 1,
+                )
+                diagnostics["rejection_counts"] = rejections
+            runs = _source_diagnostic_runs(payload)
+            if runs:
+                run = next(
+                    (
+                        item
+                        for item in reversed(runs)
+                        if _source_diagnostic_run_provider(item) == evidence.provider
+                    ),
+                    runs[-1],
+                )
+                run["probed_count"] = min(
+                    12,
+                    (_diagnostic_count(run.get("probed_count"), maximum=12) or 0) + 1,
+                )
+                if accepted:
+                    run["accepted_count"] = min(
+                        100,
+                        (_diagnostic_count(run.get("accepted_count"), maximum=100) or 0) + 1,
+                    )
+                if rejection_code in {"probe_rejected", "transient_candidate_probe"}:
+                    latest_rejections = run.get("rejection_counts")
+                    latest_counts = (
+                        dict(latest_rejections) if isinstance(latest_rejections, dict) else {}
+                    )
+                    latest_counts[rejection_code] = min(
+                        1_000,
+                        (_diagnostic_count(latest_counts.get(rejection_code), maximum=1_000) or 0)
+                        + 1,
+                    )
+                    run["rejection_counts"] = latest_counts
+                payload["discovery_diagnostic_runs"] = runs
+            payload["discovery_diagnostics"] = diagnostics
+            row.sanitized_metadata_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
 
     def _search_provider_candidates(
         self,
@@ -714,6 +937,11 @@ class WorkerServiceTaskHandler:
         if provider_for_extractor(extractor.casefold()) not in {None, provider}:
             return None
         recording = resolve_provider_recording_metadata(value, fallback_title=title)
+        recording_version = _provider_recording_version(
+            value,
+            recording.title,
+            title,
+        )
         return {
             "source_id": source_id[:200],
             "extractor": provider_capability(provider).canonical_extractor,
@@ -726,6 +954,7 @@ class WorkerServiceTaskHandler:
             "uploader": recording.uploader,
             "duration_seconds": duration,
             "description": bound_provider_description(value.get("description")),
+            "version_signature": recording_version,
         }
 
     def _persist_media_evidence(
@@ -751,6 +980,10 @@ class WorkerServiceTaskHandler:
                 provider_track = _optional_bounded_string(value.get("provider_track"), 300)
                 duration = _positive_float(value.get("duration_seconds"))
                 description = _optional_bounded_string(value.get("description"), 2_000)
+                version = normalize_version_signature(
+                    _optional_bounded_string(value.get("version_signature"), 100)
+                    or classify_version(title, provider_track).signature
+                )
                 row = session.scalar(
                     select(SourceCandidate)
                     .join(EvidenceReference, SourceCandidate.evidence_id == EvidenceReference.id)
@@ -774,6 +1007,7 @@ class WorkerServiceTaskHandler:
                     "uploader": uploader,
                     "duration_seconds": duration,
                     "description": description,
+                    "version_signature": version,
                 }
                 evidence_row: EvidenceReference | None
                 if row is None:
@@ -795,7 +1029,6 @@ class WorkerServiceTaskHandler:
                     session.flush()
                     # Descriptions are retained for display/audit, but they are
                     # untrusted provider text and cannot change match semantics.
-                    version = classify_version(title).signature
                     row = SourceCandidate(
                         evidence_id=evidence_row.id,
                         request_track_id=request_track_id,
@@ -907,7 +1140,7 @@ class WorkerServiceTaskHandler:
         ):
             raise SourceValidationError("media probe returned a mismatched extractor")
         description = bound_provider_description(metadata.get("description"))
-        version = classify_version(title, _string(metadata.get("alt_title"))).signature
+        version = _provider_recording_version(metadata, recording.title, title)
 
         with self.factory.begin() as session:
             evidence = session.get(EvidenceReference, evidence_id)
@@ -948,6 +1181,7 @@ class WorkerServiceTaskHandler:
                 "uploader": uploader,
                 "duration_seconds": duration,
                 "description": description,
+                "version_signature": version,
             }
             row.provider = provider.value
             row.extractor = provider_capability(provider).canonical_extractor
@@ -1052,6 +1286,168 @@ class _ServiceLeaseMonitor:
                 return
 
 
+def _request_source_diagnostic_row(
+    session: Session,
+    *,
+    request_id: str | None,
+    request_track_id: str | None,
+    create: bool,
+) -> EvidenceReference | None:
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    track_scope = (
+        EvidenceReference.request_track_id == request_track_id
+        if request_track_id is not None
+        else EvidenceReference.request_track_id.is_(None)
+    )
+    row = session.scalar(
+        select(EvidenceReference)
+        .where(
+            EvidenceReference.request_id == request_id,
+            EvidenceReference.job_id.is_(None),
+            EvidenceReference.evidence_kind == _SOURCE_DISCOVERY_DIAGNOSTICS_KIND,
+            track_scope,
+        )
+        .order_by(EvidenceReference.created_at, EvidenceReference.id)
+        .limit(1)
+    )
+    if row is not None or not create:
+        return row
+    row = EvidenceReference(
+        request_id=request_id,
+        request_track_id=request_track_id,
+        job_id=None,
+        provider="automatic",
+        evidence_kind=_SOURCE_DISCOVERY_DIAGNOSTICS_KIND,
+        canonical_url=None,
+        provider_item_id=None,
+        status="available",
+        sanitized_metadata_json="{}",
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _safe_diagnostic_query(value: str) -> str:
+    normalized = "".join(
+        character
+        for character in unicodedata.normalize("NFKC", value)
+        if not unicodedata.category(character).startswith("C")
+    )
+    normalized = " ".join(normalized.split())[:300]
+    if not normalized or _DIAGNOSTIC_QUERY_SECRET.search(normalized):
+        return "[redacted unsafe query]"
+    return normalized
+
+
+def _diagnostic_count(value: object, *, maximum: int) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= maximum:
+        return value
+    return None
+
+
+def _source_diagnostic_runs(payload: dict[str, object]) -> list[dict[str, object]]:
+    raw_runs = payload.get("discovery_diagnostic_runs")
+    if not isinstance(raw_runs, list):
+        return []
+    return [dict(run) for run in raw_runs[-_MAX_SOURCE_DIAGNOSTIC_RUNS:] if isinstance(run, dict)]
+
+
+def _source_diagnostic_run_key(value: dict[str, object]) -> tuple[str, str] | None:
+    attempts = value.get("query_attempts")
+    if not isinstance(attempts, list) or not attempts or not isinstance(attempts[0], dict):
+        return None
+    provider = attempts[0].get("provider")
+    query = attempts[0].get("query")
+    if not isinstance(provider, str) or not isinstance(query, str):
+        return None
+    return provider, query
+
+
+def _source_diagnostic_run_provider(value: dict[str, object]) -> str | None:
+    key = _source_diagnostic_run_key(value)
+    return key[0] if key is not None else None
+
+
+def _aggregate_source_diagnostics(
+    runs: list[dict[str, object]],
+    *,
+    previous: object,
+) -> dict[str, object]:
+    attempts: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for run in runs:
+        raw_attempts = run.get("query_attempts")
+        if not isinstance(raw_attempts, list):
+            continue
+        for raw in raw_attempts[:12]:
+            if not isinstance(raw, dict):
+                continue
+            provider = raw.get("provider")
+            query = raw.get("query")
+            found = _diagnostic_count(raw.get("found_count"), maximum=10)
+            if (
+                not isinstance(provider, str)
+                or provider not in {"bandcamp", "soundcloud", "youtube"}
+                or not isinstance(query, str)
+                or found is None
+            ):
+                continue
+            attempt_key = provider, _safe_diagnostic_query(query)
+            if attempt_key in seen:
+                continue
+            seen.add(attempt_key)
+            attempts.append(
+                {"provider": attempt_key[0], "query": attempt_key[1], "found_count": found}
+            )
+            if len(attempts) >= 12:
+                break
+        if len(attempts) >= 12:
+            break
+    prior = previous if isinstance(previous, dict) else {}
+    raw_rejections = prior.get("rejection_counts")
+    rejections: dict[str, int] = {}
+    for rejection_code in (
+        "provider_search_rejected",
+        "transient_provider_search",
+        "probe_rejected",
+        "transient_candidate_probe",
+    ):
+        run_total = 0
+        for run in runs:
+            counts = run.get("rejection_counts")
+            if isinstance(counts, dict):
+                run_total += _diagnostic_count(counts.get(rejection_code), maximum=1_000) or 0
+        prior_count = (
+            _diagnostic_count(
+                raw_rejections.get(rejection_code) if isinstance(raw_rejections, dict) else None,
+                maximum=1_000,
+            )
+            or 0
+        )
+        if rejection_count := min(1_000, max(run_total, prior_count)):
+            rejections[rejection_code] = rejection_count
+    return {
+        "schema_version": 1,
+        "query_variant_count": min(24, len({attempt["query"] for attempt in attempts})),
+        "query_attempts": attempts,
+        "found_count": min(
+            1_000,
+            sum(
+                found_count
+                for attempt in attempts
+                if (found_count := _diagnostic_count(attempt.get("found_count"), maximum=10))
+                is not None
+            ),
+        ),
+        "probed_count": _diagnostic_count(prior.get("probed_count"), maximum=12) or 0,
+        "accepted_count": _diagnostic_count(prior.get("accepted_count"), maximum=100) or 0,
+        "rejection_counts": rejections,
+        "stopped_early": False,
+    }
+
+
 def _media_provider(
     value: object,
     enabled_providers: frozenset[str] | None = None,
@@ -1147,6 +1543,26 @@ def _json_object(value: str) -> dict[str, object]:
 
 def _string(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _provider_recording_version(
+    metadata: dict[str, Any],
+    *resolved_titles: str | None,
+) -> str:
+    """Classify only provider recording fields, never album or uploader text."""
+
+    recording_values = (
+        *resolved_titles,
+        _string(metadata.get("track")),
+        _string(metadata.get("alt_title")),
+        _string(metadata.get("title")),
+    )
+    return normalize_version_signature(
+        version_signature(
+            _string(metadata.get("version")),
+            *recording_version_evidence(*recording_values),
+        )
+    )
 
 
 def _artist_source(value: object) -> str | None:

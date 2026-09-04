@@ -46,6 +46,7 @@ class CanonicalDecisionReplay:
     model_confidence: float | None
     openai_call_id: str | None
     decided_by: str = "user"
+    decision_id: str | None = None
 
 
 _CANONICAL_SELECTION_FIELDS = frozenset(
@@ -74,6 +75,7 @@ _CANONICAL_SELECTION_FIELDS = frozenset(
         "thumbnail",
         "metadata_provenance",
         "reason_code",
+        "matching_policy_version",
     }
 )
 
@@ -540,6 +542,7 @@ def latest_user_canonical_selection(
         local_confidence=decision.local_confidence,
         model_confidence=decision.model_confidence,
         openai_call_id=decision.openai_call_id,
+        decision_id=decision.id,
     )
 
 
@@ -583,6 +586,7 @@ def latest_canonical_selection(
             decision.model_confidence,
             decision.openai_call_id,
             decision.decided_by or "deterministic",
+            decision.id,
         )
     if replay is None:
         return None

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from app.config import Settings
 from app.db.models import Request, RequestTrack
+from app.services.artist_credits import artist_credit_similarity, structured_artists
 from app.services.duplicates import normalize_text, versions_compatible
 from app.services.request_constraints import parse_explicit_request_constraints
 
@@ -176,7 +177,12 @@ def _request_proves_exact_track_intent(request: Request, track: RequestTrack) ->
         return False
     if identity.artist is not None and (
         not isinstance(track_artist, str)
-        or normalize_text(identity.artist) != normalize_text(track_artist)
+        or artist_credit_similarity(
+            identity.artist,
+            track_artist,
+            right_artists=_track_structured_artists(track),
+        )
+        < 0.95
     ):
         return False
     track_album = getattr(track, "album", None)
@@ -191,6 +197,21 @@ def _request_proves_exact_track_intent(request: Request, track: RequestTrack) ->
     ):
         return False
     return True
+
+
+def _track_structured_artists(track: RequestTrack) -> tuple[str, ...]:
+    """Read only locally persisted, bounded canonical artist-credit parts."""
+
+    encoded = getattr(track, "metadata_provenance_json", None)
+    if not isinstance(encoded, str):
+        return ()
+    try:
+        provenance = json.loads(encoded)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(provenance, dict):
+        return ()
+    return structured_artists(provenance.get("artists"))
 
 
 def _parse_requested_track_identity(value: str) -> _RequestedTrackIdentity | None:

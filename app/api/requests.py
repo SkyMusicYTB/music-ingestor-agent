@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 
@@ -47,30 +48,61 @@ def _request_payload(item: DbRequest, tracks: list[RequestTrack]) -> dict[str, o
         ),
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
-        "tracks": [
-            {
-                "id": track.id,
-                "ordinal": track.ordinal,
-                "artist": track.artist,
-                "title": track.title,
-                "album": track.album,
-                "album_artist": track.album_artist,
-                "year": track.year,
-                "duration_seconds": track.duration_seconds,
-                "recording_mbid": track.recording_mbid,
-                "release_mbid": track.release_mbid,
-                "canonical_identity_verified": track.canonical_identity_verified,
-                "source_extractor": track.source_extractor,
-                "source_id": track.source_id,
-                "version": track.version_signature,
-                "rationale": track.rationale,
-                "duplicate_status": track.duplicate_status,
-                "duplicate_track_id": track.duplicate_track_id,
-                "selected": track.selected,
-                "metadata_confidence": track.metadata_confidence,
-            }
-            for track in tracks
-        ],
+        "tracks": [_track_payload(track) for track in tracks],
+    }
+
+
+def _track_payload(track: RequestTrack) -> dict[str, object]:
+    try:
+        raw_provenance = json.loads(track.metadata_provenance_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        raw_provenance = {}
+    provenance = raw_provenance if isinstance(raw_provenance, dict) else {}
+    constraints = provenance.get("request_constraints")
+    requested_version = (
+        constraints.get("requested_version") if isinstance(constraints, dict) else None
+    )
+    version_authority = (
+        "user"
+        if isinstance(requested_version, str) and requested_version
+        else "canonical"
+        if track.canonical_identity_verified
+        else "provisional"
+    )
+    return {
+        "id": track.id,
+        "ordinal": track.ordinal,
+        "artist": track.artist,
+        "title": track.title,
+        "album": track.album,
+        "album_artist": track.album_artist,
+        "year": track.year,
+        "duration_seconds": track.duration_seconds,
+        "recording_mbid": track.recording_mbid,
+        "release_mbid": track.release_mbid,
+        "canonical_identity_verified": track.canonical_identity_verified,
+        "source_extractor": track.source_extractor,
+        "source_id": track.source_id,
+        "version": track.version_signature,
+        "rationale": track.rationale,
+        "duplicate_status": track.duplicate_status,
+        "duplicate_track_id": track.duplicate_track_id,
+        "selected": track.selected,
+        "metadata_confidence": track.metadata_confidence,
+        "recording_version": {
+            "value": track.version_signature,
+            "authority": version_authority,
+        },
+        "requested_version": (
+            requested_version
+            if isinstance(requested_version, str) and requested_version.strip()
+            else None
+        ),
+        "release_context": {
+            "album": track.album,
+            "year": track.year,
+            "canonical": bool(track.canonical_identity_verified and track.release_mbid),
+        },
     }
 
 

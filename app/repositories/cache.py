@@ -97,11 +97,17 @@ class ExternalCacheRepository:
         row.last_accessed_at = current
         return row
 
-    def delete_expired(self, *, now: datetime | None = None) -> int:
+    def delete_expired(
+        self,
+        *,
+        namespace: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
         current = now or datetime.now(UTC)
-        result = self._session.execute(
-            delete(ExternalCache).where(ExternalCache.expires_at <= current)
-        )
+        statement = delete(ExternalCache).where(ExternalCache.expires_at <= current)
+        if namespace is not None:
+            statement = statement.where(ExternalCache.namespace == _validate_namespace(namespace))
+        result = self._session.execute(statement)
         return int(result.rowcount or 0)
 
 

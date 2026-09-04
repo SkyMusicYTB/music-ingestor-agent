@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.db.models import Base, OpenAICall
+from app.db.models import Base, ExternalCache, OpenAICall
 from app.repositories.cache import ExternalCacheRepository
 from app.repositories.usage import OpenAIUsageRepository, UsageValues
 from app.services.costs import CostCalculator, PricingSnapshot
+from app.workers.source_discovery_state import (
+    SOURCE_SEARCH_CACHE_NAMESPACE,
+    delete_expired_source_search_cache,
+)
 
 
 def database() -> sessionmaker[Session]:
@@ -40,6 +44,42 @@ def test_external_cache_expires_and_replaces_entries() -> None:
             )
             is None
         )
+
+
+def test_expired_source_search_cleanup_is_namespace_scoped() -> None:
+    factory = database()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    with factory.begin() as session:
+        cache = ExternalCacheRepository(session)
+        cache.put(
+            SOURCE_SEARCH_CACHE_NAMESPACE,
+            "expired-search",
+            {"value": 1},
+            ttl=timedelta(hours=1),
+            now=now,
+        )
+        cache.put(
+            SOURCE_SEARCH_CACHE_NAMESPACE,
+            "live-search",
+            {"value": 2},
+            ttl=timedelta(hours=3),
+            now=now,
+        )
+        cache.put(
+            "musicbrainz",
+            "expired-shared-provider-entry",
+            {"value": 3},
+            ttl=timedelta(hours=1),
+            now=now,
+        )
+
+    assert delete_expired_source_search_cache(factory, now=now + timedelta(hours=2)) == 1
+    with factory() as session:
+        remaining = set(session.execute(select(ExternalCache.namespace, ExternalCache.cache_key)))
+    assert remaining == {
+        (SOURCE_SEARCH_CACHE_NAMESPACE, "live-search"),
+        ("musicbrainz", "expired-shared-provider-entry"),
+    }
 
 
 def test_usage_accounting_and_cost_snapshot() -> None:

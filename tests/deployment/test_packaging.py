@@ -123,9 +123,12 @@ def test_installed_wheel_contains_runtime_data_and_can_migrate(tmp_path: Path) -
         "app/static/app.css",
         "app/static/app.js",
         "app/prompts/orchestrator_v1.txt",
+        "app/prompts/orchestrator_v2.txt",
         "app/prompts/source_selector_v1.txt",
         "app/prompts/source_matcher_v2.txt",
+        "app/prompts/source_matcher_v3.txt",
         "app/prompts/canonical_matcher_v2.txt",
+        "app/prompts/canonical_matcher_v3.txt",
     }
     assert not required.difference(names)
 

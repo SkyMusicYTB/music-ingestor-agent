@@ -35,15 +35,23 @@ from app.clients.openai import (
 )
 from app.config import Settings
 from app.db.models import DownloadJob, OpenAICall, Request, RequestTrack
+from app.prompts import (
+    CANONICAL_MATCH_PROMPT_VERSION,
+    ORCHESTRATOR_PROMPT_VERSION,
+    SOURCE_MATCH_PROMPT_VERSION,
+    SOURCE_SELECTOR_PROMPT_VERSION,
+)
 from app.repositories.events import make_event
 from app.repositories.usage import OpenAIUsageRepository
 from app.schemas import MusicProposal, ProposalTrack, StrictModel
+from app.services.artist_credits import artist_credit_similarity, structured_artists
 from app.services.conversations import ConversationService, OrchestrationContext
 from app.services.costs import CostCalculator, PricingSnapshot
 from app.services.duplicates import (
     DuplicateCandidate,
     DuplicateDetector,
-    version_signature,
+    normalize_version_signature,
+    recording_version_signature,
     versions_compatible,
 )
 from app.services.metadata_matching import normalize_text
@@ -58,6 +66,7 @@ from app.services.proposals import (
     VerifiedMetadata,
     _verified_match,
 )
+from app.services.request_constraints import parse_explicit_request_constraints
 from app.sources import (
     CanonicalMatchDecision,
     MatchDecision,
@@ -73,10 +82,8 @@ from app.sources import (
 from app.tools.media_sources import media_tool_authorization
 from app.tools.registry import ToolExecution, ToolRegistry
 
-PROMPT_VERSION = "orchestrator_v1"
-SOURCE_PROMPT_VERSION = "source_selector_v1"
-SOURCE_MATCH_PROMPT_VERSION = "source_matcher_v2"
-CANONICAL_MATCH_PROMPT_VERSION = "canonical_matcher_v2"
+PROMPT_VERSION = ORCHESTRATOR_PROMPT_VERSION
+SOURCE_PROMPT_VERSION = SOURCE_SELECTOR_PROMPT_VERSION
 _PROMPT_DIRECTORY = Path(__file__).resolve().parent.parent / "prompts"
 _SOURCE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 _MATCH_CANDIDATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
@@ -144,10 +151,10 @@ class OrchestrationService:
         self._pricing = PricingSnapshot.from_settings(settings)
         self._costs = CostCalculator(self._pricing)
         self._duplicates = DuplicateDetector(settings.music_path)
-        self._instructions = _load_prompt("orchestrator_v1.txt")
+        self._instructions = _load_prompt("orchestrator_v2.txt")
         self._source_instructions = _load_prompt("source_selector_v1.txt")
-        self._source_match_instructions = _load_prompt("source_matcher_v2.txt")
-        self._canonical_match_instructions = _load_prompt("canonical_matcher_v2.txt")
+        self._source_match_instructions = _load_prompt("source_matcher_v3.txt")
+        self._canonical_match_instructions = _load_prompt("canonical_matcher_v3.txt")
         self._closed = False
 
     async def aclose(self) -> None:
@@ -187,6 +194,7 @@ class OrchestrationService:
                 update(Request)
                 .where(Request.id == request_id, Request.lease_token == lease_token)
                 .values(
+                    prompt_version=PROMPT_VERSION,
                     orchestration_attempt_id=attempt.attempt_id,
                     model_rounds_used=0,
                     configured_model_rounds=self._settings.max_model_rounds,
@@ -212,7 +220,16 @@ class OrchestrationService:
                 )
                 return
             context = self._conversations.orchestration_context(request_id)
-            with media_tool_authorization(context.user_id, context.request_id):
+            explicit_constraints = parse_explicit_request_constraints(
+                context.text,
+                input_kind=context.input_kind,
+            )
+            with media_tool_authorization(
+                context.user_id,
+                context.request_id,
+                requested_album=explicit_constraints.album,
+                requested_version=explicit_constraints.version,
+            ):
                 # One deadline owner; reserve at most one second for bounded
                 # local persistence after a provider/tool timeout.
                 async with asyncio.timeout_at(attempt.deadline - 1.0):
@@ -617,6 +634,11 @@ class OrchestrationService:
         collected: dict[str, ProposalTrack] = {}
         verified_metadata: dict[str, VerifiedMetadata] = {}
         canonical_candidates: dict[str, VerifiedMetadata] = {}
+        explicit_request_constraints = parse_explicit_request_constraints(
+            context.text, input_kind=context.input_kind
+        )
+        explicit_request_version = explicit_request_constraints.version
+        explicit_request_album = explicit_request_constraints.album
         attempt = current_attempt.get()
         if attempt is not None:
             attempt.verified = verified_metadata
@@ -771,7 +793,11 @@ class OrchestrationService:
             for track in proposal.tracks:
                 if len(collected) >= self._settings.max_candidates_per_request:
                     break
-                identity = _proposal_identity(track, verified_metadata)
+                identity = _proposal_identity(
+                    track,
+                    verified_metadata,
+                    explicit_version=explicit_request_version,
+                )
                 previous = collected.get(identity)
                 if previous is None or track.confidence > previous.confidence:
                     collected[identity] = track
@@ -783,9 +809,13 @@ class OrchestrationService:
                 merged,
                 verified_metadata,
                 canonical_candidates,
+                explicit_version=explicit_request_version,
+                explicit_album=explicit_request_album,
             )
             available_count = self._available_candidate_count(
-                tuple(collected.values()), verified_metadata
+                tuple(collected.values()),
+                verified_metadata,
+                explicit_version=explicit_request_version,
             )
 
             if recovery_without_web:
@@ -869,6 +899,9 @@ class OrchestrationService:
         proposal: MusicProposal,
         verified: dict[str, VerifiedMetadata],
         candidates: Mapping[str, VerifiedMetadata],
+        *,
+        explicit_version: str | None,
+        explicit_album: str | None,
     ) -> None:
         if (
             context.action != "add"
@@ -879,14 +912,21 @@ class OrchestrationService:
         ):
             return
         track = proposal.tracks[0]
-        signature = version_signature(track.version, track.title, track.album)
-        if _verified_match(track, signature, verified) is not None:
+        signature = _proposal_recording_version(
+            track,
+            explicit_version=explicit_version,
+            verified_metadata=verified,
+        )
+        if _verified_match(track, explicit_version, verified) is not None:
             return
         eligible = [
             value
             for value in candidates.values()
             if value.score >= self._settings.ai_match_min_local_score * 100
-            and versions_compatible(signature, value.version_signature)
+            and (
+                explicit_version is None or versions_compatible(signature, value.version_signature)
+            )
+            and not value.contradiction_codes
         ]
         eligible.sort(key=lambda value: (-value.score, value.recording_mbid))
         eligible = eligible[:8]
@@ -911,11 +951,12 @@ class OrchestrationService:
                     "artist": candidate.artist,
                     "title": candidate.title,
                     "album": candidate.album,
-                    "year": None,
+                    "year": candidate.year,
                     "duration_seconds": candidate.duration_seconds,
                     "local_score": candidate.score / 100.0,
                     "version": candidate.version_signature,
                     "reason_codes": ["musicbrainz_borderline_candidate"],
+                    "contradiction_codes": list(candidate.contradiction_codes),
                 }
             )
             if release_id is not None:
@@ -925,10 +966,11 @@ class OrchestrationService:
                         "release_candidate_id": release_id,
                         "recording_candidate_id": recording_id,
                         "album": candidate.album,
-                        "year": None,
+                        "year": candidate.year,
                         "status": "unknown",
                         "primary_type": "unknown",
                         "local_score": candidate.score / 100.0,
+                        "contradiction_codes": list(candidate.contradiction_codes),
                     }
                 )
         try:
@@ -939,7 +981,7 @@ class OrchestrationService:
                     "intent": {
                         "artist": track.artist,
                         "title": track.title,
-                        "album": track.album,
+                        "album": explicit_album,
                         "version": signature,
                         "duration_seconds": track.duration_seconds,
                     },
@@ -970,7 +1012,11 @@ class OrchestrationService:
             or selected is None
             or decision.confidence < self._settings.ai_match_auto_accept_threshold
             or decision.contradiction_codes
-            or not versions_compatible(signature, decision.recording_version)
+            or not versions_compatible(selected.version_signature, decision.recording_version)
+            or (
+                explicit_version is not None
+                and not versions_compatible(explicit_version, selected.version_signature)
+            )
         ):
             return
         if (
@@ -990,6 +1036,9 @@ class OrchestrationService:
             release_mbid=selected.release_mbid,
             release_group_mbid=selected.release_group_mbid,
             score=selected.score,
+            year=selected.year,
+            artists=selected.artists,
+            contradiction_codes=selected.contradiction_codes,
             decided_by="openai",
             model_confidence=decision.confidence,
             openai_call_id=_bounded_string(result.get("openai_call_id"), 64),
@@ -999,6 +1048,8 @@ class OrchestrationService:
         self,
         tracks: Sequence[ProposalTrack],
         verified_metadata: Mapping[str, VerifiedMetadata],
+        *,
+        explicit_version: str | None,
     ) -> int:
         """Count candidates not already owned, revalidating indexed paths on disk."""
 
@@ -1009,13 +1060,17 @@ class OrchestrationService:
                     DuplicateCandidate(
                         artist=track.artist,
                         title=track.title,
-                        version_signature=version_signature(
-                            track.version,
-                            track.title,
-                            track.album,
+                        version_signature=_proposal_recording_version(
+                            track,
+                            explicit_version=explicit_version,
+                            verified_metadata=verified_metadata,
                         ),
                         duration_seconds=track.duration_seconds,
-                        recording_mbid=_authoritative_recording_mbid(track, verified_metadata),
+                        recording_mbid=_authoritative_recording_mbid(
+                            track,
+                            verified_metadata,
+                            explicit_version=explicit_version,
+                        ),
                     ),
                 ).status
                 != "owned"
@@ -1459,20 +1514,34 @@ def _collect_verified_metadata(
         if recording_mbid is None or artist is None or title is None:
             continue
         album = _bounded_string(value.get("album"), 300)
+        try:
+            candidate_year = _optional_year(value.get("year"))
+        except ValueError:
+            candidate_year = None
         duration = _finite_number(value.get("duration_seconds"))
         if duration is not None and not 0 < duration <= 14_400:
             duration = None
         candidate_version = _bounded_string(value.get("version"), 100)
+        try:
+            contradiction_codes = tuple(_match_codes(value.get("contradiction_codes")))
+        except ValueError:
+            continue
         candidate = VerifiedMetadata(
             recording_mbid=recording_mbid,
             artist=artist,
             title=title,
             album=album,
             duration_seconds=duration,
-            version_signature=version_signature(candidate_version, title, album),
+            version_signature=recording_version_signature(
+                explicit_version=candidate_version,
+                recording_title=title,
+            ),
             release_mbid=_canonical_mbid(value.get("release_mbid")),
             release_group_mbid=_canonical_mbid(value.get("release_group_mbid")),
             score=min(100.0, score),
+            year=candidate_year,
+            artists=structured_artists(value.get("artists")),
+            contradiction_codes=contradiction_codes,
         )
         if candidates is not None and candidate.score >= 75:
             current_candidate = candidates.get(recording_mbid)
@@ -1493,7 +1562,12 @@ def _opaque_candidate_id(prefix: str, canonical_id: str | None) -> str:
 
 def _canonical_evidence_compatible(proposed: ProposalTrack, selected: VerifiedMetadata) -> bool:
     if (
-        token_set_ratio(normalize_text(proposed.artist), normalize_text(selected.artist)) < 80
+        artist_credit_similarity(
+            proposed.artist,
+            selected.artist,
+            right_artists=selected.artists,
+        )
+        < 0.95
         or token_set_ratio(normalize_text(proposed.title), normalize_text(selected.title)) < 80
     ):
         return False
@@ -1536,27 +1610,52 @@ def _oversample_target(requested_count: int | None, hard_cap: int) -> int | None
 
 
 def _proposal_identity(
-    track: ProposalTrack, verified_metadata: Mapping[str, VerifiedMetadata]
+    track: ProposalTrack,
+    verified_metadata: Mapping[str, VerifiedMetadata],
+    *,
+    explicit_version: str | None = None,
 ) -> str:
-    signature = version_signature(track.version, track.title, track.album)
-    verified = _verified_match(track, signature, verified_metadata)
+    signature = _proposal_recording_version(
+        track,
+        explicit_version=explicit_version,
+        verified_metadata=verified_metadata,
+    )
+    verified = _verified_match(track, explicit_version, verified_metadata)
     if verified is not None:
-        return f"mbid:{verified.recording_mbid}:{normalize_text(track.version)}"
+        return f"mbid:{verified.recording_mbid}:{normalize_text(signature)}"
     return (
         f"text:{normalize_text(track.artist)}:{normalize_text(track.title)}:"
-        f"{normalize_text(track.version)}"
+        f"{normalize_text(signature)}"
     )
 
 
 def _authoritative_recording_mbid(
-    track: ProposalTrack, verified_metadata: Mapping[str, VerifiedMetadata]
+    track: ProposalTrack,
+    verified_metadata: Mapping[str, VerifiedMetadata],
+    *,
+    explicit_version: str | None = None,
 ) -> str | None:
     verified = _verified_match(
         track,
-        version_signature(track.version, track.title, track.album),
+        explicit_version,
         verified_metadata,
     )
     return verified.recording_mbid if verified is not None else None
+
+
+def _proposal_recording_version(
+    track: ProposalTrack,
+    *,
+    explicit_version: str | None = None,
+    verified_metadata: Mapping[str, VerifiedMetadata] | None = None,
+) -> str:
+    if explicit_version is not None:
+        return recording_version_signature(explicit_version=explicit_version)
+    if verified_metadata:
+        verified = _verified_match(track, None, verified_metadata)
+        if verified is not None:
+            return normalize_version_signature(verified.version_signature)
+    return "studio"
 
 
 def _source_selection_input(
@@ -1721,7 +1820,7 @@ def _canonical_match_input(
                     raw.get("recording_version", raw.get("version")), 100
                 ),
                 "duration_seconds": _optional_duration(raw.get("duration_seconds"), 14_400),
-                "local_score": _bounded_number(raw.get("local_score"), 0.0, 100.0),
+                "local_score": _canonical_local_score(raw.get("local_score")),
                 "lead": _optional_bounded_number(raw.get("lead"), 0.0, 100.0),
                 "local_reason_summaries": _bounded_text_list(
                     raw.get("reason_codes", raw.get("reasons")), 16, 200
@@ -1761,7 +1860,7 @@ def _canonical_match_input(
                 "primary_type": _optional_match_text(raw.get("primary_type"), 100),
                 "secondary_types": _bounded_text_list(raw.get("secondary_types"), 8, 100),
                 "version": _optional_match_text(raw.get("version"), 100),
-                "local_score": _bounded_number(raw.get("local_score"), 0.0, 100.0),
+                "local_score": _canonical_local_score(raw.get("local_score")),
                 "local_reason_summaries": _bounded_text_list(
                     raw.get("reason_codes", raw.get("reasons")), 16, 200
                 ),
@@ -1858,6 +1957,13 @@ def _optional_bounded_number(value: object, minimum: float, maximum: float) -> f
     if value is None:
         return None
     return _bounded_number(value, minimum, maximum)
+
+
+def _canonical_local_score(value: object) -> float:
+    """Normalize legacy percentage scores to the current unit-interval contract."""
+
+    score = _bounded_number(value, 0.0, 100.0)
+    return score / 100.0 if score > 1.0 else score
 
 
 def _optional_duration(value: object, maximum: float) -> float | None:

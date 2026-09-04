@@ -7,13 +7,14 @@
   <div class="section-heading"><h1>{{ item.raw_text }}</h1><span class="status status-{{ item.status }}">{{ item.status|replace('_', ' ') }}</span></div>
   {% if item.error_message %}<div class="alert error">{{ item.error_message }}</div>{% endif %}
   {% if item.status == 'degraded' %}<div class="alert warning">Partial results: {{ tracks|length }} available{% if item.requested_count %} of {{ item.requested_count }} requested{% endif %}. Review these before adding; no missing tracks were invented.</div>{% endif %}
-  {% if item.termination_reason %}<details><summary>Execution details</summary><p>{{ item.termination_reason|replace('_', ' ') }} · {{ item.model_rounds_used or 0 }} of {{ item.configured_model_rounds }} model rounds · built-in tool cap {{ item.configured_tool_calls }} per response{% if item.configured_agent_seconds is not none %} · {{ item.configured_agent_seconds }}s overall deadline{% endif %}.</p></details>{% endif %}
+  {% if user.role == 'admin' and execution_diagnostics %}<details><summary>Model execution diagnostics</summary><p>{{ execution_diagnostics.reason }}{% if execution_diagnostics.rounds_used is not none %} · {{ execution_diagnostics.rounds_used }}{% if execution_diagnostics.round_budget is not none %} of {{ execution_diagnostics.round_budget }}{% endif %} model rounds{% endif %}{% if execution_diagnostics.tool_cap is not none %} · built-in tool cap {{ execution_diagnostics.tool_cap }} per response{% endif %}{% if execution_diagnostics.deadline_seconds is not none %} · {{ execution_diagnostics.deadline_seconds }}s overall deadline{% endif %}{% if execution_diagnostics.attempt_id %} · attempt {{ execution_diagnostics.attempt_id }}{% endif %}.</p></details>{% endif %}
   {% if item.status in ['pending', 'orchestrating'] %}<div class="progress-card"><span class="spinner"></span> Building a proposal…</div>{% endif %}
   {% if item.status == 'auto_queued' %}<div class="alert success"><strong>Matched and queued automatically.</strong> No source or metadata choice was needed. Follow progress on <a href="/downloads">Downloads</a>.</div>{% endif %}
   {% if tracks and item.status not in ['auto_queued', 'queued'] %}
   <form id="approval-form" data-request-id="{{ item.id }}" class="stack">
     <div class="proposal-grid">
     {% for track in tracks %}
+      {% set presentation = track_presentations.get(track.id, {}) %}
       <article class="track-card duplicate-{{ track.duplicate_status }}">
         {% if track.canonical_identity_verified and (track.release_mbid or track.release_group_mbid) %}
         <div class="track-art-shell" aria-hidden="true">
@@ -25,15 +26,19 @@
         <label class="track-select">
           <input type="checkbox" name="track_ids" value="{{ track.id }}" {% if track.selected and track.duplicate_status != 'owned' %}checked{% endif %} {% if track.duplicate_status == 'owned' %}disabled{% endif %}>
           <span class="track-number">{{ '%02d'|format(track.ordinal) }}</span>
-          <span><strong>{{ track.title }}</strong><small>{{ track.artist }}{% if track.album %} · {{ track.album }}{% endif %}{% if track.year %} ({{ track.year }}){% endif %}</small></span>
+          <span><strong>{{ track.title }}</strong><small>{{ track.artist }}</small></span>
         </label>
         <p>{{ track.rationale }}</p>
+        <p><small><strong>Requested version:</strong> {% if presentation.requested_version %}{{ presentation.requested_version|replace('_', ' ')|title }}{% else %}No special version (studio/original default){% endif %} · <strong>Resolved recording version:</strong> {{ presentation.version|replace('_', ' ')|title }} · {{ presentation.version_basis }}.</small></p>
+        {% if presentation.album %}<p><small><strong>{{ presentation.release_basis|title }}:</strong> {{ presentation.album }}{% if presentation.year %} ({{ presentation.year }}){% endif %}</small></p>{% endif %}
+        {% if presentation.source %}<p class="source-summary"><small><strong>Candidate acquisition source:</strong> {{ presentation.source }}{% if presentation.uploader %} · uploaded by {{ presentation.uploader }}{% endif %}{% if presentation.source_confidence is not none %} · {{ (presentation.source_confidence * 100)|round|int }}% local confidence{% endif %}</small></p>{% endif %}
         <div class="badges">
           {% if track.version_signature != 'studio' %}<span>{{ track.version_signature }}</span>{% endif %}
           {% if track.canonical_identity_verified and track.recording_mbid %}<span>MusicBrainz matched</span>{% endif %}
           {% if track.duplicate_status == 'owned' %}<span class="owned">Already owned</span>{% endif %}
           {% if track.duplicate_status == 'possible' %}<span class="possible">Possible duplicate</span>{% endif %}
         </div>
+        {% if user.role == 'admin' %}<details><summary>Safe matching diagnostics</summary><p><small>Canonical identity: {{ 'verified' if presentation.canonical else 'not yet verified' }} · Version basis: {{ presentation.version_basis }} · Metadata basis: {{ presentation.diagnostic_source }}{% if presentation.source %} · Safe source candidate: {{ presentation.source }}{% endif %}</small></p>{% for line in presentation.source_diagnostics %}<p><small>{{ line }}</small></p>{% endfor %}</details>{% endif %}
       </article>
     {% endfor %}
     </div>

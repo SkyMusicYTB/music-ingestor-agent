@@ -21,6 +21,7 @@ from app.config import Settings
 from app.repositories.cache import ExternalCacheRepository
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[Any]]
+CacheVary = Callable[[], Any]
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DEFAULT_TOOL_NAMES = frozenset(
     {
@@ -45,6 +46,7 @@ class ToolDefinition:
     timeout_seconds: float = 25.0
     max_result_bytes: int = 96_000
     cache_ttl_seconds: int | None = None
+    cache_vary: CacheVary | None = None
 
     def openai_schema(self) -> dict[str, Any]:
         return {
@@ -180,7 +182,11 @@ class ToolRegistry:
         try:
             with self._session_factory.begin() as session:
                 entry = ExternalCacheRepository(session).get(
-                    f"tool:{definition.name}", _cache_key(arguments)
+                    f"tool:{definition.name}",
+                    _cache_key(
+                        arguments,
+                        vary=definition.cache_vary() if definition.cache_vary else None,
+                    ),
                 )
                 return entry.payload if entry is not None else None
         except Exception:
@@ -198,7 +204,10 @@ class ToolRegistry:
             with self._session_factory.begin() as session:
                 ExternalCacheRepository(session).put(
                     f"tool:{definition.name}",
-                    _cache_key(arguments),
+                    _cache_key(
+                        arguments,
+                        vary=definition.cache_vary() if definition.cache_vary else None,
+                    ),
                     result,
                     ttl=timedelta(seconds=definition.cache_ttl_seconds),
                 )
@@ -317,8 +326,8 @@ def _encode_result(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _cache_key(arguments: Mapping[str, Any]) -> str:
-    payload = _encode_result(arguments)
+def _cache_key(arguments: Mapping[str, Any], *, vary: Any = None) -> str:
+    payload = _encode_result({"arguments": arguments, "trusted_context": vary})
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

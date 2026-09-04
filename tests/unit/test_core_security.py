@@ -209,6 +209,75 @@ def test_explicit_title_and_artist_remain_exact_even_for_a_generic_real_title(se
 
 
 @pytest.mark.parametrize(
+    "requested_artist",
+    ["Gabry Ponte, KEL", "Gabry Ponte & KEL", "Gabry Ponte x KEL", "Gabry Ponte and KEL"],
+)
+def test_exact_autoqueue_accepts_complete_collaboration_credit_variants(
+    settings, requested_artist: str
+) -> None:
+    class Candidate:
+        artist = "Gabry Ponte & KEL"
+        title = "Tarantella"
+        album = "Tarantella - Single"
+        version_signature = "studio"
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.96
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": recording_mbid,
+                "score": 96,
+                "artists": ["Gabry Ponte", "KEL"],
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = 1
+
+        def __init__(self, artist: str) -> None:
+            self.raw_text = f"add {artist} - Tarantella"
+
+    assert confirmation_decision(Request(requested_artist), [Candidate()], settings).auto_queue
+
+
+def test_exact_autoqueue_never_drops_a_required_collaborator(settings) -> None:
+    class Candidate:
+        artist = "Gabry Ponte & KEL"
+        title = "Tarantella"
+        album = "Tarantella - Single"
+        version_signature = "studio"
+        selected = True
+        duplicate_status = "none"
+        metadata_confidence = 0.96
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        source_extractor = None
+        source_id = None
+        metadata_provenance_json = json.dumps(
+            {
+                "automatic_association": True,
+                "source": "musicbrainz_search_recordings",
+                "recording_mbid": recording_mbid,
+                "score": 96,
+            }
+        )
+
+    class Request:
+        action = "add"
+        input_kind = "natural_language"
+        requested_count = 1
+        raw_text = "add Gabry Ponte - Tarantella"
+
+    assert not confirmation_decision(Request(), [Candidate()], settings).auto_queue
+
+
+@pytest.mark.parametrize(
     "source_constraint",
     [
         "from SoundCloud or via Bandcamp",

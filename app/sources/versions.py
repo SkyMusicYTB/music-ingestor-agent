@@ -5,6 +5,11 @@ import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 
+from app.services.recording_versions import (
+    canonical_recording_version_labels,
+    recording_version_evidence,
+)
+
 _SPACE_RE = re.compile(r"\s+")
 _NON_WORD_RE = re.compile(r"[^\w]+", re.UNICODE)
 
@@ -22,25 +27,24 @@ class VersionKind(StrEnum):
     REMASTER = "remaster"
     SPED_UP = "sped_up"
     SLOWED = "slowed"
+    EXTENDED = "extended"
     NIGHTCORE = "nightcore"
 
 
-_PATTERNS: tuple[tuple[VersionKind, re.Pattern[str]], ...] = (
-    (VersionKind.LIVE, re.compile(r"\b(?:live|concert|live session)\b", re.I)),
-    (
-        VersionKind.REMIX,
-        re.compile(r"\b(?:remix|rework|club mix|extended mix|radio mix|mix by)\b", re.I),
-    ),
-    (VersionKind.COVER, re.compile(r"\bcover(?:ed)?\b", re.I)),
-    (VersionKind.KARAOKE, re.compile(r"\bkaraoke\b", re.I)),
-    (VersionKind.ACOUSTIC, re.compile(r"\b(?:acoustic|unplugged)\b", re.I)),
-    (VersionKind.INSTRUMENTAL, re.compile(r"\binstrumental\b", re.I)),
-    (VersionKind.DEMO, re.compile(r"\bdemo\b", re.I)),
-    (VersionKind.RADIO_EDIT, re.compile(r"\bradio\s+(?:edit|version)\b", re.I)),
-    (VersionKind.REMASTER, re.compile(r"\b(?:re)?master(?:ed)?\b", re.I)),
-    (VersionKind.SPED_UP, re.compile(r"\b(?:sped|speed)\s+up\b", re.I)),
-    (VersionKind.SLOWED, re.compile(r"\bslowed(?:\s+down)?\b", re.I)),
-    (VersionKind.NIGHTCORE, re.compile(r"\bnightcore\b", re.I)),
+_KINDS_BY_CANONICAL_LABEL: tuple[tuple[str, VersionKind], ...] = (
+    ("live", VersionKind.LIVE),
+    ("acoustic", VersionKind.ACOUSTIC),
+    ("remix", VersionKind.REMIX),
+    ("radio edit", VersionKind.RADIO_EDIT),
+    ("remaster", VersionKind.REMASTER),
+    ("demo", VersionKind.DEMO),
+    ("instrumental", VersionKind.INSTRUMENTAL),
+    ("sped up", VersionKind.SPED_UP),
+    ("slowed", VersionKind.SLOWED),
+    ("extended", VersionKind.EXTENDED),
+    ("cover", VersionKind.COVER),
+    ("karaoke", VersionKind.KARAOKE),
+    ("nightcore", VersionKind.NIGHTCORE),
 )
 _CONTRADICTORY_IF_UNREQUESTED = frozenset(
     {VersionKind.LIVE, VersionKind.REMIX, VersionKind.COVER, VersionKind.KARAOKE}
@@ -64,21 +68,39 @@ class VersionClassification:
     def primary(self) -> VersionKind:
         if not self.kinds:
             return VersionKind.STUDIO
-        return next(kind for kind, _pattern in _PATTERNS if kind in self.kinds)
+        return next(kind for _label, kind in _KINDS_BY_CANONICAL_LABEL if kind in self.kinds)
 
     @property
     def signature(self) -> str:
         if not self.kinds:
             return VersionKind.STUDIO.value
-        ordered = [kind.value for kind, _pattern in _PATTERNS if kind in self.kinds]
+        ordered = [kind.value for _label, kind in _KINDS_BY_CANONICAL_LABEL if kind in self.kinds]
         return "+".join(ordered)
 
 
 class VersionClassifier:
-    def classify(self, *values: str | None) -> VersionClassification:
-        combined = " ".join(value for value in values if value)
+    def classify(self, *recording_values: str | None) -> VersionClassification:
+        """Classify recording titles using context-aware qualifier evidence."""
+
+        return self.classify_recording(*recording_values)
+
+    def classify_recording(
+        self,
+        *recording_values: str | None,
+        explicit_version: str | None = None,
+    ) -> VersionClassification:
+        samples = recording_version_evidence(*recording_values)
+        labels = set(canonical_recording_version_labels(*samples, explicit_version))
         return VersionClassification(
-            frozenset(kind for kind, pattern in _PATTERNS if pattern.search(combined))
+            frozenset(kind for label, kind in _KINDS_BY_CANONICAL_LABEL if label in labels)
+        )
+
+    def classify_signature(self, value: str | None) -> VersionClassification:
+        if not value:
+            return VersionClassification(frozenset())
+        labels = set(canonical_recording_version_labels(value))
+        return VersionClassification(
+            frozenset(kind for label, kind in _KINDS_BY_CANONICAL_LABEL if label in labels)
         )
 
     def compatible(
@@ -106,6 +128,6 @@ def classify_version(*values: str | None) -> VersionClassification:
 
 def versions_compatible(*, requested: str | None, candidate: str | None) -> bool:
     return DEFAULT_VERSION_CLASSIFIER.compatible(
-        DEFAULT_VERSION_CLASSIFIER.classify(requested),
-        DEFAULT_VERSION_CLASSIFIER.classify(candidate),
+        DEFAULT_VERSION_CLASSIFIER.classify_signature(requested),
+        DEFAULT_VERSION_CLASSIFIER.classify_signature(candidate),
     )
